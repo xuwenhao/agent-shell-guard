@@ -39,5 +39,5 @@ jobs:
             and post a top-level summary, including when no issues are found.
           claude_args: |
             --model claude-sonnet-4-6
-            --max-turns 20
+            --max-turns 30
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
