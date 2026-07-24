@@ -6,10 +6,11 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { resolveShfmtPath } from '../src/config.mjs';
 import { evaluateHookEvent } from '../src/guard-core.mjs';
 import { resolveDecision } from '../src/resolver.mjs';
 
-const SHFMT = join(homedir(), '.local', 'bin', 'shfmt');
+const SHFMT = resolveShfmtPath();
 
 /** @param {string} command @param {string} [profile] */
 function decision(command, profile = 'full') {
@@ -35,12 +36,14 @@ test('strict mode prompts when supported and otherwise denies', () => {
     mode: 'strict',
     reviewer: null,
   }).action, 'delegate');
-  assert.equal(resolveDecision(result, {
+  const denied = resolveDecision(result, {
     supportsHookPrompt: false,
     nativePromptCovered: false,
     mode: 'strict',
     reviewer: null,
-  }).action, 'deny');
+  });
+  assert.equal(denied.action, 'deny');
+  assert.match(denied.reason ?? '', /strict 模式不允许自动放行/);
 });
 
 test('reviewed mode uses a configured second model and fails closed', () => {

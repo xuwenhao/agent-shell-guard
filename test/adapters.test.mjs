@@ -2,17 +2,17 @@
 
 import assert from 'node:assert/strict';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
 import test from 'node:test';
 
 import { adaptClaude } from '../src/adapters/claude.mjs';
 import { adaptCodex } from '../src/adapters/codex.mjs';
 import { adaptKimi } from '../src/adapters/kimi.mjs';
+import { resolveShfmtPath } from '../src/config.mjs';
 
 const BASE_CONFIG = {
   mode: 'strict',
   profile: 'full',
-  shfmtPath: join(homedir(), '.local', 'bin', 'shfmt'),
+  shfmtPath: resolveShfmtPath(),
   protectedRoots: ['/', homedir()],
   nativePrompt: { codex: true, kimi: true },
   reviewer: null,

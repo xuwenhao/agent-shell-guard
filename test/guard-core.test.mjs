@@ -2,12 +2,12 @@
 
 import assert from 'node:assert/strict';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
 import test from 'node:test';
 
+import { resolveShfmtPath } from '../src/config.mjs';
 import { evaluateHookEvent } from '../src/guard-core.mjs';
 
-const SHFMT = join(homedir(), '.local', 'bin', 'shfmt');
+const SHFMT = resolveShfmtPath();
 
 /** @param {string|string[]} command @param {string} [profile] */
 function evaluate(command, profile = 'full') {
