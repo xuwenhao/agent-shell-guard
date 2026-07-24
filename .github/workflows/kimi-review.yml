@@ -9,8 +9,9 @@ concurrency:
 
 jobs:
   review:
+    # Opt in with the KIMI_REVIEW_ENABLED Actions variable while the API is unreliable.
     # Fork PRs cannot access repository secrets.
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ vars.KIMI_REVIEW_ENABLED == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
