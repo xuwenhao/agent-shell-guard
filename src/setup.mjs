@@ -76,6 +76,7 @@ export async function installManagedShfmt(options = {}) {
   const temporary = `${destination}.tmp-${process.pid}`;
   try {
     writeFileSync(temporary, data, { mode: 0o755 });
+    // Creation mode is masked by process umask; normalize the executable mode.
     chmodSync(temporary, 0o755);
     renameSync(temporary, destination);
   } finally {
@@ -110,6 +111,7 @@ export function installLauncher() {
     `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(cliPath)} "$@"\n`,
     { mode: 0o755 },
   );
+  // Creation mode is masked by process umask; normalize the executable mode.
   chmodSync(LAUNCHER_PATH, 0o755);
   return LAUNCHER_PATH;
 }

@@ -424,7 +424,8 @@ function confirmationPolicy(graph, enabled) {
           why: '本地未推送的提交和工作区改动会被丢弃，请先确认没有需要保留的工作。',
         };
       }
-      // 已按 remote reset 专用开关决定放行，不能再落入通用 git-destructive。
+      // dangerous-only intentionally delegates an explicit non-main remote reset
+      // to the host approval layer; full enables reset-hard-remote above.
       continue;
     }
 

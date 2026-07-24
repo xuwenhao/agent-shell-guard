@@ -70,6 +70,7 @@ test('dangerous-only defers disabled soft rules while retaining enabled confirms
   assert.equal(evaluate('ssh host uptime', 'dangerous-only').kind, 'allow');
   assert.equal(evaluate('rm -rf ./build', 'dangerous-only').kind, 'allow');
   assert.equal(evaluate('git push origin feature --force', 'dangerous-only').kind, 'allow');
+  assert.equal(evaluate('git reset --hard origin/feature', 'dangerous-only').kind, 'allow');
   assert.equal(evaluate('psql -c "DROP TABLE users"', 'dangerous-only').kind, 'confirm');
 });
 
