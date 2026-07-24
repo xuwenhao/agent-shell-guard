@@ -1,10 +1,26 @@
 {
-  "name": "@xuwenhao/agent-shell-guard",
+  "name": "@xuwenhao83/agent-shell-guard",
   "version": "0.1.0",
   "description": "AST-based shell safety guard for Claude Code, Codex, and Kimi Code",
+  "keywords": [
+    "shell",
+    "security",
+    "claude-code",
+    "codex",
+    "kimi-code",
+    "hooks"
+  ],
+  "homepage": "https://github.com/xuwenhao/agent-shell-guard#readme",
+  "bugs": {
+    "url": "https://github.com/xuwenhao/agent-shell-guard/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xuwenhao/agent-shell-guard.git"
+  },
   "type": "module",
   "bin": {
-    "agent-shell-guard": "./src/cli.mjs"
+    "agent-shell-guard": "src/cli.mjs"
   },
   "exports": {
     ".": {
@@ -28,7 +44,9 @@
     "node": ">=24"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
   },
   "license": "MIT",
   "devDependencies": {
