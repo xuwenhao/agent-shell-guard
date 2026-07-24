@@ -12,7 +12,10 @@ import { resolveShfmtPath } from './config.mjs';
 const MAX_INPUT_BYTES = 64 * 1024;
 const MAX_RECURSION = 8;
 const MAX_COMMANDS = 256;
-const DEFAULT_TIMEOUT_MS = 500;
+// shfmt can take longer than 500 ms to cold-start when several Node test
+// workers launch it concurrently on macOS. Keep the bound short enough for a
+// hook while avoiding a fail-closed denial caused only by process startup.
+const DEFAULT_TIMEOUT_MS = 2_000;
 
 /** @typedef {'bash'|'posix'|'zsh'} ShellDialect */
 /** @typedef {'top-level'|'shell-c'|'eval'|'command-substitution'|'backtick-substitution'|'process-substitution'} CommandSource */
