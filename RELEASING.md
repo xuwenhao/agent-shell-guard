@@ -11,12 +11,14 @@ Bootstrap the first publish with a short-lived granular npm token:
 
 1. Create a granular npm token for the `xuwenhao` scope with package
    read/write access, a short expiration, and 2FA bypass for automation.
-2. Add it as the `NPM_TOKEN` Actions secret in
-   `xuwenhao/agent-shell-guard`.
-3. Confirm `package.json` is at version `0.1.0` on `main`.
-4. Publish the GitHub Release `v0.1.0`. The workflow runs tests, validates the
+2. Create an `npm` environment under **Settings → Environments**. Optionally
+   add a required reviewer; solo maintainers should leave "Prevent self-review"
+   disabled.
+3. Add the token as the `NPM_TOKEN` environment secret.
+4. Confirm `package.json` is at version `0.1.0` on `main`.
+5. Publish the GitHub Release `v0.1.0`. The workflow runs tests, validates the
    tag, and publishes the public package with provenance.
-5. Verify the published package:
+6. Verify the published package:
 
    ```bash
    npm view @xuwenhao/agent-shell-guard version
@@ -33,9 +35,9 @@ After the first package version exists:
    - organization or user: `xuwenhao`
    - repository: `agent-shell-guard`
    - workflow filename: `publish.yml`
-   - environment: leave blank
-   - allowed action: `npm publish`
-2. Delete the repository's `NPM_TOKEN` Actions secret.
+   - environment: `npm`
+   - allowed actions: `npm publish`
+2. Delete the `NPM_TOKEN` secret from the `npm` environment.
 3. Set npm publishing access to require 2FA and disallow tokens.
 
 Future publishes use GitHub OIDC with short-lived credentials and automatic
