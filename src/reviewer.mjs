@@ -36,7 +36,10 @@ function redact(command) {
 function redactArgv(argv) {
   let redactNext = false;
   return argv.map((arg) => {
-    if (arg === null) return null;
+    if (arg === null) {
+      redactNext = false;
+      return null;
+    }
     if (redactNext) {
       redactNext = false;
       return '<redacted-secret>';

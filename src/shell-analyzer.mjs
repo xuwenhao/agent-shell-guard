@@ -16,7 +16,7 @@ const DEFAULT_TIMEOUT_MS = 500;
 
 /** @typedef {'bash'|'posix'|'zsh'} ShellDialect */
 /** @typedef {'top-level'|'shell-c'|'eval'|'command-substitution'|'backtick-substitution'|'process-substitution'} CommandSource */
-/** @typedef {{reason: string, detail: string, hard?: boolean}} AnalysisUnknown */
+/** @typedef {{reason: string, detail: string}} AnalysisUnknown */
 /**
  * @typedef {{
  *   argv: Array<string|null>,

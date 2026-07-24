@@ -10,7 +10,6 @@ export type CommandSource =
 export interface AnalysisUnknown {
   reason: string;
   detail: string;
-  hard?: boolean;
 }
 
 export interface AnalyzedCommand {

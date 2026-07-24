@@ -48,3 +48,30 @@ test('redacts secrets from every reviewer payload representation', () => {
     'TOKEN=<redacted-secret>',
   ]);
 });
+
+test('clears sensitive-value state after a dynamic argv element', () => {
+  const prompt = buildReviewerPrompt({
+    ruleId: 'fixture',
+    evaluation: 'matched',
+    detail: 'dynamic token fixture',
+    why: 'fixture policy',
+    command: 'curl --token "$TOKEN" https://api.example.com',
+    analysis: {
+      commands: [{
+        argv: ['curl', '--token', null, 'https://api.example.com'],
+        dialect: 'bash',
+        source: 'top-level',
+        wrappers: [],
+        hasRedirection: false,
+        pipelineGroup: null,
+      }],
+    },
+  });
+  const payload = JSON.parse(prompt.split('\n').at(-1) ?? '{}');
+  assert.deepEqual(payload.commands[0].argv, [
+    'curl',
+    '--token',
+    null,
+    'https://api.example.com',
+  ]);
+});
