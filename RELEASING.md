@@ -11,20 +11,23 @@ Bootstrap the first publish interactively from a clean `main` checkout:
 
 1. Confirm `package.json` is named `@xuwenhao83/agent-shell-guard` at version
    `0.1.0`.
-2. Authenticate interactively and verify the account:
+2. Authenticate interactively:
 
    ```bash
    npm login
-   npm whoami
    ```
 
-   `npm whoami` must print `xuwenhao83`.
-3. Publish the public package with 2FA:
+3. Run the guarded bootstrap script:
 
    ```bash
-   npm publish --access public
+   bash scripts/bootstrap-npm-package.sh
    ```
 
+   It verifies the branch, clean worktree, remote commit, npm account, package
+   identity, unpublished version, tests, and package contents before asking for
+   an exact confirmation. The bootstrap explicitly disables provenance because
+   local publishing cannot use GitHub OIDC; later workflow releases include
+   provenance automatically.
 4. Verify the published package:
 
    ```bash
