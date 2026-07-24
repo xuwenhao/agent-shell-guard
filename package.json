@@ -1,0 +1,38 @@
+{
+  "name": "@xuwenhao/agent-shell-guard",
+  "version": "0.1.0",
+  "description": "AST-based shell safety guard for Claude Code, Codex, and Kimi Code",
+  "type": "module",
+  "bin": {
+    "agent-shell-guard": "./src/cli.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./src/index.mjs"
+    }
+  },
+  "types": "./types/index.d.ts",
+  "files": [
+    "src/",
+    "types/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc -p tsconfig.json",
+    "prepack": "npm test && npm run typecheck"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
+  }
+}
