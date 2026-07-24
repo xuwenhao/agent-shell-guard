@@ -49,7 +49,7 @@ function resolveExecutable(command, env = process.env) {
   return command;
 }
 
-/** @param {string|undefined} explicit @param {NodeJS.ProcessEnv} [env] */
+/** @param {string} [explicit] @param {NodeJS.ProcessEnv} [env] */
 export function resolveShfmtPath(explicit, env = process.env) {
   const candidates = [
     explicit,
@@ -97,7 +97,7 @@ export function loadConfig(options = {}) {
         args: Array.isArray(reviewerValue.args) ? reviewerValue.args.map(String) : [],
         model: reviewerModel,
         timeoutMs: Number.isFinite(configuredTimeout)
-          ? Math.max(500, Math.min(25_000, configuredTimeout))
+          ? Math.max(500, Math.min(20_000, configuredTimeout))
           : 12_000,
       }
     : null;

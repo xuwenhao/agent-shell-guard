@@ -14,6 +14,7 @@ test('native prompt delegation is opt-in and config path honors the supplied env
   writeFileSync(configPath, JSON.stringify({
     mode: 'reviewed',
     nativePrompt: { codex: true, kimi: false },
+    reviewer: { command: process.execPath, timeoutMs: 90_000 },
   }));
   try {
     const config = loadConfig({
@@ -29,6 +30,7 @@ test('native prompt delegation is opt-in and config path honors the supplied env
     assert.deepEqual(config.nativePrompt, { codex: true, kimi: true });
     assert.ok(config.protectedRoots.includes(join(homedir(), 'Codebase')));
     assert.ok(config.protectedRoots.includes('/srv/work'));
+    assert.equal(config.reviewer?.timeoutMs, 20_000);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

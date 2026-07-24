@@ -40,7 +40,7 @@ export const POLICY_PROFILES = {
 
 /** @param {string|undefined} value @returns {PolicyProfile} */
 export function resolvePolicyProfile(value) {
-  return value === 'dangerous-only' || value === 'off' || value === 'full' ? value : 'full';
+  return value === 'dangerous-only' || value === 'off' || value === 'full' ? value : 'dangerous-only';
 }
 
 /** @param {string} ruleId @param {PolicyProfile} profile */

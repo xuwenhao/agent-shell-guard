@@ -4,19 +4,55 @@ import { spawnSync } from 'node:child_process';
 import { basename } from 'node:path';
 
 const REVIEW_DEPTH_ENV = 'AGENT_SHELL_GUARD_REVIEW_DEPTH';
+const SENSITIVE_VALUE_FLAGS = new Set([
+  '--access-token',
+  '--api-key',
+  '--apikey',
+  '--client-secret',
+  '--credential',
+  '--credentials',
+  '--password',
+  '--passwd',
+  '--private-key',
+  '--proxy-user',
+  '--secret',
+  '--token',
+  '--user',
+  '-u',
+]);
 
 /** @param {string} command */
 function redact(command) {
   return command
     .replace(/(authorization:\s*(?:bearer|token)\s+)[^\s'"]+/gi, '$1<redacted>')
     .replace(/([?&](?:access_token|api_key|apikey|token|password)=)[^&\s'"]+/gi, '$1<redacted>')
+    .replace(/((?:--(?:access-token|api-key|apikey|client-secret|credential|credentials|password|passwd|private-key|proxy-user|secret|token|user))=)[^\s'"]+/gi, '$1<redacted-secret>')
+    .replace(/((?:--(?:access-token|api-key|apikey|client-secret|credential|credentials|password|passwd|private-key|proxy-user|secret|token|user)|-u)\s+)[^\s'"]+/gi, '$1<redacted-secret>')
+    .replace(/\b([A-Z0-9_]*(?:API_KEY|PASSWORD|SECRET|TOKEN|CREDENTIALS?))=[^\s'"]+/gi, '$1=<redacted-secret>')
     .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{12,}\b/g, '<redacted-secret>');
 }
 
+/** @param {Array<string|null>} argv */
+function redactArgv(argv) {
+  let redactNext = false;
+  return argv.map((arg) => {
+    if (arg === null) return null;
+    if (redactNext) {
+      redactNext = false;
+      return '<redacted-secret>';
+    }
+    if (SENSITIVE_VALUE_FLAGS.has(arg)) {
+      redactNext = true;
+      return arg;
+    }
+    return redact(arg);
+  });
+}
+
 /** @param {any} decision */
-function reviewerPrompt(decision) {
+export function buildReviewerPrompt(decision) {
   const commands = decision.analysis.commands.map((/** @type {any} */ command) => ({
-    argv: command.argv,
+    argv: redactArgv(command.argv),
     dialect: command.dialect,
     source: command.source,
     wrappers: command.wrappers,
@@ -26,8 +62,8 @@ function reviewerPrompt(decision) {
   const payload = {
     ruleId: decision.ruleId,
     evaluation: decision.evaluation,
-    operation: decision.detail,
-    policyReason: decision.why,
+    operation: redact(decision.detail),
+    policyReason: redact(decision.why),
     command: redact(decision.command),
     commands,
   };
@@ -74,10 +110,10 @@ export function runModelReview(decision, config) {
   if (commandName === 'kimi') {
     args.push('-p');
     if (config.model) args.push('-m', config.model);
-    args.push(reviewerPrompt(decision));
+    args.push(buildReviewerPrompt(decision));
   } else {
     if (config.model) args.push('--model', config.model);
-    args.push(reviewerPrompt(decision));
+    args.push(buildReviewerPrompt(decision));
   }
   const result = spawnSync(config.command, args, {
     encoding: 'utf8',

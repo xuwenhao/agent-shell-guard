@@ -6,9 +6,10 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { resolveShfmtPath } from '../src/config.mjs';
 import { analyzeShellInput, selectShellDialect } from '../src/shell-analyzer.mjs';
 
-const SHFMT = join(process.env.HOME ?? '', '.local', 'bin', 'shfmt');
+const SHFMT = resolveShfmtPath();
 
 /** @param {string} text @param {'bash'|'posix'|'zsh'} [dialect] @param {Record<string, unknown>} [options] */
 function analyze(text, dialect = 'bash', options = {}) {
@@ -21,6 +22,17 @@ test('selects the adapter dialect deterministically', () => {
   assert.equal(selectShellDialect({ toolName: 'shell', explicitShell: '/bin/bash', envShell: '/bin/zsh' }), 'bash');
   assert.equal(selectShellDialect({ toolName: 'exec_command', envShell: '/bin/zsh' }), 'zsh');
   assert.equal(selectShellDialect({ toolName: 'exec_command', envShell: '/bin/dash' }), 'posix');
+  assert.equal(selectShellDialect({ toolName: 'exec_command', envShell: '/usr/bin/fish' }), 'posix');
+  assert.equal(selectShellDialect({ toolName: 'exec_command' }), 'posix');
+});
+
+test('unknown shells do not require a zsh validator', () => {
+  const dialect = selectShellDialect({ toolName: 'exec_command', envShell: '/usr/bin/fish' });
+  const graph = analyzeShellInput(
+    { kind: 'script', text: 'printf ok' },
+    { dialect, shfmtPath: SHFMT, zshPath: '/definitely/missing/zsh' },
+  );
+  assert.equal(graph.status, 'safe');
 });
 
 test('does not treat an assignment-only statement as a dynamic command', () => {
@@ -92,9 +104,19 @@ test('records pipeline, redirection, command substitution, backticks, and proces
 });
 
 test('recursively parses static shell -c scripts and switches dialect', () => {
-  const graph = analyze('bash -lc -- "ssh host uptime"; zsh -c "print ok"');
-  const nested = graph.commands.filter((command) => command.source === 'shell-c');
-  assert.deepEqual(nested.map((command) => [command.dialect, command.argv?.[0]]), [['bash', 'ssh'], ['zsh', 'print']]);
+  const directory = mkdtempSync(join(tmpdir(), 'guard-analyzer-zsh-'));
+  const acceptingZsh = join(directory, 'zsh');
+  writeFileSync(acceptingZsh, '#!/bin/sh\nexit 0\n');
+  chmodSync(acceptingZsh, 0o755);
+  try {
+    const graph = analyze('bash -lc -- "ssh host uptime"; zsh -c "print ok"', 'bash', {
+      zshPath: acceptingZsh,
+    });
+    const nested = graph.commands.filter((command) => command.source === 'shell-c');
+    assert.deepEqual(nested.map((command) => [command.dialect, command.argv?.[0]]), [['bash', 'ssh'], ['zsh', 'print']]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('unwraps common static command wrappers before policy matching', () => {
@@ -187,6 +209,15 @@ test('fails closed for unsupported zsh syntax instead of falling back', () => {
   const graph = analyze('print ${^array}', 'zsh');
   assert.equal(graph.status, 'unknown');
   assert.ok(graph.unknowns.some((item) => item.reason === 'parser-failed'));
+});
+
+test('uses the managed shfmt resolver for direct library calls', () => {
+  const graph = analyzeShellInput(
+    { kind: 'script', text: 'printf ok' },
+    { dialect: 'bash' },
+  );
+  assert.equal(graph.status, 'safe');
+  assert.equal(graph.commands[0].argv[0], 'printf');
 });
 
 test('enforces input, recursion, and command-node limits', () => {

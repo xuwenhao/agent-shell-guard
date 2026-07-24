@@ -79,12 +79,14 @@ test('strict mode never invokes the second-model reviewer', () => {
   try {
     const result = decision('git branch -d old-branch');
     assert.equal(result.kind, 'review');
-    assert.equal(resolveDecision(result, {
+    const resolved = resolveDecision(result, {
       supportsHookPrompt: false,
       nativePromptCovered: false,
       mode: 'strict',
       reviewer: { command: process.execPath, args: [allowScript], timeoutMs: 2_000 },
-    }).action, 'deny');
+    });
+    assert.equal(resolved.action, 'deny');
+    assert.match(resolved.reason ?? '', /启用 reviewed 模式/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

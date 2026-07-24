@@ -134,7 +134,7 @@ function pushRefs(command) {
   const git = parseGitCommand(command);
   if (git?.subcommand !== 'push') return [];
   const display = effectiveDisplayArgv(command).slice(git.argOffset);
-  const valueFlags = new Set(['--repo', '--receive-pack', '--exec', '--push-option']);
+  const valueFlags = new Set(['--repo', '--receive-pack', '--exec', '--push-option', '-o']);
   /** @type {Array<{value: string|null, display: string}>} */
   const positionals = [];
   let options = true;
@@ -310,7 +310,8 @@ function hardPolicy(graph, enabled, protectedRoots) {
       const refs = pushRefs(command);
       const protectedRef = refs.find((ref) => ref.value !== null && isProtectedRef(ref.value));
       const unknownRef = refs.find((ref) => ref.value === null);
-      if ((protectedRef || unknownRef) && enabled('force-push-main')) {
+      const unresolvedTarget = refs.length === 0 || unknownRef !== undefined;
+      if ((protectedRef || unresolvedTarget) && enabled('force-push-main')) {
         return {
           ruleId: 'force-push-main', evaluation: protectedRef ? 'matched' : 'unknown',
           detail: `force push 到 main/master（${trunc(displayCommand(command))}，含 --force-with-lease / +refspec 形式）`,

@@ -4,8 +4,9 @@
 import { adaptClaude } from './adapters/claude.mjs';
 import { adaptCodex } from './adapters/codex.mjs';
 import { adaptKimi } from './adapters/kimi.mjs';
+import { hookOutput } from './adapters/common.mjs';
 import { LAUNCHER_PATH, loadConfig, MANAGED_SHFMT_PATH } from './config.mjs';
-import { readJsonFromStdin, writeJson } from './io.mjs';
+import { HookInputError, readJsonFromStdin, writeJson } from './io.mjs';
 import {
   configSnippet,
   ensureDefaultConfig,
@@ -18,7 +19,17 @@ import {
 const [, , subcommand, argument] = process.argv;
 
 if (subcommand === 'hook' && ['claude', 'codex', 'kimi'].includes(argument ?? '')) {
-  const event = await readJsonFromStdin();
+  /** @type {Record<string, unknown>|null} */
+  let event = null;
+  try {
+    event = await readJsonFromStdin();
+  } catch (error) {
+    const code = error instanceof HookInputError ? error.code : 'input-invalid';
+    writeJson(hookOutput(
+      'deny',
+      `hook 输入无效（${code}）；无法建立可靠的安全判定，已按 fail-closed 拒绝。`,
+    ));
+  }
   if (event) {
     const config = loadConfig();
     const output = argument === 'claude'

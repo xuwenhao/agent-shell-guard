@@ -36,6 +36,9 @@ test('preserves hard-deny rules in dangerous-only', () => {
     ['gh api -X PUT orgs/acme/rulesets/1 -f name=x', 'org-ruleset-write'],
     [`rm -rf ${homedir()}`, 'rm-protected-root'],
     ['git push origin main --force', 'force-push-main'],
+    ['git push --force', 'force-push-main'],
+    ['git push --force origin', 'force-push-main'],
+    ['git push origin -o ci.skip main --force', 'force-push-main'],
   ];
   for (const [command, ruleId] of cases) {
     const result = evaluate(command, 'dangerous-only');
@@ -68,6 +71,17 @@ test('dangerous-only defers disabled soft rules while retaining enabled confirms
   assert.equal(evaluate('rm -rf ./build', 'dangerous-only').kind, 'allow');
   assert.equal(evaluate('git push origin feature --force', 'dangerous-only').kind, 'allow');
   assert.equal(evaluate('psql -c "DROP TABLE users"', 'dangerous-only').kind, 'confirm');
+});
+
+test('direct API calls default to the dangerous-only profile', () => {
+  for (const profile of [undefined, 'invalid-profile']) {
+    const result = evaluateHookEvent({
+      tool_name: 'Bash',
+      tool_input: { command: 'ssh host uptime' },
+    }, { profile, shfmtPath: SHFMT });
+    assert.ok(result);
+    assert.equal(result.kind, 'allow');
+  }
 });
 
 test('parser infrastructure failure denies independently of profile', () => {

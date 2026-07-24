@@ -115,6 +115,9 @@ The reviewer must return exactly:
 Invalid output, incomplete shell analysis, a timeout, or reviewer failure is
 treated as `uncertain` and denied. Reviewer subprocesses receive
 `AGENT_SHELL_GUARD_REVIEW_DEPTH=1`; nested reviews are rejected.
+Before a command graph is sent to the reviewer, common credential forms are
+redacted from both the raw command and normalized argv. Reviewer timeouts are
+capped at 20 seconds to leave headroom inside the 30-second host hook timeout.
 
 Environment overrides:
 
@@ -138,8 +141,22 @@ AGENT_SHELL_GUARD_REVIEWER_TIMEOUT_MS
 - `full`: all bundled confirmation and review rules.
 - `off`: disables policy rules, but parser infrastructure failure still denies.
 
+Both the CLI configuration and direct library calls default to
+`dangerous-only`. This profile intentionally leaves explicit force pushes to a
+known non-main ref and `git reset --hard origin/<non-main>` to the host's own
+approval layer; `full` adds guard-level confirmation for them. A force push
+whose target ref cannot be resolved remains a hard deny.
+
+All `git checkout` forms are conservatively classified as destructive because
+the command can replace working-tree content. Use `git switch` for ordinary
+branch changes when that confirmation is unnecessary.
+
 `off` does not disable the parser health check: without a reliable command graph,
 the guard cannot prove that hard-deny rules were not bypassed.
+
+Explicit zsh shells are syntax-checked with zsh and therefore require a working
+zsh executable. Missing or unrecognized shell metadata falls back to POSIX
+parsing instead of assuming zsh.
 
 ## Development
 

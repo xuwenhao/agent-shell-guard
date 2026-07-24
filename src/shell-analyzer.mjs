@@ -5,8 +5,9 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename } from 'node:path';
 import { homedir } from 'node:os';
+import { resolveShfmtPath } from './config.mjs';
 
 const MAX_INPUT_BYTES = 64 * 1024;
 const MAX_RECURSION = 8;
@@ -60,7 +61,8 @@ function dialectFromShell(value) {
   const name = basename(value || '').toLowerCase();
   if (name === 'bash') return 'bash';
   if (name === 'sh' || name === 'dash') return 'posix';
-  return 'zsh';
+  if (name === 'zsh') return 'zsh';
+  return 'posix';
 }
 
 /**
@@ -295,7 +297,8 @@ function failedGraph(reason, detail, dialect) {
  */
 export function analyzeShellInput(input, options) {
   const dialect = options.dialect;
-  const shfmtPath = options.shfmtPath || process.env.GUARD_BASH_SHFMT || join(homedir(), '.local', 'bin', 'shfmt');
+  const explicitShfmt = options.shfmtPath || process.env.GUARD_BASH_SHFMT;
+  const shfmtPath = explicitShfmt || resolveShfmtPath();
   const zshPath = options.zshPath || process.env.GUARD_BASH_ZSH || '/bin/zsh';
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxInputBytes = options.maxInputBytes ?? MAX_INPUT_BYTES;
@@ -391,6 +394,11 @@ export function analyzeShellInput(input, options) {
       return;
     }
 
+    if (parsed.status !== 0) {
+      unknown('parser-failed', String(parsed.stderr || `shfmt exited ${parsed.status}`));
+      return;
+    }
+
     let zshValidation = null;
     if (currentDialect === 'zsh') {
       zshValidation = spawnSync(zshPath, ['-f', '-n', '-c', text], {
@@ -406,11 +414,6 @@ export function analyzeShellInput(input, options) {
         return;
       }
     }
-    if (parsed.status !== 0) {
-      unknown('parser-failed', String(parsed.stderr || `shfmt exited ${parsed.status}`));
-      return;
-    }
-
     /** @type {unknown} */
     let ast;
     try { ast = JSON.parse(parsed.stdout); }
