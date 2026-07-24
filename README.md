@@ -7,7 +7,7 @@ policies, and adapts the result to each host's approval protocol.
 ## Install
 
 ```bash
-npm install --global @xuwenhao/agent-shell-guard
+npm install --global @xuwenhao83/agent-shell-guard
 agent-shell-guard setup
 agent-shell-guard doctor
 ```

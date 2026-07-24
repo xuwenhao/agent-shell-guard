@@ -7,22 +7,29 @@ with a `v` prefix.
 ## First publish
 
 The npm package must exist before npm Trusted Publishing can be configured.
-Bootstrap the first publish with a short-lived granular npm token:
+Bootstrap the first publish interactively from a clean `main` checkout:
 
-1. Create a granular npm token for the `xuwenhao` scope with package
-   read/write access, a short expiration, and 2FA bypass for automation.
-2. Create an `npm` environment under **Settings → Environments**. Optionally
-   add a required reviewer; solo maintainers should leave "Prevent self-review"
-   disabled.
-3. Add the token as the `NPM_TOKEN` environment secret.
-4. Confirm `package.json` is at version `0.1.0` on `main`.
-5. Publish the GitHub Release `v0.1.0`. The workflow runs tests, validates the
-   tag, and publishes the public package with provenance.
-6. Verify the published package:
+1. Confirm `package.json` is named `@xuwenhao83/agent-shell-guard` at version
+   `0.1.0`.
+2. Authenticate interactively and verify the account:
 
    ```bash
-   npm view @xuwenhao/agent-shell-guard version
-   npm install --global @xuwenhao/agent-shell-guard@0.1.0
+   npm login
+   npm whoami
+   ```
+
+   `npm whoami` must print `xuwenhao83`.
+3. Publish the public package with 2FA:
+
+   ```bash
+   npm publish --access public
+   ```
+
+4. Verify the published package:
+
+   ```bash
+   npm view @xuwenhao83/agent-shell-guard version
+   npm install --global @xuwenhao83/agent-shell-guard@0.1.0
    agent-shell-guard doctor
    ```
 
@@ -30,15 +37,17 @@ Bootstrap the first publish with a short-lived granular npm token:
 
 After the first package version exists:
 
-1. Open the package settings on npmjs.com and add a GitHub Actions Trusted
-   Publisher:
+1. Open
+   <https://www.npmjs.com/package/@xuwenhao83/agent-shell-guard/access>,
+   find **Trusted publishing**, and add a GitHub Actions publisher:
    - organization or user: `xuwenhao`
    - repository: `agent-shell-guard`
    - workflow filename: `publish.yml`
-   - environment: `npm`
+   - environment: leave blank
    - allowed actions: `npm publish`
-2. Delete the `NPM_TOKEN` secret from the `npm` environment.
-3. Set npm publishing access to require 2FA and disallow tokens.
+2. Set npm publishing access to require 2FA and disallow tokens.
+3. Publish the GitHub Release `v0.1.0`. The workflow validates the tag and
+   detects that the bootstrap version already exists without republishing it.
 
 Future publishes use GitHub OIDC with short-lived credentials and automatic
 provenance.
