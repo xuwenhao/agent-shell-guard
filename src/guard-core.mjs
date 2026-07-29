@@ -522,9 +522,10 @@ function extractInput(input) {
  * @returns {GuardDecision|{kind: 'allow', command: string, description: string, analysis: ShellGraph}|null}
  */
 export function evaluateHookEvent(event, options = {}) {
-  const toolName = String(event.tool_name ?? '');
-  if (!/^(Bash|shell|local_shell|exec_command)$/i.test(toolName)) return null;
-  const { shellInput, command, description, explicitShell } = extractInput(event.tool_input);
+  const toolName = String(event.tool_name ?? event.toolName ?? '');
+  if (!/^(Bash|shell|local_shell|exec_command|run_terminal_command)$/i.test(toolName)) return null;
+  const { shellInput, command, description, explicitShell } =
+    extractInput(event.tool_input ?? event.toolInput);
   if (!shellInput) return null;
   const dialect = selectShellDialect({ toolName, explicitShell, envShell: options.envShell });
   const analysis = analyzeShellInput(shellInput, {

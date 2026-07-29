@@ -3,6 +3,7 @@
 
 import { adaptClaude } from './adapters/claude.mjs';
 import { adaptCodex } from './adapters/codex.mjs';
+import { adaptGrok, grokDenyOutput } from './adapters/grok.mjs';
 import { adaptKimi } from './adapters/kimi.mjs';
 import { hookOutput } from './adapters/common.mjs';
 import { LAUNCHER_PATH, loadConfig, MANAGED_SHFMT_PATH } from './config.mjs';
@@ -18,17 +19,15 @@ import {
 
 const [, , subcommand, argument] = process.argv;
 
-if (subcommand === 'hook' && ['claude', 'codex', 'kimi'].includes(argument ?? '')) {
+if (subcommand === 'hook' && ['claude', 'codex', 'grok', 'kimi'].includes(argument ?? '')) {
   /** @type {Record<string, unknown>|null} */
   let event = null;
   try {
     event = await readJsonFromStdin();
   } catch (error) {
     const code = error instanceof HookInputError ? error.code : 'input-invalid';
-    writeJson(hookOutput(
-      'deny',
-      `hook 输入无效（${code}）；无法建立可靠的安全判定，已按 fail-closed 拒绝。`,
-    ));
+    const reason = `hook 输入无效（${code}）；无法建立可靠的安全判定，已按 fail-closed 拒绝。`;
+    writeJson(argument === 'grok' ? grokDenyOutput(reason) : hookOutput('deny', reason));
   }
   if (event) {
     const config = loadConfig();
@@ -36,7 +35,9 @@ if (subcommand === 'hook' && ['claude', 'codex', 'kimi'].includes(argument ?? ''
       ? adaptClaude(event, config)
       : argument === 'codex'
         ? adaptCodex(event, config)
-        : adaptKimi(event, config);
+        : argument === 'grok'
+          ? adaptGrok(event, config)
+          : adaptKimi(event, config);
     if (output) writeJson(output);
   }
 } else if (subcommand === 'setup') {
@@ -54,18 +55,18 @@ if (subcommand === 'hook' && ['claude', 'codex', 'kimi'].includes(argument ?? ''
     process.stderr.write(`error: ${result.reason}\nrun: agent-shell-guard setup\n`);
     process.exitCode = 1;
   }
-} else if (subcommand === 'print-config' && ['claude', 'codex', 'kimi'].includes(argument ?? '')) {
-  process.stdout.write(`${configSnippet(/** @type {'claude'|'codex'|'kimi'} */ (argument))}\n`);
-} else if (subcommand === 'print-native-rules' && ['codex', 'kimi'].includes(argument ?? '')) {
-  process.stdout.write(`${nativeRulesSnippet(/** @type {'codex'|'kimi'} */ (argument))}\n`);
+} else if (subcommand === 'print-config' && ['claude', 'codex', 'grok', 'kimi'].includes(argument ?? '')) {
+  process.stdout.write(`${configSnippet(/** @type {'claude'|'codex'|'grok'|'kimi'} */ (argument))}\n`);
+} else if (subcommand === 'print-native-rules' && ['codex', 'grok', 'kimi'].includes(argument ?? '')) {
+  process.stdout.write(`${nativeRulesSnippet(/** @type {'codex'|'grok'|'kimi'} */ (argument))}\n`);
 } else {
   process.stderr.write(
     'usage:\n' +
-    '  agent-shell-guard hook <claude|codex|kimi>\n' +
+    '  agent-shell-guard hook <claude|codex|grok|kimi>\n' +
     '  agent-shell-guard setup\n' +
     '  agent-shell-guard doctor\n' +
-    '  agent-shell-guard print-config <claude|codex|kimi>\n' +
-    '  agent-shell-guard print-native-rules <codex|kimi>\n' +
+    '  agent-shell-guard print-config <claude|codex|grok|kimi>\n' +
+    '  agent-shell-guard print-native-rules <codex|grok|kimi>\n' +
     `managed shfmt: ${MANAGED_SHFMT_PATH}\n` +
     `launcher: ${LAUNCHER_PATH}\n`,
   );

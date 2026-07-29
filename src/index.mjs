@@ -4,7 +4,13 @@ export { loadConfig, resolveShfmtPath } from './config.mjs';
 export { resolveDecision } from './resolver.mjs';
 export { adaptClaude } from './adapters/claude.mjs';
 export { adaptCodex } from './adapters/codex.mjs';
+export { adaptGrok, grokDenyOutput } from './adapters/grok.mjs';
 export { adaptKimi } from './adapters/kimi.mjs';
+export {
+  GROK_NATIVE_PROMPT_PREFIXES,
+  GROK_PERMISSION_PATTERNS,
+  isGrokNativePromptCovered,
+} from './adapters/grok-native.mjs';
 export {
   KIMI_NATIVE_PROMPT_PREFIXES,
   KIMI_PERMISSION_PATTERNS,

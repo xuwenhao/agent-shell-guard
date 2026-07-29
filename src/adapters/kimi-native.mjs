@@ -1,6 +1,7 @@
 // @ts-check
 
 import { CODEX_NATIVE_PROMPT_PREFIXES } from './codex-native.mjs';
+import { isNativePromptCovered } from './common.mjs';
 
 /** @type {Map<string, string[][]>} */
 export const KIMI_NATIVE_PROMPT_PREFIXES = new Map([
@@ -33,13 +34,5 @@ export const KIMI_PERMISSION_PATTERNS = [
  * @param {string} command
  */
 export function isKimiNativePromptCovered(ruleId, analysis, command) {
-  const prefixes = KIMI_NATIVE_PROMPT_PREFIXES.get(ruleId);
-  const argv = analysis.nativePromptArgv;
-  if (prefixes === undefined || argv === null) return false;
-  return prefixes.some((prefix) => {
-    const argvMatches = prefix.every((part, index) => argv[index] === part);
-    const literal = prefix.join(' ');
-    const sourceMatches = command === literal || command.startsWith(`${literal} `);
-    return argvMatches && sourceMatches;
-  });
+  return isNativePromptCovered(ruleId, analysis, command, KIMI_NATIVE_PROMPT_PREFIXES);
 }

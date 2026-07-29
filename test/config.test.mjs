@@ -13,7 +13,7 @@ test('native prompt delegation is opt-in and config path honors the supplied env
   const configPath = join(directory, 'config.json');
   writeFileSync(configPath, JSON.stringify({
     mode: 'reviewed',
-    nativePrompt: { codex: true, kimi: false },
+    nativePrompt: { codex: true, grok: false, kimi: false },
     reviewer: { command: process.execPath, timeoutMs: 90_000 },
   }));
   try {
@@ -21,13 +21,14 @@ test('native prompt delegation is opt-in and config path honors the supplied env
       env: {
         AGENT_SHELL_GUARD_CONFIG: configPath,
         AGENT_SHELL_GUARD_SHFMT: '/not/installed/in-test',
+        AGENT_SHELL_GUARD_NATIVE_PROMPT_GROK: 'true',
         AGENT_SHELL_GUARD_NATIVE_PROMPT_KIMI: 'yes',
         AGENT_SHELL_GUARD_PROTECTED_ROOTS: '~/Codebase,/srv/work',
         PATH: '',
       },
     });
     assert.equal(config.mode, 'reviewed');
-    assert.deepEqual(config.nativePrompt, { codex: true, kimi: true });
+    assert.deepEqual(config.nativePrompt, { codex: true, grok: true, kimi: true });
     assert.ok(config.protectedRoots.includes(join(homedir(), 'Codebase')));
     assert.ok(config.protectedRoots.includes('/srv/work'));
     assert.equal(config.reviewer?.timeoutMs, 20_000);
@@ -41,5 +42,5 @@ test('native prompt delegation defaults to disabled', () => {
     configPath: '/definitely/missing/agent-shell-guard.json',
     env: { PATH: '' },
   });
-  assert.deepEqual(config.nativePrompt, { codex: false, kimi: false });
+  assert.deepEqual(config.nativePrompt, { codex: false, grok: false, kimi: false });
 });

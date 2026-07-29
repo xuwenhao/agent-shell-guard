@@ -1,12 +1,13 @@
 {
   "name": "@xuwenhao83/agent-shell-guard",
   "version": "0.1.0",
-  "description": "AST-based shell safety guard for Claude Code, Codex, and Kimi Code",
+  "description": "AST-based shell safety guard for Claude Code, Codex, Grok Build, and Kimi Code",
   "keywords": [
     "shell",
     "security",
     "claude-code",
     "codex",
+    "grok-build",
     "kimi-code",
     "hooks"
   ],

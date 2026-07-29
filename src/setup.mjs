@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 import { CONFIG_PATH, LAUNCHER_PATH, MANAGED_SHFMT_PATH } from './config.mjs';
 import { CODEX_NATIVE_PROMPT_PREFIXES } from './adapters/codex-native.mjs';
+import { GROK_PERMISSION_PATTERNS } from './adapters/grok-native.mjs';
 import { KIMI_PERMISSION_PATTERNS } from './adapters/kimi-native.mjs';
 
 export const SHFMT_VERSION = '3.13.1';
@@ -93,7 +94,7 @@ export function ensureDefaultConfig() {
     `${JSON.stringify({
       mode: 'strict',
       profile: 'dangerous-only',
-      nativePrompt: { codex: false, kimi: false },
+      nativePrompt: { codex: false, grok: false, kimi: false },
     }, null, 2)}\n`,
     { flag: 'wx' },
   );
@@ -116,8 +117,22 @@ export function installLauncher() {
   return LAUNCHER_PATH;
 }
 
-/** @param {'claude'|'codex'|'kimi'} host */
+/** @param {'claude'|'codex'|'grok'|'kimi'} host */
 export function configSnippet(host) {
+  if (host === 'grok') {
+    return JSON.stringify({
+      hooks: {
+        PreToolUse: [{
+          matcher: 'run_terminal_command',
+          hooks: [{
+            type: 'command',
+            command: '"$HOME/.local/bin/agent-shell-guard" hook grok',
+            timeout: 30,
+          }],
+        }],
+      },
+    }, null, 2);
+  }
   if (host === 'kimi') {
     return [
       '[[hooks]]',
@@ -155,8 +170,15 @@ export function configSnippet(host) {
   }, null, 2);
 }
 
-/** @param {'codex'|'kimi'} host */
+/** @param {'codex'|'grok'|'kimi'} host */
 export function nativeRulesSnippet(host) {
+  if (host === 'grok') {
+    // Grok's permission schema names the terminal tool class "bash"; this is
+    // intentionally distinct from the hook event tool name run_terminal_command.
+    return GROK_PERMISSION_PATTERNS.map((pattern) =>
+      `[[permission.rules]]\naction = "ask"\ntool = "bash"\npattern = ${JSON.stringify(pattern)}`,
+    ).join('\n\n');
+  }
   if (host === 'kimi') {
     return KIMI_PERMISSION_PATTERNS.map((pattern) =>
       `[[permission.rules]]\ndecision = "ask"\npattern = ${JSON.stringify(pattern)}\nreason = "agent-shell-guard native confirmation"`,

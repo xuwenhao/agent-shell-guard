@@ -1,6 +1,7 @@
 # agent-shell-guard
 
-AST-based shell safety guard shared by Claude Code, Codex, and Kimi Code.
+AST-based shell safety guard shared by Claude Code, Codex, Grok Build, and
+Kimi Code.
 It parses shell input with a pinned `shfmt` build, evaluates deterministic
 policies, and adapts the result to each host's approval protocol.
 
@@ -22,6 +23,7 @@ Print the host configuration to merge into the corresponding config file:
 ```bash
 agent-shell-guard print-config claude
 agent-shell-guard print-config codex
+agent-shell-guard print-config grok
 agent-shell-guard print-config kimi
 ```
 
@@ -29,17 +31,20 @@ Merge the outputs into:
 
 - Claude Code: `~/.claude/settings.json`
 - Codex: `~/.codex/hooks.json`
+- Grok Build: `~/.grok/hooks/agent-shell-guard.json`
 - Kimi Code: `~/.kimi/config.toml`
 
 Install native confirmation rules separately:
 
 ```bash
 agent-shell-guard print-native-rules codex
+agent-shell-guard print-native-rules grok
 agent-shell-guard print-native-rules kimi
 ```
 
-Merge Codex rules into `~/.codex/rules/default.rules` and Kimi rules into
-`~/.kimi/config.toml`. Keep the Kimi `ask` rules before broader `allow` rules.
+Merge Codex rules into `~/.codex/rules/default.rules`, Grok rules into
+`~/.grok/config.toml`, and Kimi rules into `~/.kimi/config.toml`. Keep the Kimi
+`ask` rules before broader `allow` rules.
 
 After merging and verifying those rules, opt the corresponding host into native
 delegation:
@@ -48,14 +53,16 @@ delegation:
 {
   "nativePrompt": {
     "codex": true,
+    "grok": true,
     "kimi": true
   }
 }
 ```
 
-Both flags default to `false`. The guard never assumes that printing a snippet
-means it was installed. Kimi delegation also requires both normalized argv and
-the original command prefix to prove that the permission rule will match.
+All flags default to `false`. The guard never assumes that printing a snippet
+means it was installed. Grok and Kimi delegation also require both normalized
+argv and the original command prefix to prove that the permission rule will
+match.
 
 ## Decisions
 
@@ -66,9 +73,11 @@ The core returns four states:
 3. `review`: eligible for a configured second-model review.
 4. `allow`: no guard intervention.
 
-Claude supports hook-level prompts. Codex and Kimi only receive a delegated
-confirmation when a matching native rule is guaranteed. Otherwise the configured
-mode controls the fallback.
+Claude supports hook-level prompts. Codex, Grok, and Kimi only receive a
+delegated confirmation when a matching native rule is guaranteed. Otherwise
+the configured mode controls the fallback. Grok's hook adapter accepts its
+camelCase `run_terminal_command` events and emits Grok's native deny response;
+an omitted response continues into Grok's permission pipeline.
 
 ## Modes
 
@@ -122,6 +131,7 @@ AGENT_SHELL_GUARD_PROFILE
 AGENT_SHELL_GUARD_SHFMT
 AGENT_SHELL_GUARD_PROTECTED_ROOTS
 AGENT_SHELL_GUARD_NATIVE_PROMPT_CODEX
+AGENT_SHELL_GUARD_NATIVE_PROMPT_GROK
 AGENT_SHELL_GUARD_NATIVE_PROMPT_KIMI
 AGENT_SHELL_GUARD_REVIEWER_COMMAND
 AGENT_SHELL_GUARD_REVIEWER_MODEL

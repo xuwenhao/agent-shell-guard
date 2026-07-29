@@ -24,7 +24,7 @@ const DEFAULT_LAUNCHER_PATH = join(homedir(), '.local', 'bin', 'agent-shell-guar
  *   shfmtPath: string,
  *   zshPath?: string,
  *   protectedRoots: string[],
- *   nativePrompt: {codex: boolean, kimi: boolean},
+ *   nativePrompt: {codex: boolean, grok: boolean, kimi: boolean},
  *   reviewer: ReviewerConfig|null,
  * }} GuardConfig
  */
@@ -125,6 +125,10 @@ export function loadConfig(options = {}) {
       codex: booleanOverride(
         env.AGENT_SHELL_GUARD_NATIVE_PROMPT_CODEX,
         nativePromptValue.codex === true,
+      ),
+      grok: booleanOverride(
+        env.AGENT_SHELL_GUARD_NATIVE_PROMPT_GROK,
+        nativePromptValue.grok === true,
       ),
       kimi: booleanOverride(
         env.AGENT_SHELL_GUARD_NATIVE_PROMPT_KIMI,

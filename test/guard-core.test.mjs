@@ -101,3 +101,16 @@ test('ignores unrelated tools and accepts tokenized argv literally', () => {
   assert.equal(evaluateHookEvent({ tool_name: 'Read', tool_input: {} }), null);
   assert.equal(evaluate(['printf', 'rm -rf /']).kind, 'allow');
 });
+
+test('accepts Grok Build camelCase terminal hook events', () => {
+  const result = evaluateHookEvent({
+    hookEventName: 'pre_tool_use',
+    toolName: 'run_terminal_command',
+    toolInput: { command: 'git push origin main --force' },
+  }, {
+    profile: 'dangerous-only',
+    shfmtPath: SHFMT,
+  });
+  assert.ok(result);
+  assert.equal(result.kind, 'deny');
+});
