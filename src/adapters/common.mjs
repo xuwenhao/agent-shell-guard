@@ -42,6 +42,24 @@ export function hookOutput(permissionDecision, reason) {
   };
 }
 
+/**
+ * @param {string} ruleId
+ * @param {{nativePromptArgv: string[]|null}} analysis
+ * @param {string} command
+ * @param {Map<string, string[][]>} prefixesByRule
+ */
+export function isNativePromptCovered(ruleId, analysis, command, prefixesByRule) {
+  const prefixes = prefixesByRule.get(ruleId);
+  const argv = analysis.nativePromptArgv;
+  if (prefixes === undefined || argv === null) return false;
+  return prefixes.some((prefix) => {
+    const argvMatches = prefix.every((part, index) => argv[index] === part);
+    const literal = prefix.join(' ');
+    const sourceMatches = command === literal || command.startsWith(`${literal} `);
+    return argvMatches && sourceMatches;
+  });
+}
+
 /** @param {Record<string, unknown>} event */
 export function reviewerToolReason(event) {
   const toolName = String(event.tool_name ?? event.toolName ?? '');

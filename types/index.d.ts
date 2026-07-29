@@ -89,7 +89,7 @@ export interface GuardConfig {
   shfmtPath: string;
   zshPath?: string;
   protectedRoots: string[];
-  nativePrompt: { codex: boolean; grok?: boolean; kimi: boolean };
+  nativePrompt: { codex: boolean; grok: boolean; kimi: boolean };
   reviewer: ReviewerConfig | null;
 }
 

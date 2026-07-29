@@ -173,6 +173,8 @@ export function configSnippet(host) {
 /** @param {'codex'|'grok'|'kimi'} host */
 export function nativeRulesSnippet(host) {
   if (host === 'grok') {
+    // Grok's permission schema names the terminal tool class "bash"; this is
+    // intentionally distinct from the hook event tool name run_terminal_command.
     return GROK_PERMISSION_PATTERNS.map((pattern) =>
       `[[permission.rules]]\naction = "ask"\ntool = "bash"\npattern = ${JSON.stringify(pattern)}`,
     ).join('\n\n');
