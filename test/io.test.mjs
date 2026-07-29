@@ -43,3 +43,15 @@ test('CLI fails closed for invalid hook input', () => {
     assert.match(output.hookSpecificOutput.permissionDecisionReason, /fail-closed/);
   }
 });
+
+test('Grok CLI failures use its blocking hook output contract', () => {
+  const result = spawnSync(process.execPath, [CLI, 'hook', 'grok'], {
+    input: 'not-json',
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.decision, 'deny');
+  assert.match(output.reason, /fail-closed/);
+  assert.equal(output.hookSpecificOutput, undefined);
+});

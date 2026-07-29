@@ -89,7 +89,7 @@ export interface GuardConfig {
   shfmtPath: string;
   zshPath?: string;
   protectedRoots: string[];
-  nativePrompt: { codex: boolean; kimi: boolean };
+  nativePrompt: { codex: boolean; grok?: boolean; kimi: boolean };
   reviewer: ReviewerConfig | null;
 }
 
@@ -99,6 +99,11 @@ export interface HookOutput {
     permissionDecision: 'ask' | 'deny';
     permissionDecisionReason: string;
   };
+}
+
+export interface GrokHookOutput {
+  decision: 'deny';
+  reason: string;
 }
 
 export function analyzeShellInput(input: ShellInput, options: AnalyzeOptions): ShellGraph;
@@ -135,7 +140,16 @@ export function resolveDecision(
 };
 export function adaptClaude(event: Record<string, unknown>, config: GuardConfig): HookOutput | null;
 export function adaptCodex(event: Record<string, unknown>, config: GuardConfig): HookOutput | null;
+export function adaptGrok(event: Record<string, unknown>, config: GuardConfig): GrokHookOutput | null;
+export function grokDenyOutput(reason: string): GrokHookOutput;
 export function adaptKimi(event: Record<string, unknown>, config: GuardConfig): HookOutput | null;
+export const GROK_NATIVE_PROMPT_PREFIXES: Map<string, string[][]>;
+export const GROK_PERMISSION_PATTERNS: string[];
+export function isGrokNativePromptCovered(
+  ruleId: string,
+  analysis: Pick<ShellGraph, 'nativePromptArgv'>,
+  command: string,
+): boolean;
 export const KIMI_NATIVE_PROMPT_PREFIXES: Map<string, string[][]>;
 export const KIMI_PERMISSION_PATTERNS: string[];
 export function isKimiNativePromptCovered(
