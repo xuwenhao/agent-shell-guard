@@ -31,6 +31,8 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   wrappers: string[],
  *   hasRedirection: boolean,
  *   pipelineGroup: number|null,
+ *   resolvedArgv: Array<string|null>,
+ *   argvSuffix: Array<string|null>,
  * }} AnalyzedCommand
  */
 /**
@@ -161,6 +163,197 @@ function staticWord(word) {
     result += value;
   }
   return expandHome ? `${homedir()}${result.slice(1)}` : result;
+}
+
+// --- straight-line constant propagation -------------------------------------
+//
+// A guard rule that refuses every `$VAR` target is useless in practice: agents
+// routinely write `S=/tmp/scratch; rm -rf "$S/art"`. Resolving those names turns
+// an "unknown, deny" into a real path decision. Soundness rules, deliberately
+// conservative:
+//   * only assignments on the top-level straight line (File.Stmts and the two
+//     sides of `&&` / `||` / `;`) are trusted; anything inside if/for/while/
+//     case/function/subshell/pipeline-tail poisons the name forever, because we
+//     cannot know whether that branch ran;
+//   * `NAME=x cmd` is transient (scoped to that command) and never recorded;
+//   * a name bound by `for NAME in`, `read NAME` or cleared by `unset` is poisoned;
+//   * only the last assignment *before* the command's own offset applies.
+// A word we still cannot resolve gets a literal suffix instead (`"$S/art"` →
+// `/art`), which is enough to prove the target is not a protected root.
+
+/** @typedef {{kind: 'lit', value: string}|{kind: 'param', name: string}|{kind: 'opaque'}} WordSegment */
+
+/** @param {unknown} part @param {boolean} doubleQuoted @returns {WordSegment[]} */
+function partSegments(part, doubleQuoted) {
+  if (!isObject(part)) return [{ kind: 'opaque' }];
+  if (part.Type === 'Lit' || part.Type === 'SglQuoted') {
+    const value = staticPart(part, doubleQuoted);
+    return value === null ? [{ kind: 'opaque' }] : [{ kind: 'lit', value }];
+  }
+  if (part.Type === 'DblQuoted') {
+    const parts = Array.isArray(part.Parts) ? part.Parts : [];
+    return parts.flatMap((child) => partSegments(child, true));
+  }
+  if (part.Type === 'ParamExp') {
+    // Only a plain `$NAME` / `${NAME}` is a name lookup. Index, slicing,
+    // replacement, length and the `${x:-y}` family all change the value in ways
+    // the const table cannot model, so they stay opaque.
+    const param = isObject(part.Param) ? part.Param : null;
+    const name = param && typeof param.Value === 'string' ? param.Value : null;
+    const plain = name !== null && !part.Excl && !part.Length && !part.Width &&
+      !part.Index && !part.Slice && !part.Repl && !part.Names && !part.Exp;
+    return plain ? [{ kind: 'param', name: /** @type {string} */ (name) }] : [{ kind: 'opaque' }];
+  }
+  return [{ kind: 'opaque' }];
+}
+
+/** @param {unknown} word @returns {WordSegment[]|null} */
+function wordSegments(word) {
+  if (!isObject(word) || !Array.isArray(word.Parts)) return null;
+  const first = word.Parts[0];
+  const firstLiteral = isObject(first) && first.Type === 'Lit' && typeof first.Value === 'string' ? first.Value : '';
+  if (firstLiteral === '~' && word.Parts.length > 1) return null;
+  const segments = word.Parts.flatMap((part) => partSegments(part, false));
+  if (firstLiteral.startsWith('~/') || (firstLiteral === '~' && word.Parts.length === 1)) {
+    const head = segments[0];
+    if (head?.kind !== 'lit') return null;
+    segments[0] = { kind: 'lit', value: `${homedir()}${head.value.slice(1)}` };
+  }
+  return segments;
+}
+
+/**
+ * Assignment table for one parsed script.
+ * @typedef {{assignments: Array<{name: string, offset: number, value: string|null}>, poisoned: Set<string>}} ConstScope
+ */
+
+/** @param {unknown} node @param {ConstScope} scope */
+function poisonNames(node, scope) {
+  if (Array.isArray(node)) { for (const item of node) poisonNames(item, scope); return; }
+  if (!isObject(node)) return;
+  if (node.Type === 'Assign' && isObject(node.Name) && typeof node.Name.Value === 'string') {
+    scope.poisoned.add(node.Name.Value);
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (['Pos', 'End', 'Position', 'ValuePos', 'ValueEnd', 'OpPos', 'Rparen'].includes(key)) continue;
+    poisonNames(value, scope);
+  }
+}
+
+/** @param {unknown} assign @param {ConstScope} scope */
+function recordAssign(assign, scope) {
+  if (!isObject(assign) || !isObject(assign.Name) || typeof assign.Name.Value !== 'string') return;
+  const name = assign.Name.Value;
+  // Append (`+=`), array literals and indexed writes are not simple rebinds.
+  if (assign.Append || assign.Array || assign.Index || assign.Naked) { scope.poisoned.add(name); return; }
+  const value = assign.Value === undefined || assign.Value === null ? '' : staticWord(assign.Value);
+  scope.assignments.push({ name, offset: offsetOf(assign, 'Pos'), value });
+}
+
+/** @param {unknown} node @param {ConstScope} scope @param {string} text @param {boolean} straight */
+function collectAssignments(node, scope, text, straight) {
+  if (Array.isArray(node)) { for (const item of node) collectAssignments(item, scope, text, straight); return; }
+  if (!isObject(node)) return;
+  const type = typeof node.Type === 'string' ? node.Type : '';
+
+  if (type === 'Stmt') {
+    // A backgrounded statement runs concurrently; its writes are not ordered.
+    collectAssignments(node.Cmd, scope, text, straight && node.Background !== true);
+    return;
+  }
+  if (type === 'BinaryCmd') {
+    const opPos = isObject(node.OpPos) && typeof node.OpPos.Offset === 'number' ? node.OpPos.Offset : 0;
+    const operator = text.slice(opPos, opPos + 2);
+    const isPipeline = operator.startsWith('|') && !operator.startsWith('||');
+    collectAssignments(node.X, scope, text, straight && !isPipeline);
+    collectAssignments(node.Y, scope, text, straight && !isPipeline);
+    return;
+  }
+  if (type === 'CallExpr') {
+    const args = Array.isArray(node.Args) ? node.Args : [];
+    if (args.length === 0) {
+      // Bare `NAME=value` — persists in the current shell.
+      for (const assign of Array.isArray(node.Assigns) ? node.Assigns : []) {
+        if (straight) recordAssign(assign, scope);
+        else poisonNames(assign, scope);
+      }
+    } else {
+      // `NAME=value cmd` is scoped to cmd only; never a persistent binding.
+      poisonNames(node.Assigns, scope);
+      const argv = args.map(staticWord);
+      const head = typeof argv[0] === 'string' ? basename(argv[0]) : '';
+      if (head === 'read' || head === 'unset' || head === 'mapfile' || head === 'readarray' || head === 'getopts') {
+        for (const arg of argv.slice(1)) {
+          if (typeof arg === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) scope.poisoned.add(arg);
+        }
+      }
+    }
+    return;
+  }
+  if (type === 'DeclClause') {
+    const variant = isObject(node.Variant) && typeof node.Variant.Value === 'string' ? node.Variant.Value : '';
+    for (const arg of Array.isArray(node.Args) ? node.Args : []) {
+      if (variant === 'unset') { poisonNames(arg, scope); continue; }
+      if (straight) recordAssign(arg, scope);
+      else poisonNames(arg, scope);
+    }
+    return;
+  }
+  if (type === 'ForClause') {
+    const loop = isObject(node.Loop) ? node.Loop : null;
+    if (loop && isObject(loop.Name) && typeof loop.Name.Value === 'string') scope.poisoned.add(loop.Name.Value);
+    poisonNames(node, scope);
+    return;
+  }
+  if (type === 'IfClause' || type === 'WhileClause' || type === 'CaseClause' ||
+      type === 'FuncDecl' || type === 'Subshell' || type === 'Block' ||
+      type === 'CmdSubst' || type === 'ProcSubst' || type === 'TestClause' ||
+      type === 'ArithmCmd' || type === 'LetClause' || type === 'TimeClause' || type === 'CoprocClause') {
+    poisonNames(node, scope);
+    return;
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (['Pos', 'End', 'Position', 'ValuePos', 'ValueEnd', 'OpPos', 'Rparen'].includes(key)) continue;
+    collectAssignments(value, scope, text, straight);
+  }
+}
+
+/** @param {ConstScope} scope @param {string} name @param {number} atOffset @returns {string|null} */
+function lookupConst(scope, name, atOffset) {
+  if (name === 'HOME') return homedir();
+  if (scope.poisoned.has(name)) return null;
+  let resolved = null;
+  for (const entry of scope.assignments) {
+    if (entry.name !== name) continue;
+    if (entry.offset >= atOffset) break;
+    resolved = entry.value;
+  }
+  return resolved;
+}
+
+/**
+ * @param {WordSegment[]|null} segments @param {ConstScope} scope @param {number} atOffset
+ * @returns {{value: string|null, suffix: string|null}}
+ */
+function resolveSegments(segments, scope, atOffset) {
+  if (segments === null) return { value: null, suffix: null };
+  let value = '';
+  let resolved = true;
+  for (const segment of segments) {
+    if (segment.kind === 'lit') { value += segment.value; continue; }
+    const found = segment.kind === 'param' ? lookupConst(scope, segment.name, atOffset) : null;
+    if (found === null) { resolved = false; break; }
+    value += found;
+  }
+  if (resolved) return { value, suffix: null };
+  // Fall back to the literal tail: only meaningful when the *first* segment is
+  // the unknown one and every later segment is a literal starting a new path
+  // component, e.g. `"$S/art"`. Anything else (`"$P"base`, `"$A/$B"`) stays unknown.
+  const [head, ...rest] = segments;
+  if (head === undefined || head.kind === 'lit') return { value: null, suffix: null };
+  if (rest.length === 0 || !rest.every((segment) => segment.kind === 'lit')) return { value: null, suffix: null };
+  const suffix = rest.map((segment) => /** @type {{kind:'lit', value:string}} */ (segment).value).join('');
+  return { value: null, suffix: suffix.startsWith('/') ? suffix : null };
 }
 
 /** @param {Array<string|null>} rawArgv */
@@ -313,7 +506,11 @@ export function analyzeShellInput(input, options) {
     /** @type {ShellGraph} */
     const graph = {
       status: 'safe', dialect,
-      commands: [{ argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 }, wrappers, hasRedirection: false, pipelineGroup: null }],
+      commands: [{
+        argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 },
+        wrappers, hasRedirection: false, pipelineGroup: null,
+        resolvedArgv: argv, argvSuffix: argv.map(() => null),
+      }],
       unknowns: [], hasPipeline: false, hasRedirection: false, hasSubstitution: false,
       hasCompound: false, nativePromptArgv: wrappers.length ? null : rawArgv,
     };
@@ -431,6 +628,13 @@ export function analyzeShellInput(input, options) {
     }
     if (ast.Stmts.length !== 1) graph.hasCompound = true;
 
+    // Constant table for this script only; nested `bash -c`/`eval` bodies get
+    // their own, so an outer binding never leaks into an inner evaluator.
+    /** @type {ConstScope} */
+    const scope = { assignments: [], poisoned: new Set() };
+    collectAssignments(ast.Stmts, scope, text, true);
+    scope.assignments.sort((left, right) => left.offset - right.offset);
+
     /** @param {unknown} node @param {CommandSource} nodeSource @param {number|null} [pipelineGroup] */
     function walk(node, nodeSource, pipelineGroup = null) {
       if (Array.isArray(node)) { for (const item of node) walk(item, nodeSource, pipelineGroup); return; }
@@ -451,11 +655,16 @@ export function analyzeShellInput(input, options) {
         const rawArgv = words.map(staticWord);
         const displayArgv = words.map((word) => isObject(word) ? text.slice(offsetOf(word, 'Pos'), offsetOf(word, 'End')) : '<?>');
         const { argv, wrappers } = unwrapCommand(rawArgv);
+        const commandStart = offsetOf(node, 'Pos');
+        const rawResolved = words.map((word) => resolveSegments(wordSegments(word), scope, commandStart));
+        const argvOffset = Math.max(0, rawArgv.length - argv.length);
+        const resolvedArgv = argv.map((arg, index) => arg ?? rawResolved[argvOffset + index]?.value ?? null);
+        const argvSuffix = argv.map((arg, index) => arg === null ? rawResolved[argvOffset + index]?.suffix ?? null : null);
         const command = {
           argv, rawArgv, displayArgv, dialect: currentDialect, source: nodeSource,
-          span: { start: offsetOf(node, 'Pos'), end: offsetOf(node, 'End') },
+          span: { start: commandStart, end: offsetOf(node, 'End') },
           wrappers, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
-          pipelineGroup,
+          pipelineGroup, resolvedArgv, argvSuffix,
         };
         graph.commands.push(command);
         if (argv[0] === null || argv.length === 0) unknown('dynamic-command', 'command name cannot be reconstructed statically');

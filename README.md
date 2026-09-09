@@ -151,9 +151,25 @@ known non-main ref and `git reset --hard origin/<non-main>` to the host's own
 approval layer; `full` adds guard-level confirmation for them. A force push
 whose target ref cannot be resolved remains a hard deny.
 
-All `git checkout` forms are conservatively classified as destructive because
-the command can replace working-tree content. Use `git switch` for ordinary
-branch changes when that confirmation is unnecessary.
+`git checkout` is classified by its arguments, not by its name: switching or
+creating a branch is left to the host's approval layer, while the forms that can
+replace working-tree content (`--`, `.`, `--force`, `--ours`, `--theirs`,
+`--merge`, `-p`, a second positional, a target that resolves to an existing path,
+or an unresolvable one) stay destructive. `git worktree remove` is only
+destructive when `--force` is used on a path outside a throwaway location
+(`.worktrees/`, `.claude/worktrees/`, `/tmp`), because git itself refuses to drop
+a dirty worktree otherwise. `git branch -d/-D` is destructive only for `main` /
+`master` or an unresolvable branch name; deleting a task branch leaves the
+commits reachable through the reflog.
+
+Targets and endpoints written as `$VAR` are resolved when the assignment sits on
+the same straight line of the same script (`S=/tmp/x; rm -rf "$S/art"`).
+Assignments inside `if` / `for` / `while` / `case` / functions / subshells /
+pipeline tails, `NAME=value cmd` prefixes, loop and `read` bindings, and appends
+all poison the name instead, because the guard cannot prove which value reached
+the command. A word that stays unresolved may still be judged by its literal
+tail: `"$SCRATCH/issue-1055"` cannot *be* a protected root, while `"$X"`,
+`"$X/.."`, `"$X/*"` and `"$X"base` can, and remain denied.
 
 `off` does not disable the parser health check: without a reliable command graph,
 the guard cannot prove that hard-deny rules were not bypassed.
