@@ -115,69 +115,7 @@ test('accepts Grok Build camelCase terminal hook events', () => {
   assert.equal(result.kind, 'deny');
 });
 
-// --- straight-line constant propagation -------------------------------------
-
-test('resolves straight-line literal assignments before judging rm targets', () => {
-  const allowed = [
-    'S=/tmp/claude-1000/session/scratchpad; rm -rf "$S/art"',
-    'SCRATCH="/tmp/claude-1000/x" && rm -rf "$SCRATCH/issue-1055" && mkdir -p "$SCRATCH"',
-    'T=scripts/dev/out/forensics-cases/dogfood && rm -rf $T',
-    'W=/home/xuwenhao/Codebase/srpone/zooclaw/wt; rm -rf "$W/services/claw-interface/.venv"',
-    'export OVERLAY=/tmp/claude-1000/x/overlay && rm -rf "$OVERLAY"',
-  ];
-  for (const command of allowed) {
-    assert.equal(evaluate(command, 'dangerous-only').kind, 'allow', command);
-  }
-});
-
-test('still denies rm when a resolved or unresolvable target could be a protected root', () => {
-  const denied = [
-    // resolves straight back to a protected root
-    `S=${homedir()}; rm -rf "$S"`,
-    `S=${homedir()}; rm -rf "$S/"`,
-    'S=/; rm -rf "$S"',
-    // assigned inside a branch: we cannot know whether it ran
-    `if true; then S=${homedir()}; fi; rm -rf "$S"`,
-    // rebound by a loop variable
-    `for S in a b; do :; done; rm -rf "$S"`,
-    // assignment lives in a pipeline tail, i.e. a subshell
-    `true | S=${homedir()}; rm -rf "$S"`,
-    // no literal tail to prove the target is deeper than a root
-    'rm -rf "$UNSET_TARGET"',
-    // a tail that can climb back up is not proof
-    'rm -rf "$UNSET_TARGET/.."',
-    'rm -rf "$UNSET_TARGET/*"',
-    // concatenation without a path separator: "$P" + "base" may still be a root
-    'rm -rf "$UNSET_TARGET"base',
-    // transient `NAME=value cmd` bindings never persist
-    `X=${homedir()} true; rm -rf "$X"`,
-  ];
-  for (const command of denied) {
-    const result = evaluate(command, 'dangerous-only');
-    assert.equal(result.kind, 'deny', command);
-    assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root', command);
-  }
-});
-
-test('a literal path tail proves the rm target is not a protected root', () => {
-  assert.equal(evaluate('rm -rf "$SCRATCH/issue-1055"', 'dangerous-only').kind, 'allow');
-  assert.equal(evaluate('rm -rf "${D}/raw"', 'dangerous-only').kind, 'allow');
-});
-
 // --- gh api endpoints -------------------------------------------------------
-
-test('repo-scoped gh api writes are not org ruleset writes', () => {
-  const allowed = [
-    'R=SerendipityOneInc/zooclaw-engine; gh api repos/$R/pulls/1201/comments -f body=hi',
-    'gh api -X PATCH repos/SerendipityOneInc/zooclaw-engine/code-scanning/alerts/$n -f state=dismissed',
-    'gh api -X POST repos/o/r/pulls/885/comments/$CID/replies -f body=x',
-    'gh api -X PATCH /repos/o/r/pulls/966 -F body=@/tmp/body.md',
-    'gh api repos/o/r/actions/runs/$RUN/pending_deployments -X POST -f state=approved',
-  ];
-  for (const command of allowed) {
-    assert.equal(evaluate(command, 'dangerous-only').kind, 'allow', command);
-  }
-});
 
 test('org ruleset writes stay denied however the endpoint is spelled', () => {
   const denied = [
@@ -246,42 +184,7 @@ test('a lone checkout operand is ambiguous unless a flag states branch intent', 
   }
 });
 
-// --- soundness holes found in review of the constant-propagation change ------
-
-test('an assignment that may never run cannot license the command that follows', () => {
-  // `&&` / `||` gate their right side on the previous command's status, and `|`
-  // subshells it: in every case the binding may not be the one that reaches the rm.
-  const denied = [
-    `S=${homedir()}; false && S=/tmp/safe; rm -rf "$S"`,
-    `S=${homedir()}; true || S=/tmp/safe; rm -rf "$S"`,
-    `S=${homedir()}; echo x | S=/tmp/safe; rm -rf "$S"`,
-  ];
-  for (const command of denied) {
-    const result = evaluate(command, 'dangerous-only');
-    assert.equal(result.kind, 'deny', command);
-    assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root', command);
-  }
-  // The left side of `&&` does run, so the everyday form still resolves.
-  assert.equal(evaluate('S=/tmp/claude/x && rm -rf "$S/art"', 'dangerous-only').kind, 'allow');
-});
-
-test('eval can rebind a name, so it drops every constant in the script', () => {
-  const command = `S=/tmp/safe; eval 'S=${homedir()}'; rm -rf "$S"`;
-  const result = evaluate(command, 'dangerous-only');
-  assert.equal(result.kind, 'deny');
-  assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root');
-});
-
-test('a literal tail only clears the target when no protected root ends with it', () => {
-  // `$BASE` could be /home, making this exactly the protected home directory.
-  const home = homedir();
-  const leaf = home.slice(home.lastIndexOf('/'));
-  const result = evaluate(`rm -rf "$BASE${leaf}"`, 'dangerous-only');
-  assert.equal(result.kind, 'deny');
-  assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root');
-  // A tail no protected root ends with stays provably safe.
-  assert.equal(evaluate('rm -rf "$BASE/issue-1055"', 'dangerous-only').kind, 'allow');
-});
+// --- argument shapes found in review ----------------------------------------
 
 test('git expands pathspecs itself, so glob arguments are not branch names', () => {
   for (const command of ["git checkout '*.txt'", "git checkout 'src/*'", "git checkout ':(glob)**/*.ts'"]) {
@@ -326,20 +229,15 @@ test('sourcing a file drops constants the same way eval does', () => {
   }
 });
 
-test('resolved targets are lexically normalized before the root comparison', () => {
-  // Propagation turned a variable target into a literal, so `..` and `.` segments
-  // could walk back onto a protected root while comparing unequal as strings.
+test('protected-root comparison collapses `.` and `..` first', () => {
+  // A literal that walks back onto a protected root compared unequal as a string.
   const home = homedir();
-  for (const command of [
-    `S=${home}/x/..; rm -rf "$S"`,
-    `S=${home}/./; rm -rf "$S"`,
-    'S=/tmp/..; rm -rf "$S"',
-  ]) {
+  for (const command of [`rm -rf ${home}/x/..`, `rm -rf ${home}/./`, 'rm -rf /tmp/..']) {
     const result = evaluate(command, 'dangerous-only');
     assert.equal(result.kind, 'deny', command);
     assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root', command);
   }
-  assert.equal(evaluate(`S=${home}/task/../task; rm -rf "$S"`, 'dangerous-only').kind, 'allow');
+  assert.equal(evaluate(`rm -rf ${home}/task/../task`, 'dangerous-only').kind, 'allow');
 });
 
 test('checkout --pathspec-from-file discards working-tree state', () => {
@@ -364,32 +262,7 @@ test('short options are split from their attached operand', () => {
   assert.equal(evaluate('git checkout -bfix/parse', 'dangerous-only').kind, 'allow');
 });
 
-// --- third review round: expansion semantics and path shape -----------------
-
-test('an unquoted expansion is field-split, so a multi-word value is not one target', () => {
-  const command = `S='${homedir()} /tmp/safe'; rm -rf $S`;
-  const result = evaluate(command, 'dangerous-only');
-  assert.equal(result.kind, 'deny');
-  assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root');
-  // A single-word value still resolves unquoted — that is the common real form.
-  assert.equal(evaluate('T=scripts/dev/out/case && rm -rf $T', 'dangerous-only').kind, 'allow');
-  // A glob in the value would expand to other paths too.
-  assert.equal(evaluate('S=/tmp/claude/* ; rm -rf $S', 'dangerous-only').kind, 'deny');
-});
-
-test('expansions and builtins that write a variable poison it', () => {
-  const denied = [
-    `S=/tmp/safe; echo "\${S:=${homedir()}}"; rm -rf "$S"`,
-    `S=/tmp/safe; echo "\${S=${homedir()}}"; rm -rf "$S"`,
-    `S=/tmp/safe; printf -v S ${homedir()}; rm -rf "$S"`,
-    `S=/tmp/safe; printf -vS ${homedir()}; rm -rf "$S"`,
-  ];
-  for (const command of denied) {
-    const result = evaluate(command, 'dangerous-only');
-    assert.equal(result.kind, 'deny', command);
-    assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root', command);
-  }
-});
+// --- path shape --------------------------------------------------------------
 
 test('worktree targets are normalized before the throwaway exemption', () => {
   const result = evaluate('git worktree remove --force /tmp/../srv/project/production', 'dangerous-only');

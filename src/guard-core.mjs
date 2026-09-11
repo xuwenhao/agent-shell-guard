@@ -46,7 +46,7 @@ function hasRecursiveFlag(argv) {
 
 /** @param {AnalyzedCommand} command */
 function commandTargets(command) {
-  /** @type {Array<{value: string|null, display: string, suffix: string|null}>} */
+  /** @type {Array<{value: string|null, display: string}>} */
   const targets = [];
   const display = effectiveDisplayArgv(command);
   let options = true;
@@ -54,42 +54,15 @@ function commandTargets(command) {
     const arg = command.argv[index];
     if (options && arg === '--') { options = false; continue; }
     if (options && typeof arg === 'string' && arg.startsWith('-')) continue;
-    // `resolvedArgv` folds in straight-line `NAME=literal` assignments from the
-    // same script, so `S=/tmp/x; rm -rf "$S/art"` is a real path here.
-    const resolved = arg ?? command.resolvedArgv[index] ?? null;
-    targets.push({ value: resolved, display: arg ?? display[index] ?? '<?>', suffix: command.argvSuffix[index] ?? null });
+    targets.push({ value: arg, display: arg ?? display[index] ?? '<?>' });
   }
   return targets;
 }
 
 /**
- * A word we could not resolve may still be provably *not* a protected root, via
- * its literal tail: `"$SCRATCH/issue-1055"` ends in `/issue-1055`, and no
- * protected root ends that way, so whatever `$SCRATCH` holds the result cannot
- * equal one. That last clause is the whole point — a tail alone proves nothing.
- * `rm -rf "$BASE/xuwenhao"` with `BASE=/home` lands exactly on the protected
- * home directory, so a tail that could complete a protected root stays unknown,
- * as do `..` and glob metacharacters, which can climb back up.
- * @param {string|null} suffix @param {string[]} protectedRoots
- */
-function suffixEscapesProtectedRoot(suffix, protectedRoots) {
-  if (typeof suffix !== 'string' || !suffix.startsWith('/')) return false;
-  const segments = suffix.split('/').filter((segment) => segment !== '');
-  if (segments.length === 0) return false;
-  if (!segments.every((segment) => segment !== '..' && !/[*?[\]]/.test(segment))) return false;
-  const tail = `/${segments.join('/')}`;
-  return !protectedRoots.some((root) => {
-    const normalized = normalizeProtectedRoot(root);
-    return normalized === tail || normalized.endsWith(tail);
-  });
-}
-
-/**
- * Lexically collapse `.` and `..` before any protected-root comparison. Constant
- * propagation made this necessary: `S=/tmp/../root; rm -rf "$S"` resolves to a
- * literal that *looks* unlike `/root` but reaches it at execution time, and the
- * pre-propagation behaviour (unknown → deny) used to cover that. Purely lexical
- * on purpose — no filesystem access in a PreToolUse hook — which is also the
+ * Lexically collapse `.` and `..` before any protected-root comparison, so
+ * `rm -rf /tmp/../root` is recognised as hitting `/root`. Purely lexical on
+ * purpose — a PreToolUse hook must not touch the filesystem — which is also the
  * conservative direction, since it can only make more paths match a root.
  * @param {string} value
  */
@@ -153,15 +126,7 @@ function parseGitCommand(command) {
   }
   const subcommand = command.argv[index];
   if (typeof subcommand !== 'string') return null;
-  const argOffset = index + 1;
-  const args = command.argv.slice(argOffset);
-  return {
-    subcommand,
-    args,
-    argOffset,
-    // Same positions as `args`, with straight-line `NAME=literal` folded in.
-    resolved: args.map((arg, position) => arg ?? command.resolvedArgv[argOffset + position] ?? null),
-  };
+  return { subcommand, args: command.argv.slice(index + 1), argOffset: index + 1 };
 }
 
 /** @param {AnalyzedCommand} command */
@@ -200,7 +165,7 @@ function pushRefs(command) {
       if (valueFlags.has(token)) index++;
       continue;
     }
-    positionals.push({ value: git.resolved[index], display: token });
+    positionals.push({ value: arg, display: token });
   }
   return positionals.slice(1);
 }
@@ -211,8 +176,8 @@ function shortOptionHas(arg, letters) {
 }
 
 /**
- * Positional arguments of a git subcommand, resolved where possible.
- * @param {{args: Array<string|null>, resolved: Array<string|null>}} git
+ * Positional arguments of a git subcommand.
+ * @param {{args: Array<string|null>}} git
  * @param {Set<string>} [valueFlags]
  */
 function gitPositionals(git, valueFlags = new Set()) {
@@ -226,7 +191,7 @@ function gitPositionals(git, valueFlags = new Set()) {
       if (valueFlags.has(arg)) index++;
       continue;
     }
-    positionals.push(git.resolved[index]);
+    positionals.push(arg);
   }
   return positionals;
 }
@@ -234,20 +199,11 @@ function gitPositionals(git, valueFlags = new Set()) {
 const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
 
 /**
- * `git checkout` is two commands wearing one name: switching branches (cheap,
- * reversible) and restoring paths from a tree-ish (silently discards edits).
- * Only the second needs a human. When the single positional could be either, we
- * ask the filesystem — an existing path means it is a pathspec.
- * @param {{args: Array<string|null>, resolved: Array<string|null>}} git
- * @param {string|undefined} cwd
- * @returns {'git-destructive'|'git-low-risk'|null}
- */
-/**
  * Split checkout's argv the way git does. Short options cluster (`-qB`) and may
  * carry their operand attached (`-Bmain`), so scanning for a standalone `-B`
  * token both misses the branch name and mistakes the operand's letters for more
  * flags — `-Bmain` would read as if `-m` were present.
- * @param {{args: Array<string|null>, resolved: Array<string|null>}} git
+ * @param {{args: Array<string|null>}} git
  */
 function parseCheckoutArgs(git) {
   const SHORT_WITH_OPERAND = 'bBcC';
@@ -261,7 +217,7 @@ function parseCheckoutArgs(git) {
 
   for (let index = 0; index < git.args.length; index++) {
     const raw = git.args[index];
-    if (endOfOptions) { positionals.push(git.resolved[index]); continue; }
+    if (endOfOptions) { positionals.push(raw); continue; }
     if (raw === null) { positionals.push(null); continue; }
     if (raw === '--') { flags.push('--'); endOfOptions = true; continue; }
     if (raw.startsWith('--')) {
@@ -269,7 +225,7 @@ function parseCheckoutArgs(git) {
       const name = eq === -1 ? raw : raw.slice(0, eq);
       flags.push(name);
       const operand = eq === -1 ? undefined : raw.slice(eq + 1);
-      if (name === '--orphan') createTarget = operand ?? git.resolved[++index] ?? null;
+      if (name === '--orphan') createTarget = operand ?? git.args[++index] ?? null;
       else if (operand === undefined && LONG_WITH_OPERAND.has(name)) index++;
       continue;
     }
@@ -280,7 +236,7 @@ function parseCheckoutArgs(git) {
         letters.push(letter);
         if (!SHORT_WITH_OPERAND.includes(letter)) continue;
         const attached = cluster.slice(cursor + 1);
-        const operand = attached !== '' ? attached : git.resolved[++index] ?? null;
+        const operand = attached !== '' ? attached : git.args[++index] ?? null;
         if (letter === 'b' || letter === 'B') {
           createTarget = operand;
           if (letter === 'B') forceCreate = true;
@@ -289,7 +245,7 @@ function parseCheckoutArgs(git) {
       }
       continue;
     }
-    positionals.push(git.resolved[index]);
+    positionals.push(raw);
   }
   return { flags, letters, positionals, createTarget, forceCreate };
 }
@@ -297,9 +253,10 @@ function parseCheckoutArgs(git) {
 /**
  * `git checkout` is two commands under one name: switching or creating a branch
  * (cheap, reversible) and restoring paths from a tree-ish (silently discards
- * edits). Only the second needs a human. When a lone positional could be either,
- * ask the filesystem — an existing path means it is a pathspec.
- * @param {{args: Array<string|null>, resolved: Array<string|null>}} git
+ * edits). Only the second needs a human. A lone positional can be either, and
+ * nothing in the argv settles it, so it stays destructive unless an explicit
+ * branch-intent flag says otherwise.
+ * @param {{args: Array<string|null>}} git
  * @returns {'git-destructive'|'git-low-risk'|null}
  */
 function checkoutRule(git) {
@@ -345,7 +302,7 @@ function checkoutRule(git) {
  * Without `--force`, git itself refuses to remove a worktree with uncommitted
  * changes, so the rule only has to cover the forced variant — and even then a
  * throwaway task tree is not what the protected-root rule is guarding.
- * @param {{args: Array<string|null>, resolved: Array<string|null>}} git
+ * @param {{args: Array<string|null>}} git
  * @param {string[]} protectedRoots
  * @returns {'git-destructive'|'git-low-risk'|null}
  */
@@ -449,8 +406,7 @@ function parseSsh(command) {
 /** @param {AnalyzedCommand} command @returns {{kind: 'matched'|'unknown', endpoint: string}|null} */
 function orgRulesetWrite(command) {
   if (!isCommand(command, 'gh') || command.argv[1] !== 'api') return null;
-  // Straight-line `R=owner/repo; gh api repos/$R/pulls/1 …` resolves here.
-  const args = command.argv.slice(2).map((arg, index) => arg ?? command.resolvedArgv[index + 2] ?? null);
+  const args = command.argv.slice(2);
   const display = effectiveDisplayArgv(command).slice(2);
   const tokens = args.map((arg, index) => arg ?? display[index] ?? '<?>');
   const endpointValueFlags = new Set(['-X', '--method', '-f', '-F', '--field', '--raw-field', '--input', '-H', '--header', '--preview', '--cache']);
@@ -476,12 +432,6 @@ function orgRulesetWrite(command) {
   const endpoint = typeof endpointInfo?.value === 'string' && ORG_RULESETS.test(endpointInfo.value)
     ? endpointInfo.value
     : null;
-  // An endpoint we cannot resolve is only suspicious while its literal prefix
-  // could still lead to /orgs/<org>/rulesets. `repos/<owner>/<repo>/…` with both
-  // path segments literal cannot: GitHub has no repo-scoped org ruleset route.
-  const staticPrefix = (endpointInfo?.display ?? '').replace(/^["']/, '').split(/[$`]|<\(|>\(/)[0];
-  const prefixExcludesOrgRulesets = /^\/?(?:repos\/[^/$\s]+\/[^/$\s]+\/|user\/|users\/|search\/|gists\/|notifications|rate_limit)/
-    .test(staticPrefix);
   const fieldWrite = tokens.some((arg) =>
     arg === '-f' || arg === '-F' || arg === '--field' || arg.startsWith('--field=') ||
     arg === '--raw-field' || arg.startsWith('--raw-field=') || arg === '--input' || arg.startsWith('--input='));
@@ -500,7 +450,7 @@ function orgRulesetWrite(command) {
     }
   }
   const write = fieldWrite || /^(?:PUT|POST|PATCH|DELETE)$/i.test(method);
-  const unknownEndpoint = endpointInfo?.value === null && !prefixExcludesOrgRulesets;
+  const unknownEndpoint = endpointInfo?.value === null;
   if (endpoint && write) return { kind: 'matched', endpoint };
   if ((endpoint && methodUnknown) || (unknownEndpoint && (write || methodUnknown || fieldWrite))) return { kind: 'unknown', endpoint: endpoint ?? '<?>' };
   return null;
@@ -525,8 +475,7 @@ function hardPolicy(graph, enabled, protectedRoots) {
       const protectedTarget = targets.find((target) =>
         target.value !== null && isProtectedRoot(target.value, protectedRoots));
       const unknownTarget = targets.find((target) =>
-        target.value === null && !suffixEscapesProtectedRoot(target.suffix, protectedRoots) &&
-        unknownTargetMayBeProtected(target.display, protectedRoots));
+        target.value === null && unknownTargetMayBeProtected(target.display, protectedRoots));
       if ((protectedTarget || unknownTarget) && enabled('rm-protected-root')) {
         const target = protectedTarget ?? unknownTarget;
         return {

@@ -151,54 +151,31 @@ known non-main ref and `git reset --hard origin/<non-main>` to the host's own
 approval layer; `full` adds guard-level confirmation for them. A force push
 whose target ref cannot be resolved remains a hard deny.
 
-`git checkout` is classified by its arguments, not by its name. Creating a branch
-(`-b` / `-B` / `--orphan`) or an explicit ref intent (`--detach`, `--track`) is
-left to the host's approval layer; everything else that can replace working-tree
-content stays destructive: `--`, `.`, `--force`, `--ours`, `--theirs`, `--merge`,
-`-p`, `--pathspec-from-file`, a second positional, a glob or `:`-magic pathspec,
-an unresolvable operand — and a lone operand with no branch-intent flag, because
-git resolves it against both refs and paths and nothing static can settle which.
-A filesystem probe in particular cannot: a tracked file that has been deleted is
-still a valid pathspec while it does not exist on disk. Short options are split from their
-operand the way git does — `-qB main`, `-Bmain` and `-qBmain` all yield the
-branch name — so force-creating a trunk branch is never mistaken for a plain
-switch, and an operand's letters are never mistaken for more flags.
-`--pathspec-from-file` is destructive in its own right: it restores every path
-listed in the file without a positional argument to notice it by. `git worktree remove` is only
-destructive when `--force` is used on a path outside a throwaway location
-(`.worktrees/`, `.claude/worktrees/`, `/tmp` — a bare `worktrees/` component is
-not enough), because git itself refuses to drop
-a dirty worktree otherwise. `git branch -d/-D` is destructive only for `main` /
-`master` or an unresolvable branch name; deleting a task branch leaves the
-commits reachable through the reflog.
+`git checkout` is classified by its arguments, not by its name. Creating a
+branch (`-b` / `-B` / `--orphan`) or an explicit ref intent (`--detach`,
+`--track`) is left to the host's approval layer; everything else that can replace
+working-tree content stays destructive: `--`, `.`, `--force`, `--ours`,
+`--theirs`, `--merge`, `-p`, `--pathspec-from-file`, a second positional, a glob
+or `:`-magic pathspec, an unresolvable operand — and a lone operand with no
+branch-intent flag, because git resolves it against both refs and paths and
+nothing static can settle which. A filesystem probe in particular cannot: a
+tracked file that has been deleted is still a valid pathspec while it does not
+exist on disk. Short options are split from their operand the way git does —
+`-qB main`, `-Bmain` and `-qBmain` all yield the branch name — so force-creating
+a trunk branch is never mistaken for a plain switch, and an operand's letters are
+never mistaken for more flags.
 
-Targets and endpoints written as `$VAR` are resolved when the assignment sits on
-the same straight line of the same script (`S=/tmp/x; rm -rf "$S/art"`). Only
-top-level statements and the *left* side of `&&` / `||` count as straight line:
-their right side is conditional, and a pipeline subshells **both** sides, so
-neither `S=$HOME; false && S=/tmp/safe; rm -rf "$S"` nor `S=/root; S=/tmp | cat;
-rm -rf "$S"` may resolve to the assignment that never reached the command.
-Assignments inside `if` / `for` / `while` / `case` / functions / subshells,
-`NAME=value cmd` prefixes, appends, and every other channel that writes a shell
-variable — `read`, `unset`, `mapfile`, `getopts`, `printf -v NAME`, and the
-assigning expansions `${name=…}` / `${name:=…}` — poison the name for the same
-reason. `eval`, `source` and `.` drop every binding in the script, since they
-execute in the current shell and may rebind a name already resolved.
+`git worktree remove` is destructive only when `--force` is used on a path
+outside a throwaway location (`.worktrees/`, `.claude/worktrees/`, `/tmp`; a bare
+`worktrees/` component is not enough), because git itself refuses to drop a dirty
+worktree otherwise. `git branch -d/-D` is destructive only for `main` / `master`
+or an unresolvable branch name; deleting a task branch leaves the commits
+reachable through the reflog.
 
-A resolved value is only used when it survives the shell's own word processing:
-an *unquoted* expansion is field-split and globbed, so a value carrying
-whitespace or a glob character is not the single argument being judged
-(`S='/root /tmp/safe'; rm -rf $S` removes two paths). Quoted expansions, and
-unquoted ones whose value is a single plain word, resolve normally.
-
-Resolved paths are lexically normalized (`.` and `..` collapsed, no filesystem
-access) before any protected-root comparison, so `S=/tmp/../root` is judged as
-`/root`.
-
-A word that stays unresolved may still be judged by its literal tail, but only
-when no protected root ends with that tail: `"$SCRATCH/issue-1055"` is provably
-not a root, while `"$BASE/alice"` can *be* `/home/alice`, and `"$X"`, `"$X/.."`,
-`"$X/*"` and `"$X"base` can be anything. All of those remain denied.
+Protected-root comparisons lexically normalize the path first (`.` and `..`
+collapsed, no filesystem access), so `rm -rf /tmp/../root` is judged as `/root`.
+`gh api` org-ruleset detection accepts the absolute form
+(`https://api.github.com/orgs/<org>/rulesets`) as well as the relative one.
 
 `off` does not disable the parser health check: without a reliable command graph,
 the guard cannot prove that hard-deny rules were not bypassed.
