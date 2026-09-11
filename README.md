@@ -151,9 +151,40 @@ known non-main ref and `git reset --hard origin/<non-main>` to the host's own
 approval layer; `full` adds guard-level confirmation for them. A force push
 whose target ref cannot be resolved remains a hard deny.
 
-All `git checkout` forms are conservatively classified as destructive because
-the command can replace working-tree content. Use `git switch` for ordinary
-branch changes when that confirmation is unnecessary.
+`git checkout` is classified by its arguments, not by its name. Creating a
+branch (`-b` / `-B` / `--orphan`) or an explicit ref intent (`--detach`,
+`--track`) is left to the host's approval layer; everything else that can replace
+working-tree content stays destructive: `--`, `.`, `--force`, `--ours`,
+`--theirs`, `--merge`, `-p`, `--pathspec-from-file`, a second positional, a glob
+or `:`-magic pathspec, an unresolvable operand — and a lone operand with no
+branch-intent flag, because git resolves it against both refs and paths and
+nothing static can settle which. A filesystem probe in particular cannot: a
+tracked file that has been deleted is still a valid pathspec while it does not
+exist on disk. Short options are split from their operand the way git does —
+`-qB main`, `-Bmain` and `-qBmain` all yield the branch name, and `-d` is read as
+`--detach` under `checkout` but `--delete` under `branch` — so force-creating
+a trunk branch is never mistaken for a plain switch, and an operand's letters are
+never mistaken for more flags.
+
+Long options are matched by prefix, because git accepts any unambiguous
+abbreviation: `git worktree remove --for`, `git branch --del`, `git push --for`
+and `git checkout --pathspec-from-f=` all reach the full option. Prefix matching
+can only put more commands in the destructive class; the flags that *loosen* a
+classification (checkout's `--detach` / `--track`) keep their exact spelling, so
+an abbreviation there simply fails to loosen.
+
+`git worktree remove` is destructive only when `--force` is used on a path
+outside a throwaway location (`.worktrees/`, `.claude/worktrees/`, `/tmp`; a bare
+`worktrees/` component is not enough), because git itself refuses to drop a dirty
+worktree otherwise. `git branch -d` is destructive only for `main` / `master` or an
+unresolvable branch name, since git itself refuses to `-d` an unmerged branch.
+`-D` stays destructive in every case: it deletes unmerged work and removes the
+branch's own reflog along with it.
+
+Protected-root comparisons lexically normalize the path first (`.` and `..`
+collapsed, no filesystem access), so `rm -rf /tmp/../root` is judged as `/root`.
+`gh api` org-ruleset detection accepts the absolute form
+(`https://api.github.com/orgs/<org>/rulesets`) as well as the relative one.
 
 `off` does not disable the parser health check: without a reliable command graph,
 the guard cannot prove that hard-deny rules were not bypassed.
