@@ -246,3 +246,65 @@ test('a bare checkout argument that names an existing path is treated as a paths
   assert.equal(result.kind, 'confirm');
   assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive');
 });
+
+// --- soundness holes found in review of the constant-propagation change ------
+
+test('an assignment that may never run cannot license the command that follows', () => {
+  // `&&` / `||` gate their right side on the previous command's status, and `|`
+  // subshells it: in every case the binding may not be the one that reaches the rm.
+  const denied = [
+    `S=${homedir()}; false && S=/tmp/safe; rm -rf "$S"`,
+    `S=${homedir()}; true || S=/tmp/safe; rm -rf "$S"`,
+    `S=${homedir()}; echo x | S=/tmp/safe; rm -rf "$S"`,
+  ];
+  for (const command of denied) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'deny', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root', command);
+  }
+  // The left side of `&&` does run, so the everyday form still resolves.
+  assert.equal(evaluate('S=/tmp/claude/x && rm -rf "$S/art"', 'dangerous-only').kind, 'allow');
+});
+
+test('eval can rebind a name, so it drops every constant in the script', () => {
+  const command = `S=/tmp/safe; eval 'S=${homedir()}'; rm -rf "$S"`;
+  const result = evaluate(command, 'dangerous-only');
+  assert.equal(result.kind, 'deny');
+  assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root');
+});
+
+test('a literal tail only clears the target when no protected root ends with it', () => {
+  // `$BASE` could be /home, making this exactly the protected home directory.
+  const home = homedir();
+  const leaf = home.slice(home.lastIndexOf('/'));
+  const result = evaluate(`rm -rf "$BASE${leaf}"`, 'dangerous-only');
+  assert.equal(result.kind, 'deny');
+  assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root');
+  // A tail no protected root ends with stays provably safe.
+  assert.equal(evaluate('rm -rf "$BASE/issue-1055"', 'dangerous-only').kind, 'allow');
+});
+
+test('git expands pathspecs itself, so glob arguments are not branch names', () => {
+  for (const command of ["git checkout '*.txt'", "git checkout 'src/*'", "git checkout ':(glob)**/*.ts'"]) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'confirm', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
+  }
+});
+
+test('reads the branch operand of a bundled -B before the trunk check', () => {
+  for (const command of ['git checkout -qB main', 'git checkout -B main', 'git checkout -qB $BRANCH']) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'confirm', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
+  }
+  assert.equal(evaluate('git checkout -qB feat/task origin/main', 'dangerous-only').kind, 'allow');
+});
+
+test('only the documented throwaway roots exempt a forced worktree removal', () => {
+  const result = evaluate('git worktree remove --force /srv/project/worktrees/production', 'dangerous-only');
+  assert.equal(result.kind, 'confirm');
+  assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive');
+  assert.equal(evaluate('git worktree remove --force /repo/.worktrees/task', 'dangerous-only').kind, 'allow');
+  assert.equal(evaluate('git worktree remove --force /tmp/claude/wt', 'dangerous-only').kind, 'allow');
+});

@@ -154,22 +154,31 @@ whose target ref cannot be resolved remains a hard deny.
 `git checkout` is classified by its arguments, not by its name: switching or
 creating a branch is left to the host's approval layer, while the forms that can
 replace working-tree content (`--`, `.`, `--force`, `--ours`, `--theirs`,
-`--merge`, `-p`, a second positional, a target that resolves to an existing path,
-or an unresolvable one) stay destructive. `git worktree remove` is only
+`--merge`, `-p`, a second positional, a glob or `:`-magic pathspec, a target that
+resolves to an existing path, or an unresolvable one) stay destructive. `-B` is
+read together with the operand that follows it, including the bundled `-qB main`
+form, so force-creating a trunk branch is never mistaken for a plain switch. `git worktree remove` is only
 destructive when `--force` is used on a path outside a throwaway location
-(`.worktrees/`, `.claude/worktrees/`, `/tmp`), because git itself refuses to drop
+(`.worktrees/`, `.claude/worktrees/`, `/tmp` — a bare `worktrees/` component is
+not enough), because git itself refuses to drop
 a dirty worktree otherwise. `git branch -d/-D` is destructive only for `main` /
 `master` or an unresolvable branch name; deleting a task branch leaves the
 commits reachable through the reflog.
 
 Targets and endpoints written as `$VAR` are resolved when the assignment sits on
-the same straight line of the same script (`S=/tmp/x; rm -rf "$S/art"`).
-Assignments inside `if` / `for` / `while` / `case` / functions / subshells /
-pipeline tails, `NAME=value cmd` prefixes, loop and `read` bindings, and appends
-all poison the name instead, because the guard cannot prove which value reached
-the command. A word that stays unresolved may still be judged by its literal
-tail: `"$SCRATCH/issue-1055"` cannot *be* a protected root, while `"$X"`,
-`"$X/.."`, `"$X/*"` and `"$X"base` can, and remain denied.
+the same straight line of the same script (`S=/tmp/x; rm -rf "$S/art"`). Only
+top-level statements and the *left* side of `&&` / `||` / `|` count as straight
+line: the right side is conditional or subshelled, so `S=$HOME; false &&
+S=/tmp/safe; rm -rf "$S"` must not resolve to the assignment that never ran.
+Assignments inside `if` / `for` / `while` / `case` / functions / subshells,
+`NAME=value cmd` prefixes, loop and `read` bindings, and appends poison the name
+for the same reason. An `eval` anywhere drops every binding in the script, since
+it executes in the current shell and may rebind a name already resolved.
+
+A word that stays unresolved may still be judged by its literal tail, but only
+when no protected root ends with that tail: `"$SCRATCH/issue-1055"` is provably
+not a root, while `"$BASE/alice"` can *be* `/home/alice`, and `"$X"`, `"$X/.."`,
+`"$X/*"` and `"$X"base` can be anything. All of those remain denied.
 
 `off` does not disable the parser health check: without a reliable command graph,
 the guard cannot prove that hard-deny rules were not bypassed.

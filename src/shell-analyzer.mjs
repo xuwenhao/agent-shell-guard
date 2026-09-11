@@ -224,7 +224,7 @@ function wordSegments(word) {
 
 /**
  * Assignment table for one parsed script.
- * @typedef {{assignments: Array<{name: string, offset: number, value: string|null}>, poisoned: Set<string>}} ConstScope
+ * @typedef {{assignments: Array<{name: string, offset: number, value: string|null}>, poisoned: Set<string>, poisonAll: boolean}} ConstScope
  */
 
 /** @param {unknown} node @param {ConstScope} scope */
@@ -262,15 +262,26 @@ function collectAssignments(node, scope, text, straight) {
     return;
   }
   if (type === 'BinaryCmd') {
-    const opPos = isObject(node.OpPos) && typeof node.OpPos.Offset === 'number' ? node.OpPos.Offset : 0;
-    const operator = text.slice(opPos, opPos + 2);
-    const isPipeline = operator.startsWith('|') && !operator.startsWith('||');
-    collectAssignments(node.X, scope, text, straight && !isPipeline);
-    collectAssignments(node.Y, scope, text, straight && !isPipeline);
+    // Every BinaryCmd operator makes its right side conditional or subshelled:
+    // `&&` / `||` run Y only depending on X's status, `|` runs it in a subshell.
+    // `a; b` is two Stmts rather than a BinaryCmd, so the common
+    // `S=/tmp/x; rm -rf "$S"` still resolves. Trusting Y as straight-line would
+    // let `S=$HOME; false && S=/tmp/safe; rm -rf "$S"` resolve to the assignment
+    // that never ran and walk past the protected-root rule.
+    collectAssignments(node.X, scope, text, straight);
+    collectAssignments(node.Y, scope, text, false);
     return;
   }
   if (type === 'CallExpr') {
     const args = Array.isArray(node.Args) ? node.Args : [];
+    const headName = args.length ? staticWord(args[0]) : null;
+    if (typeof headName === 'string' && basename(headName) === 'eval') {
+      // `eval` executes in the *current* shell, so its assignments outlive it and
+      // can rebind a name we already resolved (`S=/tmp/safe; eval 'S=$HOME';
+      // rm -rf "$S"`). The body may also be dynamic. Rather than model that, drop
+      // every binding for this script — eval is rare here and failing closed is cheap.
+      scope.poisonAll = true;
+    }
     if (args.length === 0) {
       // Bare `NAME=value` — persists in the current shell.
       for (const assign of Array.isArray(node.Assigns) ? node.Assigns : []) {
@@ -321,7 +332,7 @@ function collectAssignments(node, scope, text, straight) {
 /** @param {ConstScope} scope @param {string} name @param {number} atOffset @returns {string|null} */
 function lookupConst(scope, name, atOffset) {
   if (name === 'HOME') return homedir();
-  if (scope.poisoned.has(name)) return null;
+  if (scope.poisonAll || scope.poisoned.has(name)) return null;
   let resolved = null;
   for (const entry of scope.assignments) {
     if (entry.name !== name) continue;
@@ -631,7 +642,7 @@ export function analyzeShellInput(input, options) {
     // Constant table for this script only; nested `bash -c`/`eval` bodies get
     // their own, so an outer binding never leaks into an inner evaluator.
     /** @type {ConstScope} */
-    const scope = { assignments: [], poisoned: new Set() };
+    const scope = { assignments: [], poisoned: new Set(), poisonAll: false };
     collectAssignments(ast.Stmts, scope, text, true);
     scope.assignments.sort((left, right) => left.offset - right.offset);
 

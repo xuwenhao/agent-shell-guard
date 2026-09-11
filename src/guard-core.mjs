@@ -64,17 +64,25 @@ function commandTargets(command) {
 }
 
 /**
- * A word we could not resolve but whose literal tail starts a new path component
- * (`"$SCRATCH/issue-1055"` → `/issue-1055`) can never *be* a protected root: the
- * root check is an exact match and the tail adds at least one more component.
- * `..` and glob metacharacters could climb back up, so they stay unknown.
- * @param {string|null} suffix
+ * A word we could not resolve may still be provably *not* a protected root, via
+ * its literal tail: `"$SCRATCH/issue-1055"` ends in `/issue-1055`, and no
+ * protected root ends that way, so whatever `$SCRATCH` holds the result cannot
+ * equal one. That last clause is the whole point — a tail alone proves nothing.
+ * `rm -rf "$BASE/xuwenhao"` with `BASE=/home` lands exactly on the protected
+ * home directory, so a tail that could complete a protected root stays unknown,
+ * as do `..` and glob metacharacters, which can climb back up.
+ * @param {string|null} suffix @param {string[]} protectedRoots
  */
-function suffixEscapesProtectedRoot(suffix) {
+function suffixEscapesProtectedRoot(suffix, protectedRoots) {
   if (typeof suffix !== 'string' || !suffix.startsWith('/')) return false;
   const segments = suffix.split('/').filter((segment) => segment !== '');
   if (segments.length === 0) return false;
-  return segments.every((segment) => segment !== '..' && !/[*?[\]]/.test(segment));
+  if (!segments.every((segment) => segment !== '..' && !/[*?[\]]/.test(segment))) return false;
+  const tail = `/${segments.join('/')}`;
+  return !protectedRoots.some((root) => {
+    const normalized = normalizeProtectedRoot(root);
+    return normalized === tail || normalized.endsWith(tail);
+  });
 }
 
 /** @param {string} value */
@@ -223,11 +231,23 @@ function checkoutRule(git, cwd) {
   if (forceish) return 'git-destructive';
   const positionals = gitPositionals(git, new Set(['--orphan', '-b', '-B', '--track', '-t', '--conflict', '--pathspec-from-file']));
   if (positionals.some((value) => value === '.' || value === null)) return 'git-destructive';
-  const create = args.some((arg) => arg === '-b' || arg === '-B' || arg === '--orphan' || shortOptionHas(arg, /[bB]/));
-  if (create) {
+  // Git expands pathspecs itself, so `git checkout '*.txt'` overwrites modified
+  // files even though no file literally named `*.txt` exists — an existence
+  // probe alone would wave it through as a branch name. Refs cannot contain
+  // glob metacharacters, and a leading `:` is pathspec magic.
+  if (positionals.some((value) => typeof value === 'string' && (/[*?[\]]/.test(value) || value.startsWith(':')))) {
+    return 'git-destructive';
+  }
+  const createIndex = args.findIndex((arg) =>
+    arg === '-b' || arg === '-B' || arg === '--orphan' || shortOptionHas(arg, /[bB]/));
+  if (createIndex !== -1) {
+    // `-B` may arrive bundled (`git checkout -qB main`), so read the operand that
+    // follows the option rather than searching for a standalone `-B` token.
     const forceCreate = args.some((arg) => arg === '-B' || shortOptionHas(arg, /B/));
-    const target = git.resolved[git.args.findIndex((arg) => arg === '-b' || arg === '-B' || arg === '--orphan') + 1];
-    if (forceCreate && typeof target === 'string' && TRUNK_REF.test(target)) return 'git-destructive';
+    const target = git.resolved[createIndex + 1];
+    if (forceCreate && (target === null || (typeof target === 'string' && TRUNK_REF.test(target)))) {
+      return 'git-destructive';
+    }
     return 'git-low-risk';
   }
   if (positionals.length === 0) return 'git-low-risk';
@@ -251,7 +271,10 @@ function worktreeRemoveRule(git, protectedRoots) {
   const target = gitPositionals(git).slice(1)[0];
   if (typeof target !== 'string') return 'git-destructive';
   if (isProtectedRoot(target, protectedRoots)) return 'git-destructive';
-  const throwaway = /(?:^|\/)(?:\.worktrees|worktrees|\.claude\/worktrees)\//.test(target) ||
+  // Only the documented throwaway locations. A bare `worktrees/` component would
+  // also match paths like /srv/project/worktrees/production, where --force really
+  // can discard someone's work.
+  const throwaway = /(?:^|\/)(?:\.worktrees|\.claude\/worktrees)\//.test(target) ||
     target.startsWith('/tmp/') || target.startsWith('/private/tmp/');
   return throwaway ? 'git-low-risk' : 'git-destructive';
 }
@@ -415,7 +438,7 @@ function hardPolicy(graph, enabled, protectedRoots) {
       const protectedTarget = targets.find((target) =>
         target.value !== null && isProtectedRoot(target.value, protectedRoots));
       const unknownTarget = targets.find((target) =>
-        target.value === null && !suffixEscapesProtectedRoot(target.suffix) &&
+        target.value === null && !suffixEscapesProtectedRoot(target.suffix, protectedRoots) &&
         unknownTargetMayBeProtected(target.display, protectedRoots));
       if ((protectedTarget || unknownTarget) && enabled('rm-protected-root')) {
         const target = protectedTarget ?? unknownTarget;
