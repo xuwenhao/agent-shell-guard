@@ -85,9 +85,30 @@ function suffixEscapesProtectedRoot(suffix, protectedRoots) {
   });
 }
 
-/** @param {string} value */
+/**
+ * Lexically collapse `.` and `..` before any protected-root comparison. Constant
+ * propagation made this necessary: `S=/tmp/../root; rm -rf "$S"` resolves to a
+ * literal that *looks* unlike `/root` but reaches it at execution time, and the
+ * pre-propagation behaviour (unknown → deny) used to cover that. Purely lexical
+ * on purpose — no filesystem access in a PreToolUse hook — which is also the
+ * conservative direction, since it can only make more paths match a root.
+ * @param {string} value
+ */
 function normalizeProtectedRoot(value) {
-  return value.replace(/\/\*{1,2}$/, '').replace(/\/+$/, '') || '/';
+  const trimmed = value.replace(/\/\*{1,2}$/, '').replace(/\/+$/, '') || '/';
+  const absolute = trimmed.startsWith('/');
+  /** @type {string[]} */
+  const stack = [];
+  for (const segment of trimmed.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      if (stack.length && stack[stack.length - 1] !== '..') stack.pop();
+      else if (!absolute) stack.push('..');
+      continue;
+    }
+    stack.push(segment);
+  }
+  return absolute ? `/${stack.join('/')}`.replace(/\/$/, '') || '/' : stack.join('/') || '.';
 }
 
 /** @param {string} value @param {string[]} protectedRoots */
@@ -222,37 +243,94 @@ const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
  * @param {string|undefined} cwd
  * @returns {'git-destructive'|'git-low-risk'|null}
  */
+/**
+ * Split checkout's argv the way git does. Short options cluster (`-qB`) and may
+ * carry their operand attached (`-Bmain`), so scanning for a standalone `-B`
+ * token both misses the branch name and mistakes the operand's letters for more
+ * flags — `-Bmain` would read as if `-m` were present.
+ * @param {{args: Array<string|null>, resolved: Array<string|null>}} git
+ */
+function parseCheckoutArgs(git) {
+  const SHORT_WITH_OPERAND = 'bBcC';
+  const LONG_WITH_OPERAND = new Set(['--orphan', '--conflict', '--track', '--start-point', '--pathspec-from-file']);
+  /** @type {string[]} */ const flags = [];
+  /** @type {string[]} */ const letters = [];
+  /** @type {Array<string|null>} */ const positionals = [];
+  /** @type {string|null|undefined} */ let createTarget;
+  let forceCreate = false;
+  let endOfOptions = false;
+
+  for (let index = 0; index < git.args.length; index++) {
+    const raw = git.args[index];
+    if (endOfOptions) { positionals.push(git.resolved[index]); continue; }
+    if (raw === null) { positionals.push(null); continue; }
+    if (raw === '--') { flags.push('--'); endOfOptions = true; continue; }
+    if (raw.startsWith('--')) {
+      const eq = raw.indexOf('=');
+      const name = eq === -1 ? raw : raw.slice(0, eq);
+      flags.push(name);
+      const operand = eq === -1 ? undefined : raw.slice(eq + 1);
+      if (name === '--orphan') createTarget = operand ?? git.resolved[++index] ?? null;
+      else if (operand === undefined && LONG_WITH_OPERAND.has(name)) index++;
+      continue;
+    }
+    if (raw.startsWith('-') && raw.length > 1) {
+      const cluster = raw.slice(1);
+      for (let cursor = 0; cursor < cluster.length; cursor++) {
+        const letter = cluster[cursor];
+        letters.push(letter);
+        if (!SHORT_WITH_OPERAND.includes(letter)) continue;
+        const attached = cluster.slice(cursor + 1);
+        const operand = attached !== '' ? attached : git.resolved[++index] ?? null;
+        if (letter === 'b' || letter === 'B') {
+          createTarget = operand;
+          if (letter === 'B') forceCreate = true;
+        }
+        break;
+      }
+      continue;
+    }
+    positionals.push(git.resolved[index]);
+  }
+  return { flags, letters, positionals, createTarget, forceCreate };
+}
+
+/**
+ * `git checkout` is two commands under one name: switching or creating a branch
+ * (cheap, reversible) and restoring paths from a tree-ish (silently discards
+ * edits). Only the second needs a human. When a lone positional could be either,
+ * ask the filesystem — an existing path means it is a pathspec.
+ * @param {{args: Array<string|null>, resolved: Array<string|null>}} git
+ * @param {string|undefined} cwd
+ * @returns {'git-destructive'|'git-low-risk'|null}
+ */
 function checkoutRule(git, cwd) {
-  const { args } = git;
-  if (args.includes('--')) return 'git-destructive';
-  const forceish = args.some((arg) =>
-    arg === '--force' || arg === '--ours' || arg === '--theirs' || arg === '--merge' ||
-    arg === '--patch' || arg === '--overwrite-ignore' || shortOptionHas(arg, /[fmp]/));
+  const parsed = parseCheckoutArgs(git);
+  if (parsed.flags.includes('--')) return 'git-destructive';
+  // `--pathspec-from-file <file>` restores every path listed in the file, which
+  // is a working-tree discard with no positional argument to notice it by.
+  if (parsed.flags.includes('--pathspec-from-file')) return 'git-destructive';
+  const forceish = parsed.flags.some((flag) =>
+    ['--force', '--ours', '--theirs', '--merge', '--patch', '--overwrite-ignore'].includes(flag)) ||
+    parsed.letters.some((letter) => 'fmp'.includes(letter));
   if (forceish) return 'git-destructive';
-  const positionals = gitPositionals(git, new Set(['--orphan', '-b', '-B', '--track', '-t', '--conflict', '--pathspec-from-file']));
-  if (positionals.some((value) => value === '.' || value === null)) return 'git-destructive';
-  // Git expands pathspecs itself, so `git checkout '*.txt'` overwrites modified
-  // files even though no file literally named `*.txt` exists — an existence
-  // probe alone would wave it through as a branch name. Refs cannot contain
-  // glob metacharacters, and a leading `:` is pathspec magic.
-  if (positionals.some((value) => typeof value === 'string' && (/[*?[\]]/.test(value) || value.startsWith(':')))) {
+  if (parsed.positionals.some((value) => value === '.' || value === null)) return 'git-destructive';
+  // Git expands pathspecs itself, so `git checkout '*.txt'` overwrites matching
+  // modified files even though no file literally named `*.txt` exists — an
+  // existence probe alone would wave it through as a branch name. Refs cannot
+  // contain glob metacharacters, and a leading `:` is pathspec magic.
+  if (parsed.positionals.some((value) => typeof value === 'string' && (/[*?[\]]/.test(value) || value.startsWith(':')))) {
     return 'git-destructive';
   }
-  const createIndex = args.findIndex((arg) =>
-    arg === '-b' || arg === '-B' || arg === '--orphan' || shortOptionHas(arg, /[bB]/));
-  if (createIndex !== -1) {
-    // `-B` may arrive bundled (`git checkout -qB main`), so read the operand that
-    // follows the option rather than searching for a standalone `-B` token.
-    const forceCreate = args.some((arg) => arg === '-B' || shortOptionHas(arg, /B/));
-    const target = git.resolved[createIndex + 1];
-    if (forceCreate && (target === null || (typeof target === 'string' && TRUNK_REF.test(target)))) {
+  if (parsed.createTarget !== undefined) {
+    if (parsed.forceCreate && (typeof parsed.createTarget !== 'string' || TRUNK_REF.test(parsed.createTarget))) {
       return 'git-destructive';
     }
     return 'git-low-risk';
   }
-  if (positionals.length === 0) return 'git-low-risk';
-  if (positionals.length > 1) return 'git-destructive';
-  const only = /** @type {string} */ (positionals[0]);
+  if (parsed.positionals.length === 0) return 'git-low-risk';
+  if (parsed.positionals.length > 1) return 'git-destructive';
+  const only = /** @type {string} */ (parsed.positionals[0]);
   if (cwd && existsSync(resolvePath(cwd, only))) return 'git-destructive';
   return 'git-low-risk';
 }

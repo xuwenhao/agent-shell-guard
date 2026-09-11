@@ -262,24 +262,29 @@ function collectAssignments(node, scope, text, straight) {
     return;
   }
   if (type === 'BinaryCmd') {
-    // Every BinaryCmd operator makes its right side conditional or subshelled:
-    // `&&` / `||` run Y only depending on X's status, `|` runs it in a subshell.
-    // `a; b` is two Stmts rather than a BinaryCmd, so the common
-    // `S=/tmp/x; rm -rf "$S"` still resolves. Trusting Y as straight-line would
-    // let `S=$HOME; false && S=/tmp/safe; rm -rf "$S"` resolve to the assignment
-    // that never ran and walk past the protected-root rule.
-    collectAssignments(node.X, scope, text, straight);
+    const opPos = isObject(node.OpPos) && typeof node.OpPos.Offset === 'number' ? node.OpPos.Offset : 0;
+    const operator = text.slice(opPos, opPos + 2);
+    const isPipeline = operator.startsWith('|') && !operator.startsWith('||');
+    // A pipeline runs *both* sides in subshells, so neither side's assignments
+    // survive (`S=/root; S=/tmp | cat; rm -rf "$S"` still targets /root).
+    // `&&` / `||` do run their left side in the current shell, but gate the
+    // right side on the exit status, so only Y is untrustworthy there.
+    // `a; b` is two Stmts rather than a BinaryCmd, so the everyday
+    // `S=/tmp/x; rm -rf "$S"` keeps resolving.
+    collectAssignments(node.X, scope, text, straight && !isPipeline);
     collectAssignments(node.Y, scope, text, false);
     return;
   }
   if (type === 'CallExpr') {
     const args = Array.isArray(node.Args) ? node.Args : [];
     const headName = args.length ? staticWord(args[0]) : null;
-    if (typeof headName === 'string' && basename(headName) === 'eval') {
-      // `eval` executes in the *current* shell, so its assignments outlive it and
-      // can rebind a name we already resolved (`S=/tmp/safe; eval 'S=$HOME';
-      // rm -rf "$S"`). The body may also be dynamic. Rather than model that, drop
-      // every binding for this script — eval is rare here and failing closed is cheap.
+    if (typeof headName === 'string' && ['eval', 'source', '.'].includes(basename(headName))) {
+      // `eval`, `source` and `.` all execute in the *current* shell, so whatever
+      // they assign outlives them and can rebind a name we already resolved
+      // (`S=/tmp/safe; eval 'S=$HOME'; rm -rf "$S"`, or the same via a sourced
+      // file). The body — or the file — may not even be statically known. Rather
+      // than model that, drop every binding for this script; all three are rare
+      // in agent commands and failing closed is cheap.
       scope.poisonAll = true;
     }
     if (args.length === 0) {

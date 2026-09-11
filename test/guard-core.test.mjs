@@ -308,3 +308,59 @@ test('only the documented throwaway roots exempt a forced worktree removal', () 
   assert.equal(evaluate('git worktree remove --force /repo/.worktrees/task', 'dangerous-only').kind, 'allow');
   assert.equal(evaluate('git worktree remove --force /tmp/claude/wt', 'dangerous-only').kind, 'allow');
 });
+
+// --- second review round: subshell reach, sourcing, path shape ---------------
+
+test('neither side of a pipeline persists an assignment', () => {
+  // Bash runs every pipeline element in its own subshell, the left one included.
+  const result = evaluate(`S=${homedir()}; S=/tmp | cat; rm -rf "$S"`, 'dangerous-only');
+  assert.equal(result.kind, 'deny');
+  assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root');
+});
+
+test('sourcing a file drops constants the same way eval does', () => {
+  for (const verb of ['source', '.']) {
+    const command = `S=/tmp/safe; ${verb} /tmp/rebind.sh; rm -rf "$S"`;
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'deny', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root', command);
+  }
+});
+
+test('resolved targets are lexically normalized before the root comparison', () => {
+  // Propagation turned a variable target into a literal, so `..` and `.` segments
+  // could walk back onto a protected root while comparing unequal as strings.
+  const home = homedir();
+  for (const command of [
+    `S=${home}/x/..; rm -rf "$S"`,
+    `S=${home}/./; rm -rf "$S"`,
+    'S=/tmp/..; rm -rf "$S"',
+  ]) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'deny', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root', command);
+  }
+  assert.equal(evaluate(`S=${home}/task/../task; rm -rf "$S"`, 'dangerous-only').kind, 'allow');
+});
+
+test('checkout --pathspec-from-file discards working-tree state', () => {
+  for (const command of ['git checkout --pathspec-from-file paths.txt', 'git checkout --pathspec-from-file=paths.txt']) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'confirm', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
+  }
+});
+
+test('short options are split from their attached operand', () => {
+  // `-Bmain` carries the branch name; reading the next token instead both missed
+  // the trunk check and mistook the operand's letters for more flags.
+  const denied = ['git checkout -Bmain other', 'git checkout -Bmaster', 'git checkout -qBmain'];
+  for (const command of denied) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'confirm', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
+  }
+  // The operand's letters must not read as `-f` / `-m` / `-p`.
+  assert.equal(evaluate('git checkout -Bfeat/task origin/main', 'dangerous-only').kind, 'allow');
+  assert.equal(evaluate('git checkout -bfix/parse', 'dangerous-only').kind, 'allow');
+});

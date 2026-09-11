@@ -155,9 +155,12 @@ whose target ref cannot be resolved remains a hard deny.
 creating a branch is left to the host's approval layer, while the forms that can
 replace working-tree content (`--`, `.`, `--force`, `--ours`, `--theirs`,
 `--merge`, `-p`, a second positional, a glob or `:`-magic pathspec, a target that
-resolves to an existing path, or an unresolvable one) stay destructive. `-B` is
-read together with the operand that follows it, including the bundled `-qB main`
-form, so force-creating a trunk branch is never mistaken for a plain switch. `git worktree remove` is only
+resolves to an existing path, or an unresolvable one) stay destructive. Short options are split from their
+operand the way git does — `-qB main`, `-Bmain` and `-qBmain` all yield the
+branch name — so force-creating a trunk branch is never mistaken for a plain
+switch, and an operand's letters are never mistaken for more flags.
+`--pathspec-from-file` is destructive in its own right: it restores every path
+listed in the file without a positional argument to notice it by. `git worktree remove` is only
 destructive when `--force` is used on a path outside a throwaway location
 (`.worktrees/`, `.claude/worktrees/`, `/tmp` — a bare `worktrees/` component is
 not enough), because git itself refuses to drop
@@ -167,13 +170,18 @@ commits reachable through the reflog.
 
 Targets and endpoints written as `$VAR` are resolved when the assignment sits on
 the same straight line of the same script (`S=/tmp/x; rm -rf "$S/art"`). Only
-top-level statements and the *left* side of `&&` / `||` / `|` count as straight
-line: the right side is conditional or subshelled, so `S=$HOME; false &&
-S=/tmp/safe; rm -rf "$S"` must not resolve to the assignment that never ran.
+top-level statements and the *left* side of `&&` / `||` count as straight line:
+their right side is conditional, and a pipeline subshells **both** sides, so
+neither `S=$HOME; false && S=/tmp/safe; rm -rf "$S"` nor `S=/root; S=/tmp | cat;
+rm -rf "$S"` may resolve to the assignment that never reached the command.
 Assignments inside `if` / `for` / `while` / `case` / functions / subshells,
 `NAME=value cmd` prefixes, loop and `read` bindings, and appends poison the name
-for the same reason. An `eval` anywhere drops every binding in the script, since
-it executes in the current shell and may rebind a name already resolved.
+for the same reason. `eval`, `source` and `.` drop every binding in the script,
+since they execute in the current shell and may rebind a name already resolved.
+
+Resolved paths are lexically normalized (`.` and `..` collapsed, no filesystem
+access) before any protected-root comparison, so `S=/tmp/../root` is judged as
+`/root`.
 
 A word that stays unresolved may still be judged by its literal tail, but only
 when no protected root ends with that tail: `"$SCRATCH/issue-1055"` is provably
