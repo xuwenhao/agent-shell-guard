@@ -342,16 +342,22 @@ function destructiveGitRule(command, protectedRoots) {
   if (subcommand === 'stash') return args[0] === 'drop' || args[0] === 'clear' ? 'git-destructive' : null;
   if (subcommand === 'config') return args.some((arg) => arg === '--global' || arg === '--system') ? 'git-destructive' : null;
   if (subcommand === 'branch') {
-    // Deleting a branch only drops a ref (reflog keeps the commits), so `-D` on a
-    // task branch is not the same class of action as force-renaming or -moving.
-    const del = args.some((arg) => arg === '--delete' || shortOptionHas(arg, /[dD]/));
-    if (del) {
+    // `-d` refuses to delete an unmerged branch, so it can only drop a ref whose
+    // commits are reachable elsewhere — not the same class of action as
+    // force-renaming or -moving. `-D` has no such guard: it deletes unmerged
+    // work, and it deletes the branch's own reflog with it (the commits usually
+    // survive in HEAD's reflog, but a branch only ever committed to inside a
+    // worktree that has since been removed loses that too), so it stays a
+    // confirm.
+    const forced = args.some((arg) => arg === '--force' || shortOptionHas(arg, /[DfMC]/));
+    if (forced) return 'git-destructive';
+    if (args.some((arg) => arg === '--delete' || shortOptionHas(arg, /d/))) {
       const targets = gitPositionals(git, new Set(['--contains', '--no-contains', '--merged', '--no-merged', '-u', '--set-upstream-to']));
       const unresolved = targets.some((value) => value === null);
       const trunk = targets.some((value) => typeof value === 'string' && TRUNK_REF.test(value));
       return unresolved || trunk ? 'git-destructive' : 'git-low-risk';
     }
-    return args.some((arg) => arg === '--force' || shortOptionHas(arg, /[fMC]/)) ? 'git-destructive' : null;
+    return null;
   }
   if (subcommand === 'tag') {
     const force = args.some((arg) => arg === '--force' || shortOptionHas(arg, /f/));

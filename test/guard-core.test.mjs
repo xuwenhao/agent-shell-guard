@@ -141,8 +141,8 @@ test('branch switching and throwaway worktree removal no longer need confirmatio
     'git worktree remove .worktrees/node-tools-runner',
     'git worktree remove --force /home/xuwenhao/Codebase/srpone/zooclaw-dev/repos/zooclaw-engine/.worktrees/task',
     'git worktree remove --force /tmp/claude-1000/scratch/engine-doc-wt',
-    'git branch -D docs/issue-epics-tracking',
-    'git branch -D feat/a feat/b',
+    'git branch -d docs/issue-epics-tracking',
+    'git branch --delete feat/a feat/b',
   ];
   for (const command of allowed) {
     assert.equal(evaluate(command, 'dangerous-only').kind, 'allow', command);
@@ -159,7 +159,11 @@ test('checkout forms that discard working-tree state still confirm', () => {
     'git checkout $BRANCH',
     'git checkout -B main origin/main',
     'git branch -D main',
-    'git branch -D $b',
+    'git branch -d main',
+    'git branch -d $b',
+    // `-D` drops unmerged commits and the branch's own reflog with them.
+    'git branch -D docs/issue-epics-tracking',
+    'git branch --delete --force feat/a',
     'git worktree remove --force /home/xuwenhao/Codebase/srpone/zooclaw-dev/repos/zooclaw-engine',
   ];
   for (const command of confirmed) {

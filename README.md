@@ -168,9 +168,10 @@ never mistaken for more flags.
 `git worktree remove` is destructive only when `--force` is used on a path
 outside a throwaway location (`.worktrees/`, `.claude/worktrees/`, `/tmp`; a bare
 `worktrees/` component is not enough), because git itself refuses to drop a dirty
-worktree otherwise. `git branch -d/-D` is destructive only for `main` / `master`
-or an unresolvable branch name; deleting a task branch leaves the commits
-reachable through the reflog.
+worktree otherwise. `git branch -d` is destructive only for `main` / `master` or an
+unresolvable branch name, since git itself refuses to `-d` an unmerged branch.
+`-D` stays destructive in every case: it deletes unmerged work and removes the
+branch's own reflog along with it.
 
 Protected-root comparisons lexically normalize the path first (`.` and `..`
 collapsed, no filesystem access), so `rm -rf /tmp/../root` is judged as `/root`.
