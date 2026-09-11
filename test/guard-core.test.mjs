@@ -198,10 +198,8 @@ test('org ruleset writes stay denied however the endpoint is spelled', () => {
 
 test('branch switching and throwaway worktree removal no longer need confirmation', () => {
   const allowed = [
-    'git checkout main',
     'git checkout -q -b feat/session-forensics origin/main',
     'git checkout -B feat/retry origin/main',
-    'git checkout --detach origin/main',
     'git worktree remove .worktrees/node-tools-runner',
     'git worktree remove --force /home/xuwenhao/Codebase/srpone/zooclaw-dev/repos/zooclaw-engine/.worktrees/task',
     'git worktree remove --force /tmp/claude-1000/scratch/engine-doc-wt',
@@ -233,18 +231,19 @@ test('checkout forms that discard working-tree state still confirm', () => {
   }
 });
 
-test('a bare checkout argument that names an existing path is treated as a pathspec', () => {
-  const event = {
-    tool_name: 'Bash',
-    cwd: process.cwd(),
-    tool_input: { command: 'git checkout package.json' },
-  };
-  const result = evaluateHookEvent(event, {
-    profile: 'dangerous-only', envShell: '/bin/zsh', shfmtPath: SHFMT, protectedRoots: ['/', homedir()],
-  });
-  assert.ok(result);
-  assert.equal(result.kind, 'confirm');
-  assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive');
+test('a lone checkout operand is ambiguous unless a flag states branch intent', () => {
+  // git resolves a bare operand against both refs and paths, and no filesystem
+  // probe can settle it: a tracked file that was deleted is still a valid
+  // pathspec even though it does not exist on disk.
+  for (const command of ['git checkout package.json', 'git checkout main', 'git checkout deleted-tracked.txt']) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'confirm', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
+  }
+  // An explicit branch-intent flag removes the ambiguity.
+  for (const command of ['git checkout --detach origin/main', 'git checkout --track origin/feat', 'git checkout -t origin/feat']) {
+    assert.equal(evaluate(command, 'dangerous-only').kind, 'allow', command);
+  }
 });
 
 // --- soundness holes found in review of the constant-propagation change ------
@@ -363,4 +362,38 @@ test('short options are split from their attached operand', () => {
   // The operand's letters must not read as `-f` / `-m` / `-p`.
   assert.equal(evaluate('git checkout -Bfeat/task origin/main', 'dangerous-only').kind, 'allow');
   assert.equal(evaluate('git checkout -bfix/parse', 'dangerous-only').kind, 'allow');
+});
+
+// --- third review round: expansion semantics and path shape -----------------
+
+test('an unquoted expansion is field-split, so a multi-word value is not one target', () => {
+  const command = `S='${homedir()} /tmp/safe'; rm -rf $S`;
+  const result = evaluate(command, 'dangerous-only');
+  assert.equal(result.kind, 'deny');
+  assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root');
+  // A single-word value still resolves unquoted — that is the common real form.
+  assert.equal(evaluate('T=scripts/dev/out/case && rm -rf $T', 'dangerous-only').kind, 'allow');
+  // A glob in the value would expand to other paths too.
+  assert.equal(evaluate('S=/tmp/claude/* ; rm -rf $S', 'dangerous-only').kind, 'deny');
+});
+
+test('expansions and builtins that write a variable poison it', () => {
+  const denied = [
+    `S=/tmp/safe; echo "\${S:=${homedir()}}"; rm -rf "$S"`,
+    `S=/tmp/safe; echo "\${S=${homedir()}}"; rm -rf "$S"`,
+    `S=/tmp/safe; printf -v S ${homedir()}; rm -rf "$S"`,
+    `S=/tmp/safe; printf -vS ${homedir()}; rm -rf "$S"`,
+  ];
+  for (const command of denied) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'deny', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'rm-protected-root', command);
+  }
+});
+
+test('worktree targets are normalized before the throwaway exemption', () => {
+  const result = evaluate('git worktree remove --force /tmp/../srv/project/production', 'dangerous-only');
+  assert.equal(result.kind, 'confirm');
+  assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive');
+  assert.equal(evaluate('git worktree remove --force /tmp/claude/wt', 'dangerous-only').kind, 'allow');
 });

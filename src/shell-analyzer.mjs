@@ -84,7 +84,7 @@ export function selectShellDialect(input) {
 /** @param {unknown} value @returns {value is Record<string, unknown>} */
 const isObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);
 
-/** @param {Record<string, unknown>} node @param {'Pos'|'End'} field */
+/** @param {Record<string, unknown>} node @param {'Pos'|'End'|'ValuePos'|'ValueEnd'} field */
 function offsetOf(node, field) {
   const point = node[field];
   return isObject(point) && typeof point.Offset === 'number' ? point.Offset : 0;
@@ -181,7 +181,7 @@ function staticWord(word) {
 // A word we still cannot resolve gets a literal suffix instead (`"$S/art"` →
 // `/art`), which is enough to prove the target is not a protected root.
 
-/** @typedef {{kind: 'lit', value: string}|{kind: 'param', name: string}|{kind: 'opaque'}} WordSegment */
+/** @typedef {{kind: 'lit', value: string}|{kind: 'param', name: string, quoted: boolean}|{kind: 'opaque'}} WordSegment */
 
 /** @param {unknown} part @param {boolean} doubleQuoted @returns {WordSegment[]} */
 function partSegments(part, doubleQuoted) {
@@ -202,7 +202,9 @@ function partSegments(part, doubleQuoted) {
     const name = param && typeof param.Value === 'string' ? param.Value : null;
     const plain = name !== null && !part.Excl && !part.Length && !part.Width &&
       !part.Index && !part.Slice && !part.Repl && !part.Names && !part.Exp;
-    return plain ? [{ kind: 'param', name: /** @type {string} */ (name) }] : [{ kind: 'opaque' }];
+    return plain
+      ? [{ kind: 'param', name: /** @type {string} */ (name), quoted: doubleQuoted }]
+      : [{ kind: 'opaque' }];
   }
   return [{ kind: 'opaque' }];
 }
@@ -226,6 +228,31 @@ function wordSegments(word) {
  * Assignment table for one parsed script.
  * @typedef {{assignments: Array<{name: string, offset: number, value: string|null}>, poisoned: Set<string>, poisonAll: boolean}} ConstScope
  */
+
+/**
+ * `${name=value}` and `${name:=value}` assign as a side effect of expanding, so a
+ * name touched that way is no longer whatever the const table last recorded.
+ * These can sit anywhere — inside an unrelated command's argument, even — so the
+ * whole tree is scanned once rather than only the assignment positions.
+ * The operator is read out of the source text rather than from `Exp.Op`, which is
+ * a numeric code whose values could shift under a shfmt upgrade — and shift
+ * silently, in the unsafe direction.
+ * @param {unknown} node @param {ConstScope} scope @param {string} text
+ */
+function poisonAssigningExpansions(node, scope, text) {
+  if (Array.isArray(node)) { for (const item of node) poisonAssigningExpansions(item, scope, text); return; }
+  if (!isObject(node)) return;
+  if (node.Type === 'ParamExp' && isObject(node.Exp) && isObject(node.Exp.Word)) {
+    const param = isObject(node.Param) ? node.Param : null;
+    const operator = text.slice(offsetOf(param ?? {}, 'ValueEnd') || offsetOf(param ?? {}, 'End'),
+      offsetOf(node.Exp.Word, 'Pos'));
+    if (param && typeof param.Value === 'string' && operator.includes('=')) scope.poisoned.add(param.Value);
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (['Pos', 'End', 'Position', 'ValuePos', 'ValueEnd', 'OpPos', 'Rparen'].includes(key)) continue;
+    poisonAssigningExpansions(value, scope, text);
+  }
+}
 
 /** @param {unknown} node @param {ConstScope} scope */
 function poisonNames(node, scope) {
@@ -302,6 +329,15 @@ function collectAssignments(node, scope, text, straight) {
         for (const arg of argv.slice(1)) {
           if (typeof arg === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(arg)) scope.poisoned.add(arg);
         }
+      } else if (head === 'printf') {
+        // `printf -v NAME …` writes straight into a shell variable, in either the
+        // separated or the attached spelling.
+        for (let position = 1; position < argv.length; position++) {
+          const arg = argv[position];
+          if (typeof arg !== 'string' || !arg.startsWith('-v')) continue;
+          const target = arg === '-v' ? argv[position + 1] : arg.slice(2);
+          if (typeof target === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(target)) scope.poisoned.add(target);
+        }
       }
     }
     return;
@@ -359,6 +395,10 @@ function resolveSegments(segments, scope, atOffset) {
     if (segment.kind === 'lit') { value += segment.value; continue; }
     const found = segment.kind === 'param' ? lookupConst(scope, segment.name, atOffset) : null;
     if (found === null) { resolved = false; break; }
+    // An unquoted expansion is field-split and glob-expanded by the shell, so a
+    // value carrying whitespace or a glob character is not the single argument we
+    // would be judging: `S='/root /tmp/safe'; rm -rf $S` deletes two paths.
+    if (segment.kind === 'param' && !segment.quoted && /[\s*?[\]]/.test(found)) { resolved = false; break; }
     value += found;
   }
   if (resolved) return { value, suffix: null };
@@ -649,6 +689,7 @@ export function analyzeShellInput(input, options) {
     /** @type {ConstScope} */
     const scope = { assignments: [], poisoned: new Set(), poisonAll: false };
     collectAssignments(ast.Stmts, scope, text, true);
+    poisonAssigningExpansions(ast.Stmts, scope, text);
     scope.assignments.sort((left, right) => left.offset - right.offset);
 
     /** @param {unknown} node @param {CommandSource} nodeSource @param {number|null} [pipelineGroup] */

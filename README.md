@@ -151,11 +151,15 @@ known non-main ref and `git reset --hard origin/<non-main>` to the host's own
 approval layer; `full` adds guard-level confirmation for them. A force push
 whose target ref cannot be resolved remains a hard deny.
 
-`git checkout` is classified by its arguments, not by its name: switching or
-creating a branch is left to the host's approval layer, while the forms that can
-replace working-tree content (`--`, `.`, `--force`, `--ours`, `--theirs`,
-`--merge`, `-p`, a second positional, a glob or `:`-magic pathspec, a target that
-resolves to an existing path, or an unresolvable one) stay destructive. Short options are split from their
+`git checkout` is classified by its arguments, not by its name. Creating a branch
+(`-b` / `-B` / `--orphan`) or an explicit ref intent (`--detach`, `--track`) is
+left to the host's approval layer; everything else that can replace working-tree
+content stays destructive: `--`, `.`, `--force`, `--ours`, `--theirs`, `--merge`,
+`-p`, `--pathspec-from-file`, a second positional, a glob or `:`-magic pathspec,
+an unresolvable operand — and a lone operand with no branch-intent flag, because
+git resolves it against both refs and paths and nothing static can settle which.
+A filesystem probe in particular cannot: a tracked file that has been deleted is
+still a valid pathspec while it does not exist on disk. Short options are split from their
 operand the way git does — `-qB main`, `-Bmain` and `-qBmain` all yield the
 branch name — so force-creating a trunk branch is never mistaken for a plain
 switch, and an operand's letters are never mistaken for more flags.
@@ -175,9 +179,17 @@ their right side is conditional, and a pipeline subshells **both** sides, so
 neither `S=$HOME; false && S=/tmp/safe; rm -rf "$S"` nor `S=/root; S=/tmp | cat;
 rm -rf "$S"` may resolve to the assignment that never reached the command.
 Assignments inside `if` / `for` / `while` / `case` / functions / subshells,
-`NAME=value cmd` prefixes, loop and `read` bindings, and appends poison the name
-for the same reason. `eval`, `source` and `.` drop every binding in the script,
-since they execute in the current shell and may rebind a name already resolved.
+`NAME=value cmd` prefixes, appends, and every other channel that writes a shell
+variable — `read`, `unset`, `mapfile`, `getopts`, `printf -v NAME`, and the
+assigning expansions `${name=…}` / `${name:=…}` — poison the name for the same
+reason. `eval`, `source` and `.` drop every binding in the script, since they
+execute in the current shell and may rebind a name already resolved.
+
+A resolved value is only used when it survives the shell's own word processing:
+an *unquoted* expansion is field-split and globbed, so a value carrying
+whitespace or a glob character is not the single argument being judged
+(`S='/root /tmp/safe'; rm -rf $S` removes two paths). Quoted expansions, and
+unquoted ones whose value is a single plain word, resolve normally.
 
 Resolved paths are lexically normalized (`.` and `..` collapsed, no filesystem
 access) before any protected-root comparison, so `S=/tmp/../root` is judged as

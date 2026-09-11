@@ -5,8 +5,7 @@
 // inspect normalized command argv or one already-parsed data argument; they do
 // not infer quoting, command boundaries, or evaluator semantics with regex.
 
-import { existsSync } from 'node:fs';
-import { basename, resolve as resolvePath } from 'node:path';
+import { basename } from 'node:path';
 import { analyzeShellInput, selectShellDialect } from './shell-analyzer.mjs';
 import { isPolicyEnabled, resolvePolicyProfile } from './policies/profiles.mjs';
 
@@ -301,10 +300,9 @@ function parseCheckoutArgs(git) {
  * edits). Only the second needs a human. When a lone positional could be either,
  * ask the filesystem — an existing path means it is a pathspec.
  * @param {{args: Array<string|null>, resolved: Array<string|null>}} git
- * @param {string|undefined} cwd
  * @returns {'git-destructive'|'git-low-risk'|null}
  */
-function checkoutRule(git, cwd) {
+function checkoutRule(git) {
   const parsed = parseCheckoutArgs(git);
   if (parsed.flags.includes('--')) return 'git-destructive';
   // `--pathspec-from-file <file>` restores every path listed in the file, which
@@ -330,9 +328,17 @@ function checkoutRule(git, cwd) {
   }
   if (parsed.positionals.length === 0) return 'git-low-risk';
   if (parsed.positionals.length > 1) return 'git-destructive';
-  const only = /** @type {string} */ (parsed.positionals[0]);
-  if (cwd && existsSync(resolvePath(cwd, only))) return 'git-destructive';
-  return 'git-low-risk';
+  // A lone operand is genuinely ambiguous — git resolves it against both refs and
+  // paths. Filesystem existence cannot settle it either way: a tracked file that
+  // has been deleted is still a valid pathspec (`git checkout tracked.txt`
+  // restores it and discards the deletion) while `existsSync` says no, and with
+  // `git -C <dir>` the probe would be looking in the wrong directory anyway. So
+  // only an explicit branch-intent flag makes this a plain switch.
+  const refIntent = ['--detach', '--track', '--no-track', '--guess', '--no-guess'];
+  if (parsed.flags.some((flag) => refIntent.includes(flag)) || parsed.letters.includes('t')) {
+    return 'git-low-risk';
+  }
+  return 'git-destructive';
 }
 
 /**
@@ -346,8 +352,11 @@ function checkoutRule(git, cwd) {
 function worktreeRemoveRule(git, protectedRoots) {
   const forced = git.args.some((arg) => arg === '--force' || shortOptionHas(arg, /f/));
   if (!forced) return 'git-low-risk';
-  const target = gitPositionals(git).slice(1)[0];
-  if (typeof target !== 'string') return 'git-destructive';
+  const raw = gitPositionals(git).slice(1)[0];
+  if (typeof raw !== 'string') return 'git-destructive';
+  // Collapse `.`/`..` first: `/tmp/../srv/project/production` would otherwise
+  // satisfy the `/tmp/` prefix while git removes a worktree somewhere else.
+  const target = normalizeProtectedRoot(raw);
   if (isProtectedRoot(target, protectedRoots)) return 'git-destructive';
   // Only the documented throwaway locations. A bare `worktrees/` component would
   // also match paths like /srv/project/worktrees/production, where --force really
@@ -358,16 +367,16 @@ function worktreeRemoveRule(git, protectedRoots) {
 }
 
 /**
- * @param {AnalyzedCommand} command @param {string[]} protectedRoots @param {string|undefined} cwd
+ * @param {AnalyzedCommand} command @param {string[]} protectedRoots
  * @returns {'git-destructive'|'git-low-risk'|null}
  */
-function destructiveGitRule(command, protectedRoots, cwd) {
+function destructiveGitRule(command, protectedRoots) {
   const git = parseGitCommand(command);
   if (!git) return null;
   const { subcommand, args } = git;
 
   if (['clean', 'reset', 'restore', 'rm'].includes(String(subcommand))) return 'git-destructive';
-  if (subcommand === 'checkout') return checkoutRule(git, cwd);
+  if (subcommand === 'checkout') return checkoutRule(git);
   if (subcommand === 'worktree') {
     if (args[0] === 'add') return args.slice(1).some((arg) => shortOptionHas(arg, /B/)) ? 'git-destructive' : null;
     if (args[0] === 'remove') return worktreeRemoveRule(git, protectedRoots);
@@ -551,10 +560,10 @@ function hardPolicy(graph, enabled, protectedRoots) {
 
 /**
  * @param {ShellGraph} graph @param {PolicyEnabled} enabled
- * @param {string[]} protectedRoots @param {string|undefined} cwd
+ * @param {string[]} protectedRoots
  * @returns {PolicyMatch|null}
  */
-function confirmationPolicy(graph, enabled, protectedRoots, cwd) {
+function confirmationPolicy(graph, enabled, protectedRoots) {
   for (const command of graph.commands) {
     const tool = commandName(command);
     if (enabled('remote-exec') && ['ssh', 'scp', 'rsync'].includes(tool) && (tool === 'rsync' || !hasFlag(command.argv, '-G'))) {
@@ -657,7 +666,7 @@ function confirmationPolicy(graph, enabled, protectedRoots, cwd) {
       continue;
     }
 
-    const gitRule = destructiveGitRule(command, protectedRoots, cwd);
+    const gitRule = destructiveGitRule(command, protectedRoots);
     if (gitRule && enabled(gitRule)) {
       const lowRisk = gitRule === 'git-low-risk';
       return {
@@ -718,7 +727,6 @@ function confirmationPolicy(graph, enabled, protectedRoots, cwd) {
  *   maxRecursion?: number,
  *   maxCommands?: number,
  *   protectedRoots?: string[],
- *   cwd?: string,
  * }} GuardOptions
  */
 
@@ -768,9 +776,6 @@ export function evaluateHookEvent(event, options = {}) {
   });
   const profile = resolvePolicyProfile(options.profile);
   const enabled = (/** @type {string} */ ruleId) => isPolicyEnabled(ruleId, profile);
-  // Claude Code and Codex both put the tool's working directory on the hook
-  // event; it is what lets `git checkout <arg>` tell a branch from a pathspec.
-  const hookCwd = typeof event.cwd === 'string' ? event.cwd : options.cwd;
 
   const hard = hardPolicy(analysis, enabled, options.protectedRoots ?? ['/']);
   if (hard) return { kind: 'deny', command, description, analysis, ...hard };
@@ -798,7 +803,7 @@ export function evaluateHookEvent(event, options = {}) {
     };
   }
 
-  const confirmation = confirmationPolicy(analysis, enabled, options.protectedRoots ?? ['/'], hookCwd);
+  const confirmation = confirmationPolicy(analysis, enabled, options.protectedRoots ?? ['/']);
   if (confirmation) {
     const kind = confirmation.ruleId === 'git-low-risk' ? 'review' : 'confirm';
     return { kind, command, description, analysis, ...confirmation };
