@@ -161,9 +161,17 @@ branch-intent flag, because git resolves it against both refs and paths and
 nothing static can settle which. A filesystem probe in particular cannot: a
 tracked file that has been deleted is still a valid pathspec while it does not
 exist on disk. Short options are split from their operand the way git does —
-`-qB main`, `-Bmain` and `-qBmain` all yield the branch name — so force-creating
+`-qB main`, `-Bmain` and `-qBmain` all yield the branch name, and `-d` is read as
+`--detach` under `checkout` but `--delete` under `branch` — so force-creating
 a trunk branch is never mistaken for a plain switch, and an operand's letters are
 never mistaken for more flags.
+
+Long options are matched by prefix, because git accepts any unambiguous
+abbreviation: `git worktree remove --for`, `git branch --del`, `git push --for`
+and `git checkout --pathspec-from-f=` all reach the full option. Prefix matching
+can only put more commands in the destructive class; the flags that *loosen* a
+classification (checkout's `--detach` / `--track`) keep their exact spelling, so
+an abbreviation there simply fails to loosen.
 
 `git worktree remove` is destructive only when `--force` is used on a path
 outside a throwaway location (`.worktrees/`, `.claude/worktrees/`, `/tmp`; a bare

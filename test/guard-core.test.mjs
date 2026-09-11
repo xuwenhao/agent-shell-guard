@@ -266,6 +266,48 @@ test('short options are split from their attached operand', () => {
   assert.equal(evaluate('git checkout -bfix/parse', 'dangerous-only').kind, 'allow');
 });
 
+// --- long-option abbreviations ----------------------------------------------
+
+test('git accepts unambiguous long-option prefixes, so the rules must too', () => {
+  // Verified against git 2.43: each of these runs as the full option.
+  const confirmed = [
+    'git checkout --pathspec-from-f=paths.txt',
+    'git checkout --forc main',
+    'git worktree remove --for /home/xuwenhao/Codebase/srpone/zooclaw-dev/repos/zooclaw-engine',
+    'git branch --del main',
+    'git branch --dele $b',
+    'git branch --forc -m main release',
+    'git config --glo user.email x@example.com',
+    'git push --del origin feat/task',
+    'git tag --forc v1.0.0',
+  ];
+  for (const command of confirmed) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'confirm', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
+  }
+  // A force push spelled with an abbreviation is still a hard deny, not a confirm.
+  const forced = evaluate('git push --for origin main', 'dangerous-only');
+  assert.equal(forced.kind, 'deny');
+  assert.equal(/** @type {any} */ (forced).ruleId, 'force-push-main');
+});
+
+test('an abbreviation never loosens a classification', () => {
+  // `--det` is a valid abbreviation of `--detach`, but ref intent is only read
+  // from the exact spelling, so the ambiguous lone operand stays a confirm.
+  assert.equal(evaluate('git checkout --det origin/main', 'dangerous-only').kind, 'confirm');
+  assert.equal(evaluate('git checkout --detach origin/main', 'dangerous-only').kind, 'allow');
+});
+
+test('checkout -d is the short form of --detach, not a deletion', () => {
+  assert.equal(evaluate('git checkout -d origin/main', 'dangerous-only').kind, 'allow');
+  // The same letter means --delete under `git branch`, which is a different rule.
+  assert.equal(evaluate('git branch -d feat/task', 'dangerous-only').kind, 'allow');
+  assert.equal(evaluate('git branch -d main', 'dangerous-only').kind, 'confirm');
+  // A force letter in the same cluster still wins.
+  assert.equal(evaluate('git checkout -df origin/main', 'dangerous-only').kind, 'confirm');
+});
+
 // --- path shape --------------------------------------------------------------
 
 test('worktree targets are normalized before the throwaway exemption', () => {

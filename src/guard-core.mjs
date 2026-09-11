@@ -144,7 +144,7 @@ function forcePush(command) {
   const display = effectiveDisplayArgv(command).slice(git.argOffset);
   return git.args.some((arg, index) => {
     const token = arg ?? display[index] ?? '';
-    return token === '--force' || token.startsWith('--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
+    return isLongOption(token, '--force') || token.startsWith('--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
   });
 }
 
@@ -168,6 +168,22 @@ function pushRefs(command) {
     positionals.push({ value: arg, display: token });
   }
   return positionals.slice(1);
+}
+
+/**
+ * Git accepts any unambiguous prefix of a long option, so `git worktree remove
+ * --for` is a forced removal and `git branch --del` is a deletion. Matching by
+ * prefix can only put *more* commands in the destructive class, which is the
+ * safe direction — an abbreviation that is actually ambiguous makes git itself
+ * refuse the command. The flags that *loosen* a classification (checkout's ref
+ * intent) deliberately keep their exact spelling: an abbreviation there simply
+ * fails to loosen, which is conservative in the same direction.
+ * @param {string|null|undefined} arg @param {string} option
+ */
+function isLongOption(arg, option) {
+  if (typeof arg !== 'string' || !arg.startsWith('--') || arg.length < 3) return false;
+  const name = arg.split('=')[0];
+  return option.startsWith(name);
 }
 
 /** @param {string|null} arg @param {RegExp} letters */
@@ -264,9 +280,10 @@ function checkoutRule(git) {
   if (parsed.flags.includes('--')) return 'git-destructive';
   // `--pathspec-from-file <file>` restores every path listed in the file, which
   // is a working-tree discard with no positional argument to notice it by.
-  if (parsed.flags.includes('--pathspec-from-file')) return 'git-destructive';
+  if (parsed.flags.some((flag) => isLongOption(flag, '--pathspec-from-file'))) return 'git-destructive';
   const forceish = parsed.flags.some((flag) =>
-    ['--force', '--ours', '--theirs', '--merge', '--patch', '--overwrite-ignore'].includes(flag)) ||
+    ['--force', '--ours', '--theirs', '--merge', '--patch', '--overwrite-ignore']
+      .some((option) => isLongOption(flag, option))) ||
     parsed.letters.some((letter) => 'fmp'.includes(letter));
   if (forceish) return 'git-destructive';
   if (parsed.positionals.some((value) => value === '.' || value === null)) return 'git-destructive';
@@ -292,7 +309,10 @@ function checkoutRule(git) {
   // `git -C <dir>` the probe would be looking in the wrong directory anyway. So
   // only an explicit branch-intent flag makes this a plain switch.
   const refIntent = ['--detach', '--track', '--no-track', '--guess', '--no-guess'];
-  if (parsed.flags.some((flag) => refIntent.includes(flag)) || parsed.letters.includes('t')) {
+  // `-d` is checkout's short `--detach` (in `git branch` the same letter means
+  // `--delete`, which is why this lives in the checkout rule).
+  if (parsed.flags.some((flag) => refIntent.includes(flag)) ||
+      parsed.letters.some((letter) => letter === 't' || letter === 'd')) {
     return 'git-low-risk';
   }
   return 'git-destructive';
@@ -307,7 +327,7 @@ function checkoutRule(git) {
  * @returns {'git-destructive'|'git-low-risk'|null}
  */
 function worktreeRemoveRule(git, protectedRoots) {
-  const forced = git.args.some((arg) => arg === '--force' || shortOptionHas(arg, /f/));
+  const forced = git.args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /f/));
   if (!forced) return 'git-low-risk';
   const raw = gitPositionals(git).slice(1)[0];
   if (typeof raw !== 'string') return 'git-destructive';
@@ -340,7 +360,7 @@ function destructiveGitRule(command, protectedRoots) {
     return null;
   }
   if (subcommand === 'stash') return args[0] === 'drop' || args[0] === 'clear' ? 'git-destructive' : null;
-  if (subcommand === 'config') return args.some((arg) => arg === '--global' || arg === '--system') ? 'git-destructive' : null;
+  if (subcommand === 'config') return args.some((arg) => isLongOption(arg, '--global') || isLongOption(arg, '--system')) ? 'git-destructive' : null;
   if (subcommand === 'branch') {
     // `-d` refuses to delete an unmerged branch, so it can only drop a ref whose
     // commits are reachable elsewhere — not the same class of action as
@@ -349,9 +369,9 @@ function destructiveGitRule(command, protectedRoots) {
     // survive in HEAD's reflog, but a branch only ever committed to inside a
     // worktree that has since been removed loses that too), so it stays a
     // confirm.
-    const forced = args.some((arg) => arg === '--force' || shortOptionHas(arg, /[DfMC]/));
+    const forced = args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /[DfMC]/));
     if (forced) return 'git-destructive';
-    if (args.some((arg) => arg === '--delete' || shortOptionHas(arg, /d/))) {
+    if (args.some((arg) => isLongOption(arg, '--delete') || shortOptionHas(arg, /d/))) {
       const targets = gitPositionals(git, new Set(['--contains', '--no-contains', '--merged', '--no-merged', '-u', '--set-upstream-to']));
       const unresolved = targets.some((value) => value === null);
       const trunk = targets.some((value) => typeof value === 'string' && TRUNK_REF.test(value));
@@ -360,12 +380,12 @@ function destructiveGitRule(command, protectedRoots) {
     return null;
   }
   if (subcommand === 'tag') {
-    const force = args.some((arg) => arg === '--force' || shortOptionHas(arg, /f/));
+    const force = args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /f/));
     if (force) return 'git-destructive';
     return args.some((arg) => arg === '--delete' || shortOptionHas(arg, /d/)) ? 'git-low-risk' : null;
   }
   if (subcommand === 'switch') {
-    const highRisk = args.some((arg) => arg === '--discard-changes' || arg === '--force' || arg === '--force-create' ||
+    const highRisk = args.some((arg) => isLongOption(arg, '--discard-changes') || isLongOption(arg, '--force') || isLongOption(arg, '--force-create') ||
       shortOptionHas(arg, /[Cf]/));
     if (highRisk) return 'git-destructive';
     return args.some((arg) => shortOptionHas(arg, /d/)) ? 'git-low-risk' : null;
@@ -380,12 +400,12 @@ function destructiveGitRule(command, protectedRoots) {
     return ['install', 'migrate', 'uninstall', 'prune'].includes(String(action)) ? 'git-destructive' : null;
   }
   if (subcommand === 'rebase') {
-    return args.some((arg) => arg === '--exec' || (typeof arg === 'string' && arg.startsWith('--exec=')) ||
-      arg === '--reschedule-failed-exec' || shortOptionHas(arg, /x/)) ? 'git-destructive' : null;
+    return args.some((arg) => isLongOption(arg, '--exec') ||
+      isLongOption(arg, '--reschedule-failed-exec') || shortOptionHas(arg, /x/)) ? 'git-destructive' : null;
   }
   if (subcommand === 'push') {
     return args.some((arg) =>
-      arg === '--delete' || arg === '--mirror' || arg === '--prune' ||
+      isLongOption(arg, '--delete') || isLongOption(arg, '--mirror') || isLongOption(arg, '--prune') ||
       shortOptionHas(arg, /d/) || (typeof arg === 'string' && /^\+?:\S+/.test(arg))) ? 'git-destructive' : null;
   }
   return null;
