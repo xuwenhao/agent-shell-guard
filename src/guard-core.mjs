@@ -213,6 +213,9 @@ function gitPositionals(git, valueFlags = new Set()) {
 }
 
 const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
+// A literal branch name, with none of git's revision shorthands (`@{-1}`, `-`,
+// `HEAD^`, `x~2`, `a...b`) that resolve to some *other* branch at run time.
+const PLAIN_BRANCH = /^(?!-)[A-Za-z0-9._\/+-]+$/;
 
 /**
  * Split checkout's argv the way git does. Short options cluster (`-qB`) and may
@@ -295,7 +298,12 @@ function checkoutRule(git) {
     return 'git-destructive';
   }
   if (parsed.createTarget !== undefined) {
-    if (parsed.forceCreate && (typeof parsed.createTarget !== 'string' || TRUNK_REF.test(parsed.createTarget))) {
+    // `-B` resets an existing branch, so the trunk check has to see the branch it
+    // will actually land on. Git's revision shorthands hide that: `-B '@{-1}'`
+    // resets whatever branch was checked out before, which may well be main
+    // (verified on git 2.43). Only a plain branch name is judged by name.
+    const target = parsed.createTarget;
+    if (parsed.forceCreate && (typeof target !== 'string' || !PLAIN_BRANCH.test(target) || TRUNK_REF.test(target))) {
       return 'git-destructive';
     }
     return 'git-low-risk';
@@ -318,46 +326,22 @@ function checkoutRule(git) {
   return 'git-destructive';
 }
 
-/**
- * Without `--force`, git itself refuses to remove a worktree with uncommitted
- * changes, so the rule only has to cover the forced variant — and even then a
- * throwaway task tree is not what the protected-root rule is guarding.
- * @param {{args: Array<string|null>}} git
- * @param {string[]} protectedRoots
- * @returns {'git-destructive'|'git-low-risk'|null}
- */
-function worktreeRemoveRule(git, protectedRoots) {
-  const forced = git.args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /f/));
-  if (!forced) return 'git-low-risk';
-  const raw = gitPositionals(git).slice(1)[0];
-  if (typeof raw !== 'string') return 'git-destructive';
-  // Collapse `.`/`..` first: `/tmp/../srv/project/production` would otherwise
-  // satisfy the `/tmp/` prefix while git removes a worktree somewhere else.
-  const target = normalizeProtectedRoot(raw);
-  if (isProtectedRoot(target, protectedRoots)) return 'git-destructive';
-  // Only the documented throwaway locations. A bare `worktrees/` component would
-  // also match paths like /srv/project/worktrees/production, where --force really
-  // can discard someone's work.
-  const throwaway = /(?:^|\/)(?:\.worktrees|\.claude\/worktrees)\//.test(target) ||
-    target.startsWith('/tmp/') || target.startsWith('/private/tmp/');
-  return throwaway ? 'git-low-risk' : 'git-destructive';
-}
-
-/**
- * @param {AnalyzedCommand} command @param {string[]} protectedRoots
- * @returns {'git-destructive'|'git-low-risk'|null}
- */
-function destructiveGitRule(command, protectedRoots) {
+/** @param {AnalyzedCommand} command @returns {'git-destructive'|'git-low-risk'|null} */
+function destructiveGitRule(command) {
   const git = parseGitCommand(command);
   if (!git) return null;
   const { subcommand, args } = git;
 
   if (['clean', 'reset', 'restore', 'rm'].includes(String(subcommand))) return 'git-destructive';
   if (subcommand === 'checkout') return checkoutRule(git);
+  // `git worktree remove` stays destructive whatever the path looks like. Git
+  // follows a symlinked path to the real worktree, and it deletes gitignored
+  // files (`.env`, `.venv`) even without `--force` — both verified on git 2.43 —
+  // so nothing in the argv proves where the removal lands or what it discards,
+  // and this guard has no filesystem access to find out.
   if (subcommand === 'worktree') {
-    if (args[0] === 'add') return args.slice(1).some((arg) => shortOptionHas(arg, /B/)) ? 'git-destructive' : null;
-    if (args[0] === 'remove') return worktreeRemoveRule(git, protectedRoots);
-    return null;
+    return args[0] === 'remove' || (args[0] === 'add' && args.slice(1).some((arg) => shortOptionHas(arg, /B/)))
+      ? 'git-destructive' : null;
   }
   if (subcommand === 'stash') return args[0] === 'drop' || args[0] === 'clear' ? 'git-destructive' : null;
   if (subcommand === 'config') return args.some((arg) => isLongOption(arg, '--global') || isLongOption(arg, '--system')) ? 'git-destructive' : null;
@@ -429,6 +413,26 @@ function parseSsh(command) {
   return { host: '(未解析出主机)', rest: '' };
 }
 
+const ORG_RULESET_PATH = /^\/?orgs\/[^/\s]+\/rulesets(?:\/|$)/;
+
+/**
+ * `gh api` takes either a path (`orgs/x/rulesets`) or a full URL, and a URL has
+ * many spellings that reach the same endpoint: `HTTPS://API.GITHUB.COM/…`, an
+ * explicit `:443`, a trailing dot on the host. Case-folding the host and
+ * dropping the default port before matching closes those (all verified against
+ * gh 2.96). Anything that does not parse as a URL is matched as a path.
+ * @param {string} value
+ */
+function isOrgRulesetEndpoint(value) {
+  if (!/^https?:\/\//i.test(value)) return ORG_RULESET_PATH.test(value);
+  let url;
+  try { url = new URL(value); } catch { return ORG_RULESET_PATH.test(value); }
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (host !== 'api.github.com') return false;
+  if (url.port !== '' && url.port !== '443') return false;
+  return ORG_RULESET_PATH.test(url.pathname);
+}
+
 /** @param {AnalyzedCommand} command @returns {{kind: 'matched'|'unknown', endpoint: string}|null} */
 function orgRulesetWrite(command) {
   if (!isCommand(command, 'gh') || command.argv[1] !== 'api') return null;
@@ -452,10 +456,7 @@ function orgRulesetWrite(command) {
     endpointInfo = { value: args[index], display: token };
     break;
   }
-  // Accept the absolute form too: `gh api https://api.github.com/orgs/x/rulesets`
-  // reaches the same endpoint and previously slipped past the relative-only regex.
-  const ORG_RULESETS = /^(?:https?:\/\/api\.github\.com)?\/?orgs\/[^/\s]+\/rulesets(?:\/|$)/;
-  const endpoint = typeof endpointInfo?.value === 'string' && ORG_RULESETS.test(endpointInfo.value)
+  const endpoint = typeof endpointInfo?.value === 'string' && isOrgRulesetEndpoint(endpointInfo.value)
     ? endpointInfo.value
     : null;
   const fieldWrite = tokens.some((arg) =>
@@ -641,7 +642,7 @@ function confirmationPolicy(graph, enabled, protectedRoots) {
       continue;
     }
 
-    const gitRule = destructiveGitRule(command, protectedRoots);
+    const gitRule = destructiveGitRule(command);
     if (gitRule && enabled(gitRule)) {
       const lowRisk = gitRule === 'git-low-risk';
       return {

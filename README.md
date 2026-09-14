@@ -162,7 +162,10 @@ nothing static can settle which. A filesystem probe in particular cannot: a
 tracked file that has been deleted is still a valid pathspec while it does not
 exist on disk. Short options are split from their operand the way git does —
 `-qB main`, `-Bmain` and `-qBmain` all yield the branch name, and `-d` is read as
-`--detach` under `checkout` but `--delete` under `branch` — so force-creating
+`--detach` under `checkout` but `--delete` under `branch`. `-B` is judged by the
+branch it lands on, so only a plain branch name is read as one: git's revision
+shorthands (`-B '@{-1}'`, `-B -`, `-B main@{yesterday}`) resolve to some other
+branch at run time and stay destructive — so force-creating
 a trunk branch is never mistaken for a plain switch, and an operand's letters are
 never mistaken for more flags.
 
@@ -173,18 +176,20 @@ can only put more commands in the destructive class; the flags that *loosen* a
 classification (checkout's `--detach` / `--track`) keep their exact spelling, so
 an abbreviation there simply fails to loosen.
 
-`git worktree remove` is destructive only when `--force` is used on a path
-outside a throwaway location (`.worktrees/`, `.claude/worktrees/`, `/tmp`; a bare
-`worktrees/` component is not enough), because git itself refuses to drop a dirty
-worktree otherwise. `git branch -d` is destructive only for `main` / `master` or an
+`git worktree remove` stays destructive whatever the path looks like: git follows
+a symlinked path to the real worktree, and it deletes gitignored files (`.env`,
+`.venv`) even without `--force` — both verified on git 2.43 — so nothing in the
+argv proves where the removal lands or what it discards, and this guard has no
+filesystem access to find out. `git branch -d` is destructive only for `main` / `master` or an
 unresolvable branch name, since git itself refuses to `-d` an unmerged branch.
 `-D` stays destructive in every case: it deletes unmerged work and removes the
 branch's own reflog along with it.
 
 Protected-root comparisons lexically normalize the path first (`.` and `..`
 collapsed, no filesystem access), so `rm -rf /tmp/../root` is judged as `/root`.
-`gh api` org-ruleset detection accepts the absolute form
-(`https://api.github.com/orgs/<org>/rulesets`) as well as the relative one.
+`gh api` org-ruleset detection accepts a full URL as well as a path, and
+canonicalizes it first — host case-folded, trailing dot and an explicit `:443`
+dropped — so `https://API.GITHUB.COM/orgs/<org>/rulesets` matches too.
 
 `off` does not disable the parser health check: without a reliable command graph,
 the guard cannot prove that hard-deny rules were not bypassed.

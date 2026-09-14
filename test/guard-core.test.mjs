@@ -121,6 +121,8 @@ test('org ruleset writes stay denied however the endpoint is spelled', () => {
   const denied = [
     'gh api -X PUT orgs/acme/rulesets/1 -f name=x',
     'gh api -X PUT https://api.github.com/orgs/acme/rulesets/1 -f name=x',
+    'gh api -X PUT https://API.GITHUB.COM/orgs/acme/rulesets/1 -f name=x',
+    'gh api -X PUT https://api.github.com.:443/orgs/acme/rulesets/1 -f name=x',
     'O=acme; gh api -X DELETE orgs/$O/rulesets/1',
     'EP=orgs/acme/rulesets/1; gh api -X PUT "$EP" -f name=x',
     'gh api -X PATCH "$EP" -f name=x',
@@ -134,13 +136,10 @@ test('org ruleset writes stay denied however the endpoint is spelled', () => {
 
 // --- git checkout / worktree / branch ---------------------------------------
 
-test('branch switching and throwaway worktree removal no longer need confirmation', () => {
+test('branch switching no longer needs confirmation', () => {
   const allowed = [
     'git checkout -q -b feat/session-forensics origin/main',
     'git checkout -B feat/retry origin/main',
-    'git worktree remove .worktrees/node-tools-runner',
-    'git worktree remove --force /home/xuwenhao/Codebase/srpone/zooclaw-dev/repos/zooclaw-engine/.worktrees/task',
-    'git worktree remove --force /tmp/claude-1000/scratch/engine-doc-wt',
     'git branch -d docs/issue-epics-tracking',
     'git branch --delete feat/a feat/b',
   ];
@@ -164,6 +163,10 @@ test('checkout forms that discard working-tree state still confirm', () => {
     // `-D` drops unmerged commits and the branch's own reflog with them.
     'git branch -D docs/issue-epics-tracking',
     'git branch --delete --force feat/a',
+    // git follows a symlinked path and discards gitignored files without
+    // --force, so no spelling of the path proves the removal is throwaway.
+    'git worktree remove .worktrees/node-tools-runner',
+    'git worktree remove --force /tmp/claude-1000/scratch/engine-doc-wt',
     'git worktree remove --force /home/xuwenhao/Codebase/srpone/zooclaw-dev/repos/zooclaw-engine',
   ];
   for (const command of confirmed) {
@@ -199,20 +202,16 @@ test('git expands pathspecs itself, so glob arguments are not branch names', () 
 });
 
 test('reads the branch operand of a bundled -B before the trunk check', () => {
-  for (const command of ['git checkout -qB main', 'git checkout -B main', 'git checkout -qB $BRANCH']) {
+  for (const command of [
+    'git checkout -qB main', 'git checkout -B main', 'git checkout -qB $BRANCH',
+    // `-B '@{-1}'` resets whatever branch was checked out before, main included.
+    "git checkout -B '@{-1}' HEAD", 'git checkout -B -', 'git checkout -B main@{yesterday}',
+  ]) {
     const result = evaluate(command, 'dangerous-only');
     assert.equal(result.kind, 'confirm', command);
     assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
   }
   assert.equal(evaluate('git checkout -qB feat/task origin/main', 'dangerous-only').kind, 'allow');
-});
-
-test('only the documented throwaway roots exempt a forced worktree removal', () => {
-  const result = evaluate('git worktree remove --force /srv/project/worktrees/production', 'dangerous-only');
-  assert.equal(result.kind, 'confirm');
-  assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive');
-  assert.equal(evaluate('git worktree remove --force /repo/.worktrees/task', 'dangerous-only').kind, 'allow');
-  assert.equal(evaluate('git worktree remove --force /tmp/claude/wt', 'dangerous-only').kind, 'allow');
 });
 
 // --- second review round: subshell reach, sourcing, path shape ---------------
@@ -310,9 +309,3 @@ test('checkout -d is the short form of --detach, not a deletion', () => {
 
 // --- path shape --------------------------------------------------------------
 
-test('worktree targets are normalized before the throwaway exemption', () => {
-  const result = evaluate('git worktree remove --force /tmp/../srv/project/production', 'dangerous-only');
-  assert.equal(result.kind, 'confirm');
-  assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive');
-  assert.equal(evaluate('git worktree remove --force /tmp/claude/wt', 'dangerous-only').kind, 'allow');
-});
