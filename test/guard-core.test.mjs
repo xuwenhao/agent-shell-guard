@@ -286,9 +286,12 @@ test('git accepts unambiguous long-option prefixes, so the rules must too', () =
     assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
   }
   // A force push spelled with an abbreviation is still a hard deny, not a confirm.
-  const forced = evaluate('git push --for origin main', 'dangerous-only');
-  assert.equal(forced.kind, 'deny');
-  assert.equal(/** @type {any} */ (forced).ruleId, 'force-push-main');
+  for (const command of ['git push --for origin main', 'git push --force-with-l origin main',
+    'git push --force-with-lease=main origin main']) {
+    const forced = evaluate(command, 'dangerous-only');
+    assert.equal(forced.kind, 'deny', command);
+    assert.equal(/** @type {any} */ (forced).ruleId, 'force-push-main', command);
+  }
 });
 
 test('an abbreviation never loosens a classification', () => {
@@ -296,6 +299,21 @@ test('an abbreviation never loosens a classification', () => {
   // from the exact spelling, so the ambiguous lone operand stays a confirm.
   assert.equal(evaluate('git checkout --det origin/main', 'dangerous-only').kind, 'confirm');
   assert.equal(evaluate('git checkout --detach origin/main', 'dangerous-only').kind, 'allow');
+});
+
+test('only flags git refuses to pair with a path count as branch intent', () => {
+  // Verified on git 2.43: each of these errors out on `git checkout <flag> file`.
+  for (const command of ['git checkout --detach origin/main', 'git checkout --track origin/feat',
+    'git checkout --no-track feat']) {
+    assert.equal(evaluate(command, 'dangerous-only').kind, 'allow', command);
+  }
+  // `--guess` only changes how a nonexistent *branch* name is second-guessed;
+  // `git checkout --guess tracked.txt` still discards the file's edits.
+  for (const command of ['git checkout --guess tracked.txt', 'git checkout --no-guess tracked.txt']) {
+    const result = evaluate(command, 'dangerous-only');
+    assert.equal(result.kind, 'confirm', command);
+    assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
+  }
 });
 
 test('checkout -d is the short form of --detach, not a deletion', () => {

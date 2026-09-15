@@ -144,7 +144,7 @@ function forcePush(command) {
   const display = effectiveDisplayArgv(command).slice(git.argOffset);
   return git.args.some((arg, index) => {
     const token = arg ?? display[index] ?? '';
-    return isLongOption(token, '--force') || token.startsWith('--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
+    return isLongOption(token, '--force') || isLongOption(token, '--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
   });
 }
 
@@ -316,7 +316,12 @@ function checkoutRule(git) {
   // restores it and discards the deletion) while `existsSync` says no, and with
   // `git -C <dir>` the probe would be looking in the wrong directory anyway. So
   // only an explicit branch-intent flag makes this a plain switch.
-  const refIntent = ['--detach', '--track', '--no-track', '--guess', '--no-guess'];
+  // Only flags git itself refuses to pair with a path count as branch intent —
+  // verified on git 2.43: `--detach`/`-d` and `--track`/`--no-track`/`-t` all
+  // error out on `git checkout <flag> tracked.txt`. `--guess`/`--no-guess` do
+  // not: they only change how a *nonexistent* branch name is second-guessed, and
+  // `git checkout --guess tracked.txt` happily discards the file's edits.
+  const refIntent = ['--detach', '--track', '--no-track'];
   // `-d` is checkout's short `--detach` (in `git branch` the same letter means
   // `--delete`, which is why this lives in the checkout rule).
   if (parsed.flags.some((flag) => refIntent.includes(flag)) ||
