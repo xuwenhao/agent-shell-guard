@@ -44,7 +44,7 @@ test('Claude maps confirm to native hook ask', () => {
 });
 
 test('Codex delegates exact native prefixes and denies uncovered confirms in strict mode', () => {
-  assert.equal(permission(adaptCodex(event('git branch -D old-feature'), BASE_CONFIG)), 'pass');
+  assert.equal(permission(adaptCodex(event('git branch -D main'), BASE_CONFIG)), 'pass');
   assert.equal(permission(adaptCodex(event('git branch -q -D old-feature'), BASE_CONFIG)), 'deny');
   assert.equal(permission(adaptCodex(event('psql -c "DROP TABLE users"'), BASE_CONFIG)), 'deny');
 });
@@ -54,20 +54,20 @@ test('native delegation is disabled until the host rules are explicitly installe
     ...BASE_CONFIG,
     nativePrompt: { codex: false, grok: false, kimi: false },
   };
-  assert.equal(permission(adaptCodex(event('git branch -D old-feature'), config)), 'deny');
-  assert.equal(grokPermission(adaptGrok(grokEvent('git branch -D old-feature'), config)), 'deny');
-  assert.equal(permission(adaptKimi(event('git branch -D old-feature'), config)), 'deny');
+  assert.equal(permission(adaptCodex(event('git branch -D main'), config)), 'deny');
+  assert.equal(grokPermission(adaptGrok(grokEvent('git branch -D main'), config)), 'deny');
+  assert.equal(permission(adaptKimi(event('git branch -D main'), config)), 'deny');
 });
 
 test('Grok delegates only when normalized argv and raw ask-rule prefix both match', () => {
-  assert.equal(grokPermission(adaptGrok(grokEvent('git branch -D old-feature'), BASE_CONFIG)), 'pass');
-  assert.equal(grokPermission(adaptGrok(grokEvent('git branch "-D" old-feature'), BASE_CONFIG)), 'deny');
+  assert.equal(grokPermission(adaptGrok(grokEvent('git branch -D main'), BASE_CONFIG)), 'pass');
+  assert.equal(grokPermission(adaptGrok(grokEvent('git branch "-D" main'), BASE_CONFIG)), 'deny');
   assert.equal(grokPermission(adaptGrok(grokEvent('psql -c "DROP TABLE users"'), BASE_CONFIG)), 'pass');
 });
 
 test('Kimi delegates only when normalized argv and raw permission prefix both match', () => {
-  assert.equal(permission(adaptKimi(event('git branch -D old-feature'), BASE_CONFIG)), 'pass');
-  assert.equal(permission(adaptKimi(event('git branch "-D" old-feature'), BASE_CONFIG)), 'deny');
+  assert.equal(permission(adaptKimi(event('git branch -D main'), BASE_CONFIG)), 'pass');
+  assert.equal(permission(adaptKimi(event('git branch "-D" main'), BASE_CONFIG)), 'deny');
   assert.equal(permission(adaptKimi(event('psql -c "DROP TABLE users"'), BASE_CONFIG)), 'pass');
 });
 

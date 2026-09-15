@@ -59,9 +59,28 @@ function commandTargets(command) {
   return targets;
 }
 
-/** @param {string} value */
+/**
+ * Lexically collapse `.` and `..` before any protected-root comparison, so
+ * `rm -rf /tmp/../root` is recognised as hitting `/root`. Purely lexical on
+ * purpose — a PreToolUse hook must not touch the filesystem — which is also the
+ * conservative direction, since it can only make more paths match a root.
+ * @param {string} value
+ */
 function normalizeProtectedRoot(value) {
-  return value.replace(/\/\*{1,2}$/, '').replace(/\/+$/, '') || '/';
+  const trimmed = value.replace(/\/\*{1,2}$/, '').replace(/\/+$/, '') || '/';
+  const absolute = trimmed.startsWith('/');
+  /** @type {string[]} */
+  const stack = [];
+  for (const segment of trimmed.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      if (stack.length && stack[stack.length - 1] !== '..') stack.pop();
+      else if (!absolute) stack.push('..');
+      continue;
+    }
+    stack.push(segment);
+  }
+  return absolute ? `/${stack.join('/')}`.replace(/\/$/, '') || '/' : stack.join('/') || '.';
 }
 
 /** @param {string} value @param {string[]} protectedRoots */
@@ -125,7 +144,7 @@ function forcePush(command) {
   const display = effectiveDisplayArgv(command).slice(git.argOffset);
   return git.args.some((arg, index) => {
     const token = arg ?? display[index] ?? '';
-    return token === '--force' || token.startsWith('--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
+    return isLongOption(token, '--force') || isLongOption(token, '--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
   });
 }
 
@@ -151,9 +170,165 @@ function pushRefs(command) {
   return positionals.slice(1);
 }
 
+/**
+ * Git accepts any unambiguous prefix of a long option, so `git worktree remove
+ * --for` is a forced removal and `git branch --del` is a deletion. Matching by
+ * prefix can only put *more* commands in the destructive class, which is the
+ * safe direction — an abbreviation that is actually ambiguous makes git itself
+ * refuse the command. The flags that *loosen* a classification (checkout's ref
+ * intent) deliberately keep their exact spelling: an abbreviation there simply
+ * fails to loosen, which is conservative in the same direction.
+ * @param {string|null|undefined} arg @param {string} option
+ */
+function isLongOption(arg, option) {
+  if (typeof arg !== 'string' || !arg.startsWith('--') || arg.length < 3) return false;
+  const name = arg.split('=')[0];
+  return option.startsWith(name);
+}
+
 /** @param {string|null} arg @param {RegExp} letters */
 function shortOptionHas(arg, letters) {
   return typeof arg === 'string' && /^-[^-]/.test(arg) && letters.test(arg.slice(1));
+}
+
+/**
+ * Positional arguments of a git subcommand.
+ * @param {{args: Array<string|null>}} git
+ * @param {Set<string>} [valueFlags]
+ */
+function gitPositionals(git, valueFlags = new Set()) {
+  /** @type {Array<string|null>} */
+  const positionals = [];
+  let options = true;
+  for (let index = 0; index < git.args.length; index++) {
+    const arg = git.args[index];
+    if (options && arg === '--') { options = false; continue; }
+    if (options && typeof arg === 'string' && arg.startsWith('-')) {
+      if (valueFlags.has(arg)) index++;
+      continue;
+    }
+    positionals.push(arg);
+  }
+  return positionals;
+}
+
+const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
+// A literal branch name, with none of git's revision shorthands (`@{-1}`, `-`,
+// `HEAD^`, `x~2`, `a...b`) that resolve to some *other* branch at run time.
+const PLAIN_BRANCH = /^(?!-)[A-Za-z0-9._\/+-]+$/;
+
+/**
+ * Split checkout's argv the way git does. Short options cluster (`-qB`) and may
+ * carry their operand attached (`-Bmain`), so scanning for a standalone `-B`
+ * token both misses the branch name and mistakes the operand's letters for more
+ * flags — `-Bmain` would read as if `-m` were present.
+ * @param {{args: Array<string|null>}} git
+ */
+function parseCheckoutArgs(git) {
+  const SHORT_WITH_OPERAND = 'bBcC';
+  const LONG_WITH_OPERAND = new Set(['--orphan', '--conflict', '--track', '--start-point', '--pathspec-from-file']);
+  /** @type {string[]} */ const flags = [];
+  /** @type {string[]} */ const letters = [];
+  /** @type {Array<string|null>} */ const positionals = [];
+  /** @type {string|null|undefined} */ let createTarget;
+  let forceCreate = false;
+  let endOfOptions = false;
+
+  for (let index = 0; index < git.args.length; index++) {
+    const raw = git.args[index];
+    if (endOfOptions) { positionals.push(raw); continue; }
+    if (raw === null) { positionals.push(null); continue; }
+    if (raw === '--') { flags.push('--'); endOfOptions = true; continue; }
+    if (raw.startsWith('--')) {
+      const eq = raw.indexOf('=');
+      const name = eq === -1 ? raw : raw.slice(0, eq);
+      flags.push(name);
+      const operand = eq === -1 ? undefined : raw.slice(eq + 1);
+      if (name === '--orphan') createTarget = operand ?? git.args[++index] ?? null;
+      else if (operand === undefined && LONG_WITH_OPERAND.has(name)) index++;
+      continue;
+    }
+    if (raw.startsWith('-') && raw.length > 1) {
+      const cluster = raw.slice(1);
+      for (let cursor = 0; cursor < cluster.length; cursor++) {
+        const letter = cluster[cursor];
+        letters.push(letter);
+        if (!SHORT_WITH_OPERAND.includes(letter)) continue;
+        const attached = cluster.slice(cursor + 1);
+        const operand = attached !== '' ? attached : git.args[++index] ?? null;
+        if (letter === 'b' || letter === 'B') {
+          createTarget = operand;
+          if (letter === 'B') forceCreate = true;
+        }
+        break;
+      }
+      continue;
+    }
+    positionals.push(raw);
+  }
+  return { flags, letters, positionals, createTarget, forceCreate };
+}
+
+/**
+ * `git checkout` is two commands under one name: switching or creating a branch
+ * (cheap, reversible) and restoring paths from a tree-ish (silently discards
+ * edits). Only the second needs a human. A lone positional can be either, and
+ * nothing in the argv settles it, so it stays destructive unless an explicit
+ * branch-intent flag says otherwise.
+ * @param {{args: Array<string|null>}} git
+ * @returns {'git-destructive'|'git-low-risk'|null}
+ */
+function checkoutRule(git) {
+  const parsed = parseCheckoutArgs(git);
+  if (parsed.flags.includes('--')) return 'git-destructive';
+  // `--pathspec-from-file <file>` restores every path listed in the file, which
+  // is a working-tree discard with no positional argument to notice it by.
+  if (parsed.flags.some((flag) => isLongOption(flag, '--pathspec-from-file'))) return 'git-destructive';
+  const forceish = parsed.flags.some((flag) =>
+    ['--force', '--ours', '--theirs', '--merge', '--patch', '--overwrite-ignore']
+      .some((option) => isLongOption(flag, option))) ||
+    parsed.letters.some((letter) => 'fmp'.includes(letter));
+  if (forceish) return 'git-destructive';
+  if (parsed.positionals.some((value) => value === '.' || value === null)) return 'git-destructive';
+  // Git expands pathspecs itself, so `git checkout '*.txt'` overwrites matching
+  // modified files even though no file literally named `*.txt` exists — an
+  // existence probe alone would wave it through as a branch name. Refs cannot
+  // contain glob metacharacters, and a leading `:` is pathspec magic.
+  if (parsed.positionals.some((value) => typeof value === 'string' && (/[*?[\]]/.test(value) || value.startsWith(':')))) {
+    return 'git-destructive';
+  }
+  if (parsed.createTarget !== undefined) {
+    // `-B` resets an existing branch, so the trunk check has to see the branch it
+    // will actually land on. Git's revision shorthands hide that: `-B '@{-1}'`
+    // resets whatever branch was checked out before, which may well be main
+    // (verified on git 2.43). Only a plain branch name is judged by name.
+    const target = parsed.createTarget;
+    if (parsed.forceCreate && (typeof target !== 'string' || !PLAIN_BRANCH.test(target) || TRUNK_REF.test(target))) {
+      return 'git-destructive';
+    }
+    return 'git-low-risk';
+  }
+  if (parsed.positionals.length === 0) return 'git-low-risk';
+  if (parsed.positionals.length > 1) return 'git-destructive';
+  // A lone operand is genuinely ambiguous — git resolves it against both refs and
+  // paths. Filesystem existence cannot settle it either way: a tracked file that
+  // has been deleted is still a valid pathspec (`git checkout tracked.txt`
+  // restores it and discards the deletion) while `existsSync` says no, and with
+  // `git -C <dir>` the probe would be looking in the wrong directory anyway. So
+  // only an explicit branch-intent flag makes this a plain switch.
+  // Only flags git itself refuses to pair with a path count as branch intent —
+  // verified on git 2.43: `--detach`/`-d` and `--track`/`--no-track`/`-t` all
+  // error out on `git checkout <flag> tracked.txt`. `--guess`/`--no-guess` do
+  // not: they only change how a *nonexistent* branch name is second-guessed, and
+  // `git checkout --guess tracked.txt` happily discards the file's edits.
+  const refIntent = ['--detach', '--track', '--no-track'];
+  // `-d` is checkout's short `--detach` (in `git branch` the same letter means
+  // `--delete`, which is why this lives in the checkout rule).
+  if (parsed.flags.some((flag) => refIntent.includes(flag)) ||
+      parsed.letters.some((letter) => letter === 't' || letter === 'd')) {
+    return 'git-low-risk';
+  }
+  return 'git-destructive';
 }
 
 /** @param {AnalyzedCommand} command @returns {'git-destructive'|'git-low-risk'|null} */
@@ -162,25 +337,44 @@ function destructiveGitRule(command) {
   if (!git) return null;
   const { subcommand, args } = git;
 
-  if (['clean', 'reset', 'restore', 'checkout', 'rm'].includes(String(subcommand))) return 'git-destructive';
+  if (['clean', 'reset', 'restore', 'rm'].includes(String(subcommand))) return 'git-destructive';
+  if (subcommand === 'checkout') return checkoutRule(git);
+  // `git worktree remove` stays destructive whatever the path looks like. Git
+  // follows a symlinked path to the real worktree, and it deletes gitignored
+  // files (`.env`, `.venv`) even without `--force` — both verified on git 2.43 —
+  // so nothing in the argv proves where the removal lands or what it discards,
+  // and this guard has no filesystem access to find out.
   if (subcommand === 'worktree') {
     return args[0] === 'remove' || (args[0] === 'add' && args.slice(1).some((arg) => shortOptionHas(arg, /B/)))
       ? 'git-destructive' : null;
   }
   if (subcommand === 'stash') return args[0] === 'drop' || args[0] === 'clear' ? 'git-destructive' : null;
-  if (subcommand === 'config') return args.some((arg) => arg === '--global' || arg === '--system') ? 'git-destructive' : null;
+  if (subcommand === 'config') return args.some((arg) => isLongOption(arg, '--global') || isLongOption(arg, '--system')) ? 'git-destructive' : null;
   if (subcommand === 'branch') {
-    const highRisk = args.some((arg) => arg === '--force' || shortOptionHas(arg, /[DfMC]/));
-    if (highRisk) return 'git-destructive';
-    return args.some((arg) => arg === '--delete' || shortOptionHas(arg, /d/)) ? 'git-low-risk' : null;
+    // `-d` refuses to delete an unmerged branch, so it can only drop a ref whose
+    // commits are reachable elsewhere — not the same class of action as
+    // force-renaming or -moving. `-D` has no such guard: it deletes unmerged
+    // work, and it deletes the branch's own reflog with it (the commits usually
+    // survive in HEAD's reflog, but a branch only ever committed to inside a
+    // worktree that has since been removed loses that too), so it stays a
+    // confirm.
+    const forced = args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /[DfMC]/));
+    if (forced) return 'git-destructive';
+    if (args.some((arg) => isLongOption(arg, '--delete') || shortOptionHas(arg, /d/))) {
+      const targets = gitPositionals(git, new Set(['--contains', '--no-contains', '--merged', '--no-merged', '-u', '--set-upstream-to']));
+      const unresolved = targets.some((value) => value === null);
+      const trunk = targets.some((value) => typeof value === 'string' && TRUNK_REF.test(value));
+      return unresolved || trunk ? 'git-destructive' : 'git-low-risk';
+    }
+    return null;
   }
   if (subcommand === 'tag') {
-    const force = args.some((arg) => arg === '--force' || shortOptionHas(arg, /f/));
+    const force = args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /f/));
     if (force) return 'git-destructive';
     return args.some((arg) => arg === '--delete' || shortOptionHas(arg, /d/)) ? 'git-low-risk' : null;
   }
   if (subcommand === 'switch') {
-    const highRisk = args.some((arg) => arg === '--discard-changes' || arg === '--force' || arg === '--force-create' ||
+    const highRisk = args.some((arg) => isLongOption(arg, '--discard-changes') || isLongOption(arg, '--force') || isLongOption(arg, '--force-create') ||
       shortOptionHas(arg, /[Cf]/));
     if (highRisk) return 'git-destructive';
     return args.some((arg) => shortOptionHas(arg, /d/)) ? 'git-low-risk' : null;
@@ -195,12 +389,12 @@ function destructiveGitRule(command) {
     return ['install', 'migrate', 'uninstall', 'prune'].includes(String(action)) ? 'git-destructive' : null;
   }
   if (subcommand === 'rebase') {
-    return args.some((arg) => arg === '--exec' || (typeof arg === 'string' && arg.startsWith('--exec=')) ||
-      arg === '--reschedule-failed-exec' || shortOptionHas(arg, /x/)) ? 'git-destructive' : null;
+    return args.some((arg) => isLongOption(arg, '--exec') ||
+      isLongOption(arg, '--reschedule-failed-exec') || shortOptionHas(arg, /x/)) ? 'git-destructive' : null;
   }
   if (subcommand === 'push') {
     return args.some((arg) =>
-      arg === '--delete' || arg === '--mirror' || arg === '--prune' ||
+      isLongOption(arg, '--delete') || isLongOption(arg, '--mirror') || isLongOption(arg, '--prune') ||
       shortOptionHas(arg, /d/) || (typeof arg === 'string' && /^\+?:\S+/.test(arg))) ? 'git-destructive' : null;
   }
   return null;
@@ -222,6 +416,26 @@ function parseSsh(command) {
     };
   }
   return { host: '(未解析出主机)', rest: '' };
+}
+
+const ORG_RULESET_PATH = /^\/?orgs\/[^/\s]+\/rulesets(?:\/|$)/;
+
+/**
+ * `gh api` takes either a path (`orgs/x/rulesets`) or a full URL, and a URL has
+ * many spellings that reach the same endpoint: `HTTPS://API.GITHUB.COM/…`, an
+ * explicit `:443`, a trailing dot on the host. Case-folding the host and
+ * dropping the default port before matching closes those (all verified against
+ * gh 2.96). Anything that does not parse as a URL is matched as a path.
+ * @param {string} value
+ */
+function isOrgRulesetEndpoint(value) {
+  if (!/^https?:\/\//i.test(value)) return ORG_RULESET_PATH.test(value);
+  let url;
+  try { url = new URL(value); } catch { return ORG_RULESET_PATH.test(value); }
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (host !== 'api.github.com') return false;
+  if (url.port !== '' && url.port !== '443') return false;
+  return ORG_RULESET_PATH.test(url.pathname);
 }
 
 /** @param {AnalyzedCommand} command @returns {{kind: 'matched'|'unknown', endpoint: string}|null} */
@@ -247,7 +461,7 @@ function orgRulesetWrite(command) {
     endpointInfo = { value: args[index], display: token };
     break;
   }
-  const endpoint = typeof endpointInfo?.value === 'string' && /^\/?orgs\/[^/\s]+\/rulesets(?:\/|$)/.test(endpointInfo.value)
+  const endpoint = typeof endpointInfo?.value === 'string' && isOrgRulesetEndpoint(endpointInfo.value)
     ? endpointInfo.value
     : null;
   const fieldWrite = tokens.some((arg) =>
@@ -283,7 +497,7 @@ function hardPolicy(graph, enabled, protectedRoots) {
         ruleId: 'org-ruleset-write', evaluation: orgWrite.kind,
         detail: `修改 org-level ruleset（${trunc(orgWrite.endpoint)}）`,
         why: orgWrite.kind === 'unknown'
-          ? 'endpoint 或写入方法无法静态还原，可能隐藏组织级 ruleset 写入；按全局约定必须拒绝。'
+          ? 'endpoint 或写入方法无法静态还原，可能隐藏组织级 ruleset 写入；按全局约定必须拒绝。改法：endpoint 写成字面量（如 repos/<owner>/<repo>/pulls/1/comments），不要整段放在变量里。'
           : '按全局约定，组织级分支保护规则只能由人在 GitHub UI 修改，AI/CLI 一律不得写入。需要变更时把改动内容写清楚交给用户手动操作。',
       };
     }
@@ -301,7 +515,7 @@ function hardPolicy(graph, enabled, protectedRoots) {
           detail: `递归删除 ${target?.display ?? '<?>'}（root / home / Codebase 顶层目录）`,
           why: protectedTarget
             ? '一旦执行整个目录树不可恢复、影响面过大。若确需清理，请改用指向具体子目录的精确路径。'
-            : '递归删除目标无法静态还原，可能指向 root / home / Codebase 顶层目录，必须拒绝。',
+            : '递归删除目标无法静态还原，可能指向 root / home / Codebase 顶层目录，必须拒绝。改法：把目标写成字面绝对路径（变量只有在同一条命令里以字面量赋值、且不在 if/for/函数/管道里才能被还原）。',
         };
       }
     }
@@ -325,8 +539,12 @@ function hardPolicy(graph, enabled, protectedRoots) {
   return null;
 }
 
-/** @param {ShellGraph} graph @param {PolicyEnabled} enabled @returns {PolicyMatch|null} */
-function confirmationPolicy(graph, enabled) {
+/**
+ * @param {ShellGraph} graph @param {PolicyEnabled} enabled
+ * @param {string[]} protectedRoots
+ * @returns {PolicyMatch|null}
+ */
+function confirmationPolicy(graph, enabled, protectedRoots) {
   for (const command of graph.commands) {
     const tool = commandName(command);
     if (enabled('remote-exec') && ['ssh', 'scp', 'rsync'].includes(tool) && (tool === 'rsync' || !hasFlag(command.argv, '-G'))) {
@@ -566,7 +784,7 @@ export function evaluateHookEvent(event, options = {}) {
     };
   }
 
-  const confirmation = confirmationPolicy(analysis, enabled);
+  const confirmation = confirmationPolicy(analysis, enabled, options.protectedRoots ?? ['/']);
   if (confirmation) {
     const kind = confirmation.ruleId === 'git-low-risk' ? 'review' : 'confirm';
     return { kind, command, description, analysis, ...confirmation };
