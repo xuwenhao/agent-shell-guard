@@ -152,8 +152,9 @@ approval layer; `full` adds guard-level confirmation for them. A force push
 whose target ref cannot be resolved remains a hard deny.
 
 `git checkout` is classified by its arguments, not by its name. Creating a
-branch (`-b` / `-B` / `--orphan`) or an explicit ref intent (`--detach`,
-`--track`) is left to the host's approval layer; everything else that can replace
+branch (`-b` / `-B` / `--orphan`) or an explicit ref intent (`--detach`/`-d`,
+`--track`/`-t`, `--no-track` — the flags git itself refuses to pair with a path;
+`--guess` is not one of them) is left to the host's approval layer; everything else that can replace
 working-tree content stays destructive: `--`, `.`, `--force`, `--ours`,
 `--theirs`, `--merge`, `-p`, `--pathspec-from-file`, a second positional, a glob
 or `:`-magic pathspec, an unresolvable operand — and a lone operand with no
@@ -173,7 +174,7 @@ Long options are matched by prefix, because git accepts any unambiguous
 abbreviation: `git worktree remove --for`, `git branch --del`, `git push --for`
 and `git checkout --pathspec-from-f=` all reach the full option. Prefix matching
 can only put more commands in the destructive class; the flags that *loosen* a
-classification (checkout's `--detach` / `--track`) keep their exact spelling, so
+classification (checkout's ref intent) keep their exact spelling, so
 an abbreviation there simply fails to loosen.
 
 `git worktree remove` stays destructive whatever the path looks like: git follows
