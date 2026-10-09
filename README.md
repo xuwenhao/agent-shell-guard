@@ -18,6 +18,32 @@ agent-shell-guard doctor
 `~/.local/bin/agent-shell-guard`, and creates a conservative default
 configuration at `~/.config/agent-shell-guard/config.json`.
 
+### Upgrading
+
+Re-run `agent-shell-guard setup` after every upgrade, and after switching Node
+versions:
+
+```bash
+npm install --global @xuwenhao83/agent-shell-guard@latest
+agent-shell-guard setup
+agent-shell-guard doctor
+```
+
+The launcher is a two-line shell script holding the **absolute** path of the
+`node` binary and of the `src/cli.mjs` that installed it, so that hooks keep
+working regardless of which Node is on `PATH` when they fire. The cost is that
+the launcher does not follow a later `npm install --global`: with a version
+manager, a global install goes to whichever prefix is active, which may be a
+different tree from the one the launcher points at. The launcher then keeps
+executing the older copy while `npm ls --global` reports the new version — the
+two disagree, and only `setup` (run from the copy you want) brings them back in
+line, because it rewrites the launcher from its own location.
+
+`doctor` verifies the managed `shfmt`; it does not check which package version
+the launcher resolves to. To confirm an upgrade actually took effect, compare
+the path inside `~/.local/bin/agent-shell-guard` against the `version` field of
+the `package.json` next to it.
+
 Print the host configuration to merge into the corresponding config file:
 
 ```bash
