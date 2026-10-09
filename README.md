@@ -18,6 +18,46 @@ agent-shell-guard doctor
 `~/.local/bin/agent-shell-guard`, and creates a conservative default
 configuration at `~/.config/agent-shell-guard/config.json`.
 
+### Upgrading
+
+Re-run `setup` after every upgrade, and after switching Node versions — but run
+it from the copy that was just installed, **not** through the launcher on
+`PATH`:
+
+```bash
+npm install --global @xuwenhao83/agent-shell-guard@latest
+node "$(npm root --global)/@xuwenhao83/agent-shell-guard/src/cli.mjs" setup
+agent-shell-guard doctor
+```
+
+The launcher is a two-line shell script holding the **absolute** path of the
+`node` binary and of the `src/cli.mjs` that installed it, so that hooks keep
+working regardless of which Node is on `PATH` when they fire. Two consequences:
+
+- The launcher does not follow a later `npm install --global`. With a version
+  manager, a global install goes to whichever prefix is active, which may be a
+  different tree from the one the launcher points at. The launcher then keeps
+  executing the older copy while `npm ls --global` reports the new version.
+- A bare `agent-shell-guard setup` cannot repair that, and usually makes it
+  permanent. `~/.local/bin` normally precedes the npm global bin on `PATH`, so
+  the bare name resolves to the launcher, which executes its own pinned old
+  `cli.mjs`; `setup` writes the path of whichever copy is running back into the
+  launcher, so the old copy simply re-pins itself. Invoking the freshly
+  installed `cli.mjs` by path is what makes `setup` write the new paths.
+
+`npm root --global` is the right source for that path because it reports the
+same location the preceding `npm install --global` wrote to. If the package was
+installed into an explicit `--prefix`, use that prefix's
+`lib/node_modules/@xuwenhao83/agent-shell-guard/src/cli.mjs` instead.
+
+`doctor` verifies the managed `shfmt`; it does not check which package version
+the launcher resolves to. Confirm the upgrade took effect directly:
+
+```bash
+sed -n "s#.*'\(/.*\)/src/cli\.mjs'.*#\1#p" ~/.local/bin/agent-shell-guard \
+  | xargs -I{} node -p "require('{}/package.json').version"
+```
+
 Print the host configuration to merge into the corresponding config file:
 
 ```bash
