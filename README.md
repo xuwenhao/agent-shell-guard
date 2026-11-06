@@ -299,7 +299,7 @@ are protected just like `--ours` / `--theirs`. Real temporary-repository tests
 cover this destructive combination and prove ref-intent flags reject tracked-file
 restoration rather than discarding dirty content.
 
-Codex delegation failures now include a `[guard-diagnostic]` JSON marker with
+Codex native delegation failures in strict mode now include a `[guard-diagnostic]` JSON marker with
 `reasonCode`, `ruleId` and `decisionSource`, without adding unsupported fields to
 the host hook schema. Codes distinguish disabled delegation, unsupported shell
 shape, and uncovered native prefixes. For authorized Git operations the message

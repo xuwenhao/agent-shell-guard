@@ -134,6 +134,8 @@ test('Codex blocked delegation exposes stable diagnostic codes and bounded recov
     assert.match(reason, /workdir/);
     assert.match(reason, /require_escalated 不会解除/);
   }
+  const uncovered = adaptCodex(event('git checkout --conflict=merge -- a.ts'), config);
+  assert.match(uncovered?.hookSpecificOutput.permissionDecisionReason ?? '', /仅添加 workdir 或重试升级不能解决/);
   const disabled = adaptCodex(event('git restore a.ts'), { ...config, nativePrompt: { ...config.nativePrompt, codex: false } });
   assert.match(disabled?.hookSpecificOutput.permissionDecisionReason ?? '', /native-prompt-disabled/);
   const hard = adaptCodex(event('git push origin main --force'), config);
