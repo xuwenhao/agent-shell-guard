@@ -258,7 +258,8 @@ not sufficient. This repository does not publish or replace a live installation
 as part of tests.
 
 The `git clean` and `git checkout` catch-all prompt entries are replaced by exact
-first-argument prefixes. All other native entries are unchanged:
+first-argument prefixes. All other Codex native entries are unchanged; Kimi and Grok retain their broad
+clean/checkout confirmation entries and need no native-rule migration:
 
 - `git clean`: `-f`, `--force`, `-i`, `--interactive`.
 - `git checkout`: `--`, `-f`, `--force`, `--ours`, `--theirs`, `-m`, `--merge`,

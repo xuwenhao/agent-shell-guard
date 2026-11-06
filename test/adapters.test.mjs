@@ -137,3 +137,12 @@ test('Codex blocked delegation exposes stable diagnostic codes and bounded recov
   assert.equal(permission(hard), 'deny');
   assert.doesNotMatch(hard?.hookSpecificOutput.permissionDecisionReason ?? '', /恢复：|guard-diagnostic/);
 });
+
+
+test('Codex-only prefix migration preserves Kimi and Grok broad native confirmations', () => {
+  for (const command of ['git checkout tracked.txt', 'git clean -df', 'git checkout -Bfeat']) {
+    assert.equal(permission(adaptCodex(event(command), BASE_CONFIG)), 'deny', command);
+    assert.equal(permission(adaptKimi(event(command), BASE_CONFIG)), 'pass', command);
+    assert.equal(grokPermission(adaptGrok(grokEvent(command), BASE_CONFIG)), 'pass', command);
+  }
+});
