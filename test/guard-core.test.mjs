@@ -142,7 +142,6 @@ test('org ruleset writes stay denied however the endpoint is spelled', () => {
 test('branch switching no longer needs confirmation', () => {
   const allowed = [
     'git checkout -q -b feat/session-forensics origin/main',
-    'git checkout -B feat/retry origin/main',
     'git branch -d docs/issue-epics-tracking',
     'git branch --delete feat/a feat/b',
   ];
@@ -214,7 +213,7 @@ test('reads the branch operand of a bundled -B before the trunk check', () => {
     assert.equal(result.kind, 'confirm', command);
     assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
   }
-  assert.equal(evaluate('git checkout -qB feat/task origin/main', 'dangerous-only').kind, 'allow');
+  assert.equal(evaluate('git checkout -qB feat/task origin/main', 'dangerous-only').kind, 'confirm');
 });
 
 // --- second review round: subshell reach, sourcing, path shape ---------------
@@ -264,7 +263,7 @@ test('short options are split from their attached operand', () => {
     assert.equal(/** @type {any} */ (result).ruleId, 'git-destructive', command);
   }
   // The operand's letters must not read as `-f` / `-m` / `-p`.
-  assert.equal(evaluate('git checkout -Bfeat/task origin/main', 'dangerous-only').kind, 'allow');
+  assert.equal(evaluate('git checkout -Bfeat/task origin/main', 'dangerous-only').kind, 'confirm');
   assert.equal(evaluate('git checkout -bfix/parse', 'dangerous-only').kind, 'allow');
 });
 

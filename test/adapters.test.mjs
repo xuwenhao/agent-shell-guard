@@ -101,12 +101,14 @@ test('Codex native coverage never silently delegates removed broad Git prefixes'
     'git checkout --forc main', 'git checkout -b feat --force',
     'git clean --dry-run "$TARGET"', 'git clean -n --no-dry-run',
     'git checkout --detach HEAD --theirs', 'git checkout -b feat -- a.ts',
-    'git checkout -b "$BRANCH"', 'git -C "$REPO" clean -n']) {
+    'git checkout -b "$BRANCH"', 'git -C "$REPO" clean -n',
+    'git checkout -Bfeat', 'git checkout -qB feat', 'git checkout -b feat -B other',
+    'git checkout -b feat --conflict=merge', 'git checkout --detach HEAD --conflict=diff3']) {
     assert.equal(permission(adaptCodex(event(command), config)), 'deny', command);
   }
   for (const command of ['git clean -n', 'git clean --dry-run', 'git checkout -b feat',
     'git checkout --detach origin/main', 'git clean -f', 'git checkout -- tracked.txt',
-    'git checkout --force main']) {
+    'git checkout --force main', 'git checkout -B feat']) {
     assert.equal(permission(adaptCodex(event(command), config)), 'pass', command);
   }
 });

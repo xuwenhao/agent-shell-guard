@@ -192,23 +192,20 @@ approval layer; `full` adds guard-level confirmation for them. A force push
 whose target ref cannot be resolved remains a hard deny.
 
 `git checkout` is classified by its arguments, not by its name. Creating a
-branch (`-b` / `-B` / `--orphan`) or an explicit ref intent (`--detach`/`-d`,
+branch (`-b` / `--orphan`) or an explicit ref intent (`--detach`/`-d`,
 `--track`/`-t`, `--no-track` — the flags git itself refuses to pair with a path;
 `--guess` is not one of them) is left to the host's approval layer; everything else that can replace
 working-tree content stays destructive: `--`, `.`, `--force`, `--ours`,
-`--theirs`, `--merge`, `-p`, `--pathspec-from-file`, a second positional, a glob
+`--theirs`, `--merge`, `--conflict`, `-p`, `--pathspec-from-file`, a second positional, a glob
 or `:`-magic pathspec, an unresolvable operand — and a lone operand with no
 branch-intent flag, because git resolves it against both refs and paths and
 nothing static can settle which. A filesystem probe in particular cannot: a
 tracked file that has been deleted is still a valid pathspec while it does not
 exist on disk. Short options are split from their operand the way git does —
 `-qB main`, `-Bmain` and `-qBmain` all yield the branch name, and `-d` is read as
-`--detach` under `checkout` but `--delete` under `branch`. `-B` is judged by the
-branch it lands on, so only a plain branch name is read as one: git's revision
-shorthands (`-B '@{-1}'`, `-B -`, `-B main@{yesterday}`) resolve to some other
-branch at run time and stay destructive — so force-creating
-a trunk branch is never mistaken for a plain switch, and an operand's letters are
-never mistaken for more flags.
+`--detach` under `checkout` but `--delete` under `branch`. `-B` always stays destructive, including literal non-trunk targets and attached
+or bundled forms: resetting an existing branch can discard its previous tip.
+
 
 Long options are matched by prefix, because git accepts any unambiguous
 abbreviation: `git worktree remove --for`, `git branch --del`, `git push --for`
@@ -278,9 +275,13 @@ matching rule even when a later option makes a command read-only.
 Checkout keeps its parameter-based classification: explicit static `-b`,
 `--detach`, `--track` and `--no-track` can identify branch intent. A bare operand
 is still ambiguous with a path; force/pathspec options and dynamic operands stay
-protected. `-B` retains its native prompt, including cases where the core considers
-a literal non-trunk target low-risk. Existing accepted branch-switch behavior for
+protected. `-B` is now always destructive, including literal non-trunk targets that older
+core versions considered low-risk. Exact `-B` retains a native prompt; attached
+and bundled forms fail closed. Existing accepted branch-switch behavior for
 ignored files is unchanged.
+
+`--conflict` (which selects merge conflict handling) also stays destructive even
+when combined with branch-intent flags.
 
 Some dangerous forms that previously matched a catch-all prompt now **deny** in
 strict mode, for example `git clean -df`, `git checkout tracked.txt`, abbreviated

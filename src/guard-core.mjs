@@ -213,9 +213,6 @@ function gitPositionals(git, valueFlags = new Set()) {
 }
 
 const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
-// A literal branch name, with none of git's revision shorthands (`@{-1}`, `-`,
-// `HEAD^`, `x~2`, `a...b`) that resolve to some *other* branch at run time.
-const PLAIN_BRANCH = /^(?!-)[A-Za-z0-9._\/+-]+$/;
 
 /**
  * Split checkout's argv the way git does. Short options cluster (`-qB`) and may
@@ -286,7 +283,7 @@ function checkoutRule(git) {
   // is a working-tree discard with no positional argument to notice it by.
   if (parsed.flags.some((flag) => isLongOption(flag, '--pathspec-from-file'))) return 'git-destructive';
   const forceish = parsed.flags.some((flag) =>
-    ['--force', '--ours', '--theirs', '--merge', '--patch', '--overwrite-ignore']
+    ['--force', '--ours', '--theirs', '--merge', '--conflict', '--patch', '--overwrite-ignore']
       .some((option) => isLongOption(flag, option))) ||
     parsed.letters.some((letter) => 'fmp'.includes(letter));
   if (forceish) return 'git-destructive';
@@ -299,14 +296,10 @@ function checkoutRule(git) {
     return 'git-destructive';
   }
   if (parsed.createTarget !== undefined) {
-    // `-B` resets an existing branch, so the trunk check has to see the branch it
-    // will actually land on. Git's revision shorthands hide that: `-B '@{-1}'`
-    // resets whatever branch was checked out before, which may well be main
-    // (verified on git 2.43). Only a plain branch name is judged by name.
-    const target = parsed.createTarget;
-    if (parsed.forceCreate && (typeof target !== 'string' || !PLAIN_BRANCH.test(target) || TRUNK_REF.test(target))) {
-      return 'git-destructive';
-    }
+    // Every -B can discard an existing branch tip, including literal non-trunk
+    // names. Narrow native prefixes cannot cover attached/bundled forms, so all
+    // force-creation remains destructive and uncovered variants fail closed.
+    if (parsed.forceCreate) return 'git-destructive';
     return 'git-low-risk';
   }
   if (parsed.positionals.length === 0) return 'git-low-risk';
