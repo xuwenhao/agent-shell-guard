@@ -292,7 +292,10 @@ reviewable commands where authorized; for path restoration prefer the existing
 `git restore` prompt path. Do not rewrite hard denials to evade policy.
 
 Checkout parsing treats `--track[=(direct|inherit)]` as an optional attached value;
-it never consumes a following `--force` or `-f`. Real temporary-repository tests
+it never consumes a following `--force` or `-f`. Negated branch-intent flags
+`--no-detach` / `--no-orphan` remain destructive: they can cancel an earlier
+branch intent and make a trailing operand restore a path. Short `-2` / `-3`
+are protected just like `--ours` / `--theirs`. Real temporary-repository tests
 cover this destructive combination and prove ref-intent flags reject tracked-file
 restoration rather than discarding dirty content.
 

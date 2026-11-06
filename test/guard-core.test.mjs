@@ -381,6 +381,10 @@ test('checkout optional tracking value cannot swallow force; explicit ref intent
     { args: ['--detach', 'tracked.txt'], destructive: false },
     { args: ['--track', '--force', '-b', 'new', 'main'], destructive: true },
     { args: ['--track', '-f', '-b', 'new', 'main'], destructive: true },
+    { args: ['--detach', '--no-detach', 'tracked.txt'], destructive: true },
+    { args: ['-d', '--no-detach', 'tracked.txt'], destructive: true },
+    { args: ['--orphan', 'new', '--no-orphan', 'tracked.txt'], destructive: true },
+    { args: ['-2', 'tracked.txt'], destructive: true },
   ];
   for (const { args, destructive } of cases) {
     const directory = mkdtempSync(join(tmpdir(), 'guard-checkout-intent-'));

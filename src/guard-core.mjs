@@ -222,7 +222,7 @@ const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
  * @param {{args: Array<string|null>}} git
  */
 function parseCheckoutArgs(git) {
-  const SHORT_WITH_OPERAND = 'bBcC';
+  const SHORT_WITH_OPERAND = 'bB';
   // --track[=(direct|inherit)] takes only an attached optional value. Consuming
   // its next token would hide a real --force/-f option from the classifier.
   const LONG_WITH_OPERAND = new Set(['--orphan', '--conflict', '--pathspec-from-file']);
@@ -285,9 +285,10 @@ function checkoutRule(git) {
   // is a working-tree discard with no positional argument to notice it by.
   if (parsed.flags.some((flag) => isLongOption(flag, '--pathspec-from-file'))) return 'git-destructive';
   const forceish = parsed.flags.some((flag) =>
-    ['--force', '--ours', '--theirs', '--merge', '--conflict', '--patch', '--overwrite-ignore']
+    ['--force', '--ours', '--theirs', '--merge', '--conflict', '--patch', '--overwrite-ignore',
+      '--no-detach', '--no-orphan']
       .some((option) => isLongOption(flag, option))) ||
-    parsed.letters.some((letter) => 'fmp'.includes(letter));
+    parsed.letters.some((letter) => 'fmp23'.includes(letter));
   if (forceish) return 'git-destructive';
   if (parsed.positionals.some((value) => value === '.' || value === null)) return 'git-destructive';
   // Git expands pathspecs itself, so `git checkout '*.txt'` overwrites matching
