@@ -7,6 +7,7 @@ import { runModelReview } from './reviewer.mjs';
  * @typedef {{
  *   action: 'allow'|'deny'|'prompt'|'delegate',
  *   reason?: string,
+ *   reasonCode?: 'hard-deny'|'native-prompt-unavailable'|'reviewer-not-configured'|'reviewer-denied',
  *   reviewer?: {decision: 'allow'|'deny'|'uncertain', reason: string},
  * }} ResolvedDecision
  */
@@ -24,7 +25,7 @@ import { runModelReview } from './reviewer.mjs';
 export function resolveDecision(decision, options) {
   if (decision.kind === 'allow') return { action: 'allow' };
   const explanation = explainGuardDecision(decision);
-  if (decision.kind === 'deny') return { action: 'deny', reason: explanation };
+  if (decision.kind === 'deny') return { action: 'deny', reason: explanation, reasonCode: 'hard-deny' };
   if (options.supportsHookPrompt) return { action: 'prompt', reason: explanation };
   if (options.nativePromptCovered) return { action: 'delegate' };
 
@@ -37,7 +38,7 @@ export function resolveDecision(decision, options) {
       : options.mode === 'strict'
         ? 'strict 模式不会自动放行低风险变更；请使用宿主原生确认，或启用 reviewed 模式和第二模型 reviewer。'
         : 'reviewed 模式下没有可用的第二模型 reviewer。';
-    return { action: 'deny', reason: `${unavailable}${explanation}` };
+    return { action: 'deny', reason: `${unavailable}${explanation}`, reasonCode: options.mode === 'strict' ? 'native-prompt-unavailable' : 'reviewer-not-configured' };
   }
 
   const review = runModelReview(decision, options.reviewer);
@@ -46,6 +47,7 @@ export function resolveDecision(decision, options) {
   }
   return {
     action: 'deny',
+    reasonCode: 'reviewer-denied',
     reason: `第二模型安全复核未放行（${review.decision}）：${review.reason}。${explanation}`,
     reviewer: review,
   };

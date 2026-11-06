@@ -13,10 +13,23 @@ export const CODEX_NATIVE_PROMPT_PREFIXES = new Map([
     ['git', 'branch', '-C'],
     ['git', 'worktree', 'remove'],
     ['git', 'worktree', 'add', '-B'],
-    ['git', 'clean'],
+    ['git', 'clean', '-f'],
+    ['git', 'clean', '--force'],
+    ['git', 'clean', '-i'],
+    ['git', 'clean', '--interactive'],
     ['git', 'reset'],
     ['git', 'restore'],
-    ['git', 'checkout'],
+    ['git', 'checkout', '--'],
+    ['git', 'checkout', '-f'],
+    ['git', 'checkout', '--force'],
+    ['git', 'checkout', '--ours'],
+    ['git', 'checkout', '--theirs'],
+    ['git', 'checkout', '-m'],
+    ['git', 'checkout', '--merge'],
+    ['git', 'checkout', '-p'],
+    ['git', 'checkout', '--patch'],
+    ['git', 'checkout', '-B'],
+    ['git', 'checkout', '--pathspec-from-file'],
     ['git', 'rm'],
     ['git', 'config', '--global'],
     ['git', 'config', '--system'],
@@ -52,4 +65,15 @@ export function isCodexNativePromptCovered(ruleId, analysis) {
   const argv = analysis.nativePromptArgv;
   return prefixes !== undefined && argv !== null && prefixes.some((prefix) =>
     prefix.every((part, index) => argv[index] === part));
+}
+
+/** Diagnostic only: never changes the native delegation decision.
+ * @param {string} ruleId @param {{nativePromptArgv:string[]|null}} analysis
+ * @param {boolean} enabled
+ * @returns {'native-prompt-disabled'|'native-prompt-shape-unsupported'|'native-prompt-prefix-uncovered'|null}
+ */
+export function codexNativePromptFailure(ruleId, analysis, enabled) {
+  if (!enabled) return 'native-prompt-disabled';
+  if (analysis.nativePromptArgv === null) return 'native-prompt-shape-unsupported';
+  return isCodexNativePromptCovered(ruleId, analysis) ? null : 'native-prompt-prefix-uncovered';
 }

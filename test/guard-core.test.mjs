@@ -1,7 +1,10 @@
 // @ts-check
 
 import assert from 'node:assert/strict';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { resolveShfmtPath } from '../src/config.mjs';
@@ -327,3 +330,46 @@ test('checkout -d is the short form of --detach, not a deletion', () => {
 
 // --- path shape --------------------------------------------------------------
 
+
+test('clean dry-run is read-only only with explicit static option semantics', () => {
+  for (const command of ['git clean -n', 'git clean --dry-run', 'git clean -ndfx',
+    'git clean -fn -- scratch', 'git clean -n -e cache', 'git clean -necache',
+    'git -C /tmp/repo clean --dry-run -- scratch']) {
+    assert.equal(evaluate(command, 'dangerous-only').kind, 'allow', command);
+    assert.equal(evaluate(command, 'full').kind, 'allow', command);
+  }
+  for (const command of ['git clean', 'git clean -f', 'git clean -- -n',
+    'git clean -e -n', 'git clean -en', 'git clean --exclude=--dry-run',
+    'git clean -n -i', 'git clean --dry-r', 'git clean -n --unknown',
+    'git clean --dry-run "$TARGET"', 'git clean "$FLAGS"', 'git clean -n -e']) {
+    assert.equal(evaluate(command, 'dangerous-only').kind, 'confirm', command);
+  }
+});
+
+test('checkout explicit branch intent never loosens unresolved create targets', () => {
+  for (const command of ['git checkout -b "$BRANCH"', 'git checkout --orphan "$BRANCH"',
+    'git checkout -b feat "$START"', 'git checkout --detach "$START"']) {
+    assert.equal(evaluate(command, 'dangerous-only').kind, 'confirm', command);
+  }
+  for (const command of ['git checkout -b feat origin/main', 'git checkout --detach origin/main',
+    'git checkout --track origin/feat']) assert.equal(evaluate(command, 'dangerous-only').kind, 'allow', command);
+});
+
+
+test('accepted clean dry-run combinations preserve real untracked and ignored files', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'guard-clean-dry-run-'));
+  try {
+    const init = spawnSync('git', ['init', '-q', directory], { encoding: 'utf8' });
+    assert.equal(init.status, 0, init.stderr);
+    writeFileSync(join(directory, '.gitignore'), 'ignored.txt\n');
+    writeFileSync(join(directory, 'ignored.txt'), 'keep ignored');
+    writeFileSync(join(directory, 'untracked.txt'), 'keep untracked');
+    for (const args of [['clean', '-fn'], ['clean', '-ndfx'], ['clean', '--dry-run', '--force'],
+      ['clean', '-neignored.txt'], ['clean', '-n', '--', 'untracked.txt']]) {
+      const result = spawnSync('git', args, { cwd: directory, encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(existsSync(join(directory, 'ignored.txt')), args.join(' '));
+      assert.ok(existsSync(join(directory, 'untracked.txt')), args.join(' '));
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

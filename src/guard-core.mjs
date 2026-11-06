@@ -279,6 +279,7 @@ function parseCheckoutArgs(git) {
  * @returns {'git-destructive'|'git-low-risk'|null}
  */
 function checkoutRule(git) {
+  if (git.args.some((arg) => arg === null)) return 'git-destructive';
   const parsed = parseCheckoutArgs(git);
   if (parsed.flags.includes('--')) return 'git-destructive';
   // `--pathspec-from-file <file>` restores every path listed in the file, which
@@ -331,13 +332,46 @@ function checkoutRule(git) {
   return 'git-destructive';
 }
 
+/** Only explicit, fully static dry-run argv is read-only. Do not infer values
+ * from shell assignments or mistake an exclude pattern/path for an option.
+ * @param {AnalyzedCommand} command @param {Array<string|null>} args
+ */
+function cleanIsDryRun(command, args) {
+  if (command.argv.some((arg) => arg === null)) return false;
+  let dryRun = false;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--') break;
+    if (typeof arg !== 'string') return false;
+    if (arg === '--dry-run') { dryRun = true; continue; }
+    if (['--force', '--quiet'].includes(arg)) continue;
+    if (arg === '--exclude') { if (typeof args[++index] !== 'string') return false; continue; }
+    if (arg.startsWith('--exclude=')) continue;
+    if (arg.startsWith('--')) return false;
+    if (arg.startsWith('-') && arg !== '-') {
+      const letters = arg.slice(1);
+      for (let cursor = 0; cursor < letters.length; cursor++) {
+        const flag = letters[cursor];
+        if (flag === 'e') {
+          if (cursor + 1 === letters.length && typeof args[++index] !== 'string') return false;
+          break;
+        }
+        if (!'ndfqxX'.includes(flag)) return false;
+        if (flag === 'n') dryRun = true;
+      }
+    }
+  }
+  return dryRun;
+}
+
 /** @param {AnalyzedCommand} command @returns {'git-destructive'|'git-low-risk'|null} */
 function destructiveGitRule(command) {
   const git = parseGitCommand(command);
   if (!git) return null;
   const { subcommand, args } = git;
 
-  if (['clean', 'reset', 'restore', 'rm'].includes(String(subcommand))) return 'git-destructive';
+  if (subcommand === 'clean') return cleanIsDryRun(command, args) ? null : 'git-destructive';
+  if (['reset', 'restore', 'rm'].includes(String(subcommand))) return 'git-destructive';
   if (subcommand === 'checkout') return checkoutRule(git);
   // `git worktree remove` stays destructive whatever the path looks like. Git
   // follows a symlinked path to the real worktree, and it deletes gitignored

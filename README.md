@@ -250,3 +250,50 @@ npm pack --dry-run
 
 The package currently supports macOS and Linux on x64 and arm64, with Node.js 24
 or newer.
+
+### Codex 0.4 native-rule migration
+
+Update the guard **before** replacing Codex native rules, and generate the matching
+prompt entries with `agent-shell-guard print-native-rules codex`. Do not remove the
+old broad rules while an older guard is still deployed. Verify the stable launcher
+points at the installed 0.4.0 package; installing into a different Node prefix is
+not sufficient. This repository does not publish or replace a live installation
+as part of tests.
+
+The `git clean` and `git checkout` catch-all prompt entries are replaced by exact
+first-argument prefixes. All other native entries are unchanged:
+
+- `git clean`: `-f`, `--force`, `-i`, `--interactive`.
+- `git checkout`: `--`, `-f`, `--force`, `--ours`, `--theirs`, `-m`, `--merge`,
+  `-p`, `--patch`, `-B`, `--pathspec-from-file`.
+
+Under the default `dangerous-only` profile, explicit static `git clean -n` /
+`--dry-run` is read-only, including `-fn` / `-ndfx`. Exclude-pattern operands and
+paths after `--` cannot supply the dry-run flag. Dynamic arguments, interactive
+mode, abbreviations and unrecognized options do not qualify. The guard still
+examines other commands in compound scripts. Put `--dry-run` first to avoid a
+remaining `git clean --force` native prompt: the host chooses the strictest
+matching rule even when a later option makes a command read-only.
+
+Checkout keeps its parameter-based classification: explicit static `-b`,
+`--detach`, `--track` and `--no-track` can identify branch intent. A bare operand
+is still ambiguous with a path; force/pathspec options and dynamic operands stay
+protected. `-B` retains its native prompt, including cases where the core considers
+a literal non-trunk target low-risk. Existing accepted branch-switch behavior for
+ignored files is unchanged.
+
+Some dangerous forms that previously matched a catch-all prompt now **deny** in
+strict mode, for example `git clean -df`, `git checkout tracked.txt`, abbreviated
+options or flags placed after a safe first argument. This is deliberate: no
+uncovered destructive operation silently delegates. Use standard independently
+reviewable commands where authorized; for path restoration prefer the existing
+`git restore` prompt path. Do not rewrite hard denials to evade policy.
+
+Codex delegation failures now include a `[guard-diagnostic]` JSON marker with
+`reasonCode`, `ruleId` and `decisionSource`, without adding unsupported fields to
+the host hook schema. Codes distinguish disabled delegation, unsupported shell
+shape, and uncovered native prefixes. For authorized Git operations the message
+explains that `require_escalated` does not bypass hooks: use the tool's `workdir`,
+one static command, and separate subsequent status/read commands. Hard denials do
+not receive this recovery advice. `resolveDecision()` also exposes a typed
+`reasonCode` for consumers.
