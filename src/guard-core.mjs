@@ -213,9 +213,6 @@ function gitPositionals(git, valueFlags = new Set()) {
 }
 
 const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
-// A literal branch name, with none of git's revision shorthands (`@{-1}`, `-`,
-// `HEAD^`, `x~2`, `a...b`) that resolve to some *other* branch at run time.
-const PLAIN_BRANCH = /^(?!-)[A-Za-z0-9._\/+-]+$/;
 
 /**
  * Split checkout's argv the way git does. Short options cluster (`-qB`) and may
@@ -225,8 +222,10 @@ const PLAIN_BRANCH = /^(?!-)[A-Za-z0-9._\/+-]+$/;
  * @param {{args: Array<string|null>}} git
  */
 function parseCheckoutArgs(git) {
-  const SHORT_WITH_OPERAND = 'bBcC';
-  const LONG_WITH_OPERAND = new Set(['--orphan', '--conflict', '--track', '--start-point', '--pathspec-from-file']);
+  const SHORT_WITH_OPERAND = 'bB';
+  // --track[=(direct|inherit)] takes only an attached optional value. Consuming
+  // its next token would hide a real --force/-f option from the classifier.
+  const LONG_WITH_OPERAND = new Set(['--conflict', '--pathspec-from-file']);
   /** @type {string[]} */ const flags = [];
   /** @type {string[]} */ const letters = [];
   /** @type {Array<string|null>} */ const positionals = [];
@@ -279,15 +278,17 @@ function parseCheckoutArgs(git) {
  * @returns {'git-destructive'|'git-low-risk'|null}
  */
 function checkoutRule(git) {
+  if (git.args.some((arg) => arg === null)) return 'git-destructive';
   const parsed = parseCheckoutArgs(git);
   if (parsed.flags.includes('--')) return 'git-destructive';
   // `--pathspec-from-file <file>` restores every path listed in the file, which
   // is a working-tree discard with no positional argument to notice it by.
   if (parsed.flags.some((flag) => isLongOption(flag, '--pathspec-from-file'))) return 'git-destructive';
   const forceish = parsed.flags.some((flag) =>
-    ['--force', '--ours', '--theirs', '--merge', '--patch', '--overwrite-ignore']
+    ['--force', '--ours', '--theirs', '--merge', '--conflict', '--patch', '--overwrite-ignore',
+      '--no-detach', '--no-orphan']
       .some((option) => isLongOption(flag, option))) ||
-    parsed.letters.some((letter) => 'fmp'.includes(letter));
+    parsed.letters.some((letter) => 'fmp23'.includes(letter));
   if (forceish) return 'git-destructive';
   if (parsed.positionals.some((value) => value === '.' || value === null)) return 'git-destructive';
   // Git expands pathspecs itself, so `git checkout '*.txt'` overwrites matching
@@ -298,14 +299,10 @@ function checkoutRule(git) {
     return 'git-destructive';
   }
   if (parsed.createTarget !== undefined) {
-    // `-B` resets an existing branch, so the trunk check has to see the branch it
-    // will actually land on. Git's revision shorthands hide that: `-B '@{-1}'`
-    // resets whatever branch was checked out before, which may well be main
-    // (verified on git 2.43). Only a plain branch name is judged by name.
-    const target = parsed.createTarget;
-    if (parsed.forceCreate && (typeof target !== 'string' || !PLAIN_BRANCH.test(target) || TRUNK_REF.test(target))) {
-      return 'git-destructive';
-    }
+    // Every -B can discard an existing branch tip, including literal non-trunk
+    // names. Narrow native prefixes cannot cover attached/bundled forms, so all
+    // force-creation remains destructive and uncovered variants fail closed.
+    if (parsed.forceCreate) return 'git-destructive';
     return 'git-low-risk';
   }
   if (parsed.positionals.length === 0) return 'git-low-risk';
@@ -331,13 +328,46 @@ function checkoutRule(git) {
   return 'git-destructive';
 }
 
+/** Only explicit, fully static dry-run argv is read-only. Do not infer values
+ * from shell assignments or mistake an exclude pattern/path for an option.
+ * @param {AnalyzedCommand} command @param {Array<string|null>} args
+ */
+function cleanIsDryRun(command, args) {
+  if (command.argv.some((arg) => arg === null)) return false;
+  let dryRun = false;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--') break;
+    if (typeof arg !== 'string') return false;
+    if (arg === '--dry-run') { dryRun = true; continue; }
+    if (['--force', '--quiet'].includes(arg)) continue;
+    if (arg === '--exclude') { if (typeof args[++index] !== 'string') return false; continue; }
+    if (arg.startsWith('--exclude=')) continue;
+    if (arg.startsWith('--')) return false;
+    if (arg.startsWith('-') && arg !== '-') {
+      const letters = arg.slice(1);
+      for (let cursor = 0; cursor < letters.length; cursor++) {
+        const flag = letters[cursor];
+        if (flag === 'e') {
+          if (cursor + 1 === letters.length && typeof args[++index] !== 'string') return false;
+          break;
+        }
+        if (!'ndfqxX'.includes(flag)) return false;
+        if (flag === 'n') dryRun = true;
+      }
+    }
+  }
+  return dryRun;
+}
+
 /** @param {AnalyzedCommand} command @returns {'git-destructive'|'git-low-risk'|null} */
 function destructiveGitRule(command) {
   const git = parseGitCommand(command);
   if (!git) return null;
   const { subcommand, args } = git;
 
-  if (['clean', 'reset', 'restore', 'rm'].includes(String(subcommand))) return 'git-destructive';
+  if (subcommand === 'clean') return cleanIsDryRun(command, args) ? null : 'git-destructive';
+  if (['reset', 'restore', 'rm'].includes(String(subcommand))) return 'git-destructive';
   if (subcommand === 'checkout') return checkoutRule(git);
   // `git worktree remove` stays destructive whatever the path looks like. Git
   // follows a symlinked path to the real worktree, and it deletes gitignored

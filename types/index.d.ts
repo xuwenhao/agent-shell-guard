@@ -136,6 +136,7 @@ export function resolveDecision(
 ): {
   action: 'allow' | 'deny' | 'prompt' | 'delegate';
   reason?: string;
+  reasonCode?: 'hard-deny' | 'native-prompt-unavailable' | 'reviewer-not-configured' | 'reviewer-denied';
   reviewer?: { decision: 'allow' | 'deny' | 'uncertain'; reason: string };
 };
 export function adaptClaude(event: Record<string, unknown>, config: GuardConfig): HookOutput | null;

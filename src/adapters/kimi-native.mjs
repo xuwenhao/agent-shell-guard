@@ -6,6 +6,13 @@ import { isNativePromptCovered } from './common.mjs';
 /** @type {Map<string, string[][]>} */
 export const KIMI_NATIVE_PROMPT_PREFIXES = new Map([
   ...CODEX_NATIVE_PROMPT_PREFIXES,
+  // Codex 0.4 narrows these prompts only in its own rule format. Kimi (and
+  // Grok, which copies this map) keeps its installed broad confirmation rules.
+  ['git-destructive', [
+    ...(CODEX_NATIVE_PROMPT_PREFIXES.get('git-destructive') ?? [])
+      .filter((prefix) => prefix[1] !== 'clean' && prefix[1] !== 'checkout'),
+    ['git', 'clean'], ['git', 'checkout'],
+  ]],
   ['destructive-sql', [['psql'], ['mysql'], ['mysqlsh'], ['sqlite3']]],
   ['chmod-777', [['chmod']]],
   ['gh-api-delete', [['gh', 'api']]],

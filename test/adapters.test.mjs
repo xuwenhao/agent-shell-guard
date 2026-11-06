@@ -94,3 +94,60 @@ test('reviewer subprocesses cannot call shell tools recursively', () => {
     else process.env.AGENT_SHELL_GUARD_REVIEW_DEPTH = previous;
   }
 });
+
+test('Codex native coverage never silently delegates removed broad Git prefixes', () => {
+  const config = { ...BASE_CONFIG, profile: 'dangerous-only' };
+  for (const command of ['git clean', 'git clean -df', 'git checkout tracked.txt',
+    'git checkout --forc main', 'git checkout -b feat --force',
+    'git clean --dry-run "$TARGET"', 'git clean -n --no-dry-run',
+    'git checkout --detach HEAD --theirs', 'git checkout -b feat -- a.ts',
+    'git checkout -b "$BRANCH"', 'git -C "$REPO" clean -n',
+    'git checkout -Bfeat', 'git checkout -qB feat', 'git checkout -b feat -B other',
+    'git checkout -b feat --conflict=merge', 'git checkout --detach HEAD --conflict=diff3',
+    'git checkout --track --force -b new main', 'git checkout --track -f -b new main',
+    'git checkout --detach --no-detach tracked.txt', 'git checkout -d --no-det tracked.txt',
+    'git checkout --orphan new --no-orphan tracked.txt', 'git checkout -2 tracked.txt']) {
+    assert.equal(permission(adaptCodex(event(command), config)), 'deny', command);
+  }
+  for (const command of ['git clean -n', 'git clean --dry-run', 'git checkout -b feat',
+    'git checkout --detach origin/main', 'git clean -f', 'git checkout -- tracked.txt',
+    'git checkout --force main', 'git checkout -B feat']) {
+    assert.equal(permission(adaptCodex(event(command), config)), 'pass', command);
+  }
+});
+
+test('Codex blocked delegation exposes stable diagnostic codes and bounded recovery', () => {
+  const config = { ...BASE_CONFIG, profile: 'dangerous-only' };
+  for (const [command, code] of [
+    ['git restore a.ts && git status', 'native-prompt-shape-unsupported'],
+    ['git -C /tmp/repo restore a.ts', 'native-prompt-prefix-uncovered'],
+    ['git clean -df', 'native-prompt-prefix-uncovered'],
+  ]) {
+    const output = adaptCodex(event(command), config);
+    const reason = output?.hookSpecificOutput.permissionDecisionReason ?? '';
+    assert.equal(permission(output), 'deny');
+    const marker = reason.split('\n').find(line => line.startsWith('[guard-diagnostic] '));
+    assert.ok(marker);
+    assert.deepEqual(JSON.parse(marker.slice('[guard-diagnostic] '.length)), {
+      reasonCode: code, ruleId: 'git-destructive', decisionSource: 'hook',
+    });
+    assert.match(reason, /workdir/);
+    assert.match(reason, /require_escalated 不会解除/);
+  }
+  const uncovered = adaptCodex(event('git checkout --conflict=merge -- a.ts'), config);
+  assert.match(uncovered?.hookSpecificOutput.permissionDecisionReason ?? '', /仅添加 workdir 或重试升级不能解决/);
+  const disabled = adaptCodex(event('git restore a.ts'), { ...config, nativePrompt: { ...config.nativePrompt, codex: false } });
+  assert.match(disabled?.hookSpecificOutput.permissionDecisionReason ?? '', /native-prompt-disabled/);
+  const hard = adaptCodex(event('git push origin main --force'), config);
+  assert.equal(permission(hard), 'deny');
+  assert.doesNotMatch(hard?.hookSpecificOutput.permissionDecisionReason ?? '', /恢复：|guard-diagnostic/);
+});
+
+
+test('Codex-only prefix migration preserves Kimi and Grok broad native confirmations', () => {
+  for (const command of ['git checkout tracked.txt', 'git clean -df', 'git checkout -Bfeat']) {
+    assert.equal(permission(adaptCodex(event(command), BASE_CONFIG)), 'deny', command);
+    assert.equal(permission(adaptKimi(event(command), BASE_CONFIG)), 'pass', command);
+    assert.equal(grokPermission(adaptGrok(grokEvent(command), BASE_CONFIG)), 'pass', command);
+  }
+});
