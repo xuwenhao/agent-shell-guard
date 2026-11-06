@@ -291,6 +291,11 @@ uncovered destructive operation silently delegates. Use standard independently
 reviewable commands where authorized; for path restoration prefer the existing
 `git restore` prompt path. Do not rewrite hard denials to evade policy.
 
+Checkout parsing treats `--track[=(direct|inherit)]` as an optional attached value;
+it never consumes a following `--force` or `-f`. Real temporary-repository tests
+cover this destructive combination and prove ref-intent flags reject tracked-file
+restoration rather than discarding dirty content.
+
 Codex delegation failures now include a `[guard-diagnostic]` JSON marker with
 `reasonCode`, `ruleId` and `decisionSource`, without adding unsupported fields to
 the host hook schema. Codes distinguish disabled delegation, unsupported shell

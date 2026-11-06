@@ -223,7 +223,9 @@ const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
  */
 function parseCheckoutArgs(git) {
   const SHORT_WITH_OPERAND = 'bBcC';
-  const LONG_WITH_OPERAND = new Set(['--orphan', '--conflict', '--track', '--start-point', '--pathspec-from-file']);
+  // --track[=(direct|inherit)] takes only an attached optional value. Consuming
+  // its next token would hide a real --force/-f option from the classifier.
+  const LONG_WITH_OPERAND = new Set(['--orphan', '--conflict', '--pathspec-from-file']);
   /** @type {string[]} */ const flags = [];
   /** @type {string[]} */ const letters = [];
   /** @type {Array<string|null>} */ const positionals = [];

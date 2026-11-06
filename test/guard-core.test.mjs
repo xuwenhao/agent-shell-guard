@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { homedir, tmpdir } from 'node:os';
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
@@ -371,4 +371,33 @@ test('accepted clean dry-run combinations preserve real untracked and ignored fi
       assert.ok(existsSync(join(directory, 'untracked.txt')), args.join(' '));
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+
+test('checkout optional tracking value cannot swallow force; explicit ref intent rejects file restoration', () => {
+  const cases = [
+    { args: ['--no-track', 'tracked.txt'], destructive: false },
+    { args: ['--track', 'tracked.txt'], destructive: false },
+    { args: ['--detach', 'tracked.txt'], destructive: false },
+    { args: ['--track', '--force', '-b', 'new', 'main'], destructive: true },
+    { args: ['--track', '-f', '-b', 'new', 'main'], destructive: true },
+  ];
+  for (const { args, destructive } of cases) {
+    const directory = mkdtempSync(join(tmpdir(), 'guard-checkout-intent-'));
+    try {
+      assert.equal(spawnSync('git', ['init', '-q', '-b', 'main', directory]).status, 0);
+      const file = join(directory, 'tracked.txt');
+      writeFileSync(file, 'original\n');
+      assert.equal(spawnSync('git', ['add', 'tracked.txt'], { cwd: directory }).status, 0);
+      assert.equal(spawnSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+        'commit', '-qm', 'fixture'], { cwd: directory }).status, 0);
+      writeFileSync(file, 'dirty\n');
+      const command = `git checkout ${args.join(' ')}`;
+      assert.equal(evaluate(command, 'dangerous-only').kind, destructive ? 'confirm' : 'allow', command);
+      const actual = spawnSync('git', ['checkout', ...args], { cwd: directory, encoding: 'utf8' });
+      if (destructive) assert.equal(actual.status, 0, actual.stderr);
+      else assert.notEqual(actual.status, 0, command);
+      assert.equal(readFileSync(file, 'utf8'), destructive ? 'original\n' : 'dirty\n', command);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  }
 });
