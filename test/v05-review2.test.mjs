@@ -230,6 +230,31 @@ test('Codex P1-a/P1-b: dynamic git reader options and less log files are writes'
   ], { mode: 'bypassPermissions', cwd: BARE });
 });
 
+test('Claude bot (55c4fac): sed w/W commands after a numeric, $ or range address are writes', () => {
+  expectAll([
+    ["sed '1w /tmp/out' input", 'deny:bypass-no-project-sandbox'],
+    ["sed '$w /tmp/last' input", 'deny:bypass-no-project-sandbox'],
+    ["sed -n '1,5w /tmp/out' input", 'deny:bypass-no-project-sandbox'],
+    ["sed -n '1W /tmp/out' input", 'deny:bypass-no-project-sandbox'],
+    ["sed '/re/w /tmp/out' input", 'deny:bypass-no-project-sandbox'],
+    ["sed 's/a/b/w /tmp/out' input", 'deny:bypass-no-project-sandbox'],
+    ["sed 's/a/b/gw /tmp/out' input", 'deny:bypass-no-project-sandbox'],
+    ["sed -n 'p; w /tmp/out' input", 'deny:bypass-no-project-sandbox'],
+    ["sed -n '1,5p' input", 'allow'],
+    ["sed -n '/warn/,/whatever/p' input", 'allow'],
+    ["sed 's/warn/WARN/g' input", 'allow'],
+    ["sed -n '/warn/p' input", 'allow'],
+  ], { mode: 'bypassPermissions', cwd: BARE });
+});
+
+test('Claude bot (55c4fac): unknown project root makes unsandboxed-outside-project unknown, not matched', () => {
+  const result = evaluate(`rm -rf ${SCRATCH}/x`, { mode: 'bypassPermissions', cwd: BARE, unsandboxed: true });
+  if (result?.ruleId === 'unsandboxed-outside-project') {
+    assert.equal(result.evaluation, 'unknown');
+    assert.doesNotMatch(result.why, /目标在项目外/);
+  }
+});
+
 // --- P3/P4: push refspecs and option clusters -------------------------------------
 
 test('P3: matching and wildcard refspecs force-push the trunk', () => {

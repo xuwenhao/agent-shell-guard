@@ -178,10 +178,15 @@ function readOnlyGh(command) {
 const SED_ADDRESS = String.raw`(?:\d+|\$|\/(?:[^/\\]|\\.)*\/)`;
 const SED_EXEC_COMMAND = new RegExp(String.raw`(?:^|[;\n{])\s*(?:${SED_ADDRESS}(?:\s*,\s*${SED_ADDRESS})?)?\s*!?\s*e(?:\s|;|}|$)`);
 const SED_EXEC_FLAG = new RegExp(String.raw`(?:^|[;\n{}])\s*(?:${SED_ADDRESS}(?:\s*,\s*${SED_ADDRESS})?)?\s*!?\s*s(.)(?:(?!\1)[^\\]|\\.)*\1(?:(?!\1)[^\\]|\\.)*\1[a-zA-Z0-9]*e`);
+// `w file` / `W file` 命令（前面可带数字、`$`、/re/ 地址或地址范围，如 `1w out`、`$w out`、`1,5W out`）。
+const SED_WRITE_COMMAND = new RegExp(String.raw`(?:^|[;\n{}])\s*(?:${SED_ADDRESS}(?:\s*,\s*${SED_ADDRESS})?)?\s*!?\s*[wW]\s*\S`);
+// `s///w file` 的 w 标志（和 SED_EXEC_FLAG 同样按分隔符解析，不会把 `/warn/p` 这类以 w 开头的正则地址当成写）。
+const SED_WRITE_FLAG = new RegExp(String.raw`(?:^|[;\n{}])\s*(?:${SED_ADDRESS}(?:\s*,\s*${SED_ADDRESS})?)?\s*!?\s*s(.)(?:(?!\1)[^\\]|\\.)*\1(?:(?!\1)[^\\]|\\.)*\1[a-zA-Z0-9]*w`);
 
 /** @param {string} arg */
 const sedWrites = (arg) => isLongOption(arg, '--in-place') || /^-[^-]*[iI]/.test(arg) || isLongOption(arg, '--file') ||
-  /^-[^-]*f/.test(arg) || /(?:^|[;{}\s/])w\s*\S/.test(arg) || SED_EXEC_COMMAND.test(arg) || SED_EXEC_FLAG.test(arg);
+  /^-[^-]*f/.test(arg) || SED_WRITE_COMMAND.test(arg) || SED_WRITE_FLAG.test(arg) ||
+  SED_EXEC_COMMAND.test(arg) || SED_EXEC_FLAG.test(arg);
 
 const CURL_WRITE_LETTERS = 'oOTdFKcD';
 const CURL_VALUE_LETTERS = 'HuAembxwrECYyztUQhPkKcDoTdF';

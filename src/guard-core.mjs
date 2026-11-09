@@ -1169,15 +1169,19 @@ function unsandboxedOutsideProject(graph, ctx) {
       else {
         const resolved = resolveTarget(target.value, target.base);
         if (resolved.kind === 'relative') evaluation = 'unknown';
+        // 项目根未知时说不清目标在不在项目内：按 unknown 要求确认，文案不说"在项目外"。
+        else if (root === null) evaluation = 'unknown';
         else if (!inside(resolved.path)) evaluation = 'matched';
       }
       if (!evaluation) continue;
       return {
         ruleId: 'unsandboxed-outside-project', evaluation,
-        detail: `沙盒外执行的删除/移动目标在项目根${root ? `（${root}）` : ''}以外：${trunc(displayCommand(command))}`,
+        detail: root
+          ? `沙盒外执行的删除/移动目标在项目根（${root}）以外或无法确定：${trunc(displayCommand(command))}`
+          : `沙盒外执行的删除/移动，且无法确定项目根：${trunc(displayCommand(command))}`,
         why: evaluation === 'matched'
           ? '这条命令不受项目沙盒的写权限约束，bypass 下也不会有其他确认；目标在项目外，需要人确认。'
-          : '这条命令在沙盒外执行，删除/移动目标无法静态确定（变量、通配符、git -C 或 cwd 不可信），需要人确认。',
+          : '这条命令在沙盒外执行，删除/移动目标无法静态确定（变量、通配符、git -C、cwd 不可信或项目根未知），需要人确认。',
       };
     }
     // Discarding git operations act on the repository they run in; outside
