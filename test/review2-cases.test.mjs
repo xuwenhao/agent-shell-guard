@@ -8,7 +8,7 @@
 // deliberate behaviour change, and review the diff.
 
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -53,6 +53,12 @@ mkdirSync(join(FX, 'thin', 'docs'), { recursive: true });
 put(join(FX, 'base', '.git', 'worktrees', 'wt-main', 'HEAD'), 'ref: refs/heads/main\n');
 put(join(FX, 'base', '.git', 'worktrees', 'wt-main', 'commondir'), '../..\n');
 put(join(FX, 'wt-main', '.git'), `gitdir: ${join(FX, 'base', '.git', 'worktrees', 'wt-main')}\n`);
+
+// CI runners have no zsh; `zsh -c '…'` cases need a validator that accepts
+// the script so the nested commands are judged at all.
+const ACCEPTING_ZSH = join(FX, 'zsh');
+writeFileSync(ACCEPTING_ZSH, '#!/bin/sh\nexit 0\n');
+chmodSync(ACCEPTING_ZSH, 0o755);
 
 const C = `${HOME}/Codebase`;
 const DEVINFRA = `${C}/personal/devinfra`;
@@ -100,6 +106,7 @@ function run(c) {
     profile: c.profile ?? 'dangerous-only',
     shfmtPath: SHFMT,
     envShell: '/bin/bash',
+    zshPath: ACCEPTING_ZSH,
     protectedRoots: PROTECTED_ROOTS,
     protectedPaths: PROTECTED_PATHS,
     inspectDirectory: inspect,
