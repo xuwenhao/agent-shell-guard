@@ -33,7 +33,27 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   wrappers: string[],
  *   hasRedirection: boolean,
  *   pipelineGroup: number|null,
+ *   rootOffset?: number,
+ *   graphEnv?: string[],
  * }} AnalyzedCommand
+ */
+/**
+ * A shell variable assignment seen anywhere in the graph: a prefix
+ * assignment (`X=1 cmd`), a plain one (`X=1`), an `env X=1 cmd` operand or a
+ * declaration (`export X=1`, `declare -x X`). `value` is null when dynamic or
+ * absent (`export X`).
+ * @typedef {{name: string, value: string|null, exported: boolean}} AnalyzedAssignment
+ */
+/**
+ * The `cd`s of the script's leading `&&` chain. `operands` holds one entry
+ * per `cd` (null = dynamic, '' = home). `exact` lists the byte ranges of the
+ * commands that only run after the first `depth` of those `cd`s succeeded;
+ * `complete` says that nothing else in the script runs outside those ranges.
+ * @typedef {{
+ *   operands: Array<string|null>,
+ *   exact: Array<{range: [number, number], depth: number}>,
+ *   complete: boolean,
+ * }} CdPrefix
  */
 /**
  * @typedef {{
@@ -47,7 +67,8 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   hasCompound: boolean,
  *   nativePromptArgv: string[]|null,
  *   redirections: AnalyzedRedirection[],
- *   cdPrefix?: string[]|null,
+ *   cdPrefix?: CdPrefix|null,
+ *   assignments?: AnalyzedAssignment[],
  * }} ShellGraph
  */
 /** @typedef {{kind: 'script', text: string}|{kind: 'argv', argv: string[]}} ShellInput */
@@ -106,6 +127,62 @@ function decodeLiteral(value, doubleQuoted) {
   return result;
 }
 
+const ANSI_C_SIMPLE = /** @type {Record<string, string>} */ ({
+  a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v',
+  '\\': '\\', "'": "'", '"': '"', '?': '?',
+});
+
+/**
+ * Decode the body of a `$'…'` word the way bash does. Escapes that produce a
+ * raw byte above 0x7f, a NUL (which truncates the word) or anything the
+ * decoder does not know return null, so the word stays dynamic.
+ * @param {string} value
+ * @returns {string|null}
+ */
+export function decodeAnsiC(value) {
+  let result = '';
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (char !== '\\') { result += char; continue; }
+    if (index + 1 >= value.length) return null;
+    const next = value[++index];
+    if (next in ANSI_C_SIMPLE) { result += ANSI_C_SIMPLE[next]; continue; }
+    /** @param {RegExp} digit @param {number} max */
+    const take = (digit, max) => {
+      let digits = '';
+      while (digits.length < max && digit.test(value[index + 1] ?? '')) digits += value[++index];
+      return digits;
+    };
+    let code;
+    if (/[0-7]/.test(next)) code = parseInt(next + take(/[0-7]/, 2), 8);
+    else if (next === 'x') { const hex = take(/[0-9a-fA-F]/, 2); if (!hex) return null; code = parseInt(hex, 16); }
+    else if (next === 'u' || next === 'U') {
+      const hex = take(/[0-9a-fA-F]/, next === 'u' ? 4 : 8);
+      if (!hex) return null;
+      const point = parseInt(hex, 16);
+      if (point === 0 || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) return null;
+      result += String.fromCodePoint(point);
+      continue;
+    } else if (next === 'c') {
+      if (index + 1 >= value.length) return null;
+      code = value[++index].charCodeAt(0) & 0x1f;
+    } else return null;
+    if (code === 0 || code > 0x7f) return null;
+    result += String.fromCharCode(code);
+  }
+  return result;
+}
+
+/**
+ * shfmt omits `Value` for an empty `''`.
+ * @param {Record<string, unknown>} part
+ */
+const singleQuotedValue = (part) => {
+  if (part.Value !== undefined && typeof part.Value !== 'string') return null;
+  const value = typeof part.Value === 'string' ? part.Value : '';
+  return part.Dollar === true ? decodeAnsiC(value) : value;
+};
+
 /** @param {string} value */
 function hasUnescapedExpansion(value) {
   if (value.startsWith('~') && value !== '~' && !value.startsWith('~/')) return true;
@@ -133,9 +210,7 @@ function staticPart(part, doubleQuoted = false) {
     if (typeof part.Value !== 'string' || (!doubleQuoted && hasUnescapedExpansion(part.Value))) return null;
     return decodeLiteral(part.Value, doubleQuoted);
   }
-  if (part.Type === 'SglQuoted') {
-    return typeof part.Value === 'string' ? part.Value : null;
-  }
+  if (part.Type === 'SglQuoted') return singleQuotedValue(part);
   if (part.Type === 'DblQuoted') {
     const parts = Array.isArray(part.Parts) ? part.Parts : [];
     let result = '';
@@ -178,7 +253,7 @@ function markedWord(word) {
   for (const part of word.Parts) {
     if (!isObject(part)) return null;
     if (part.Type === 'Lit' && typeof part.Value === 'string') result += decodeLiteral(part.Value, false);
-    else if (part.Type === 'SglQuoted' && typeof part.Value === 'string') result += part.Value;
+    else if (part.Type === 'SglQuoted') result += singleQuotedValue(part) ?? DYNAMIC_MARKER;
     else if (part.Type === 'DblQuoted') {
       for (const child of Array.isArray(part.Parts) ? part.Parts : []) {
         result += isObject(child) && child.Type === 'Lit' && typeof child.Value === 'string'
@@ -211,7 +286,7 @@ function staticWord(word) {
 }
 
 /** @param {Array<string|null>} rawArgv */
-function unwrapCommand(rawArgv) {
+export function unwrapCommand(rawArgv) {
   let argv = rawArgv;
   /** @type {string[]} */
   const wrappers = [];
@@ -308,7 +383,7 @@ function unwrapCommand(rawArgv) {
 }
 
 /** @param {Array<string|null>} argv */
-function shellEvaluator(argv) {
+export function shellEvaluator(argv) {
   if (typeof argv[0] !== 'string') return null;
   const name = basename(argv[0]).toLowerCase();
   if (!['bash', 'sh', 'dash', 'zsh'].includes(name)) return null;
@@ -345,7 +420,7 @@ function failedGraph(reason, detail, dialect) {
   return /** @type {ShellGraph} */ ({
     status: 'unknown', dialect, commands: [], unknowns: [{ reason, detail }],
     hasPipeline: false, hasRedirection: false, hasSubstitution: false,
-    hasCompound: false, nativePromptArgv: null, redirections: [],
+    hasCompound: false, nativePromptArgv: null, redirections: [], assignments: [],
   });
 }
 
@@ -372,23 +447,23 @@ export function analyzeShellInput(input, options) {
     /** @type {ShellGraph} */
     const graph = {
       status: 'safe', dialect,
-      commands: [{ argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 }, wrappers, hasRedirection: false, pipelineGroup: null }],
+      commands: [{ argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 }, wrappers, hasRedirection: false, pipelineGroup: null, rootOffset: 0 }],
       unknowns: [], hasPipeline: false, hasRedirection: false, hasSubstitution: false,
       hasCompound: false, nativePromptArgv: wrappers.length ? null : rawArgv,
-      redirections: [],
+      redirections: [], assignments: envOperandAssignments(rawArgv, argv),
     };
     const evaluator = shellEvaluator(argv);
-    if (!evaluator) return graph;
+    if (!evaluator) return finishGraph(graph);
     graph.nativePromptArgv = null;
     if (evaluator.script === null) {
       graph.status = 'unknown';
       graph.unknowns.push({ reason: 'dynamic-evaluator', detail: `${String(argv[0])} -c script is dynamic or missing` });
-      return graph;
+      return finishGraph(graph);
     }
     if (maxRecursion <= 0) {
       graph.status = 'unknown';
       graph.unknowns.push({ reason: 'recursion-limit', detail: 'tokenized shell evaluator exceeds recursion limit' });
-      return graph;
+      return finishGraph(graph);
     }
     const nested = analyzeShellInput({ kind: 'script', text: evaluator.script }, {
       ...options,
@@ -403,7 +478,9 @@ export function analyzeShellInput(input, options) {
     graph.commands.push(...nested.commands.map((command) => ({
       ...command,
       source: command.source === 'top-level' ? /** @type {CommandSource} */ ('shell-c') : command.source,
+      rootOffset: 0,
     })));
+    graph.assignments?.push(...(nested.assignments ?? []));
     graph.unknowns.push(...nested.unknowns);
     graph.status = nested.status;
     graph.hasPipeline = nested.hasPipeline;
@@ -411,7 +488,7 @@ export function analyzeShellInput(input, options) {
     graph.hasSubstitution = nested.hasSubstitution;
     graph.hasCompound = nested.hasCompound;
     graph.redirections = nested.redirections;
-    return graph;
+    return finishGraph(graph);
   }
 
   if (Buffer.byteLength(input.text) > maxInputBytes) return failedGraph('input-too-large', `shell input exceeds ${maxInputBytes} bytes`, dialect);
@@ -427,7 +504,7 @@ export function analyzeShellInput(input, options) {
   const graph = {
     status: 'safe', dialect, commands: [], unknowns: [], hasPipeline: false,
     hasRedirection: false, hasSubstitution: false, hasCompound: false,
-    nativePromptArgv: null, redirections: [],
+    nativePromptArgv: null, redirections: [], assignments: [],
   };
   let commandCount = 0;
   let pipelineCount = 0;
@@ -443,8 +520,10 @@ export function analyzeShellInput(input, options) {
    * @param {ShellDialect} currentDialect
    * @param {number} depth
    * @param {CommandSource} source
+   * @param {number|null} [rootOffset] span start of the top-level command
+   *   that spawned this nested script (null at the top level)
    */
-  function parseScript(text, currentDialect, depth, source) {
+  function parseScript(text, currentDialect, depth, source, rootOffset = null) {
     if (Buffer.byteLength(text) > maxInputBytes) { unknown('input-too-large', `nested shell input exceeds ${maxInputBytes} bytes`); return; }
     if (depth > maxRecursion) { unknown('recursion-limit', `shell evaluator nesting exceeds ${maxRecursion}`); return; }
 
@@ -486,10 +565,14 @@ export function analyzeShellInput(input, options) {
       unknown('parser-output-invalid', 'shfmt did not return a File AST');
       return;
     }
+    // shfmt reports UTF-8 byte offsets; JS strings index UTF-16 code units.
+    const bytes = Buffer.from(text, 'utf8');
+    /** @param {number} start @param {number} end */
+    const sliceBytes = (start, end) => bytes.subarray(start, end).toString('utf8');
 
     if (depth === 0) {
       graph.nativePromptArgv = nativeArgvFromRoot(ast);
-      graph.cdPrefix = cdPrefixFromRoot(ast, text);
+      graph.cdPrefix = cdPrefixFromRoot(ast, sliceBytes);
     }
     if (ast.Stmts.length !== 1) graph.hasCompound = true;
 
@@ -517,6 +600,7 @@ export function analyzeShellInput(input, options) {
       if (type === 'CallExpr') {
         const words = Array.isArray(node.Args) ? node.Args : [];
         if (words.length === 0) {
+          recordAssignments(node.Assigns, false);
           walk(node.Assigns, nodeSource, pipelineGroup);
           if (Array.isArray(node.Redirs) && node.Redirs.length) {
             recordRedirections(node.Redirs);
@@ -526,14 +610,16 @@ export function analyzeShellInput(input, options) {
         }
         if (++commandCount > maxCommands) { unknown('command-limit', `command graph exceeds ${maxCommands} nodes`); return; }
         const rawArgv = words.map(staticWord);
-        const displayArgv = words.map((word) => isObject(word) ? text.slice(offsetOf(word, 'Pos'), offsetOf(word, 'End')) : '<?>');
+        const displayArgv = words.map((word) => isObject(word) ? sliceBytes(offsetOf(word, 'Pos'), offsetOf(word, 'End')) : '<?>');
         const { argv, wrappers } = unwrapCommand(rawArgv);
+        const span = { start: offsetOf(node, 'Pos'), end: offsetOf(node, 'End') };
         const command = {
           argv, rawArgv, displayArgv, dialect: currentDialect, source: nodeSource,
-          span: { start: offsetOf(node, 'Pos'), end: offsetOf(node, 'End') },
-          wrappers, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
-          pipelineGroup,
+          span, wrappers, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
+          pipelineGroup, rootOffset: rootOffset ?? span.start,
         };
+        recordAssignments(node.Assigns, false);
+        graph.assignments?.push(...envOperandAssignments(rawArgv, argv));
         graph.commands.push(command);
         if (argv[0] === null || argv.length === 0) unknown('dynamic-command', 'command name cannot be reconstructed statically');
 
@@ -546,18 +632,18 @@ export function analyzeShellInput(input, options) {
             // words, so hard boundaries inside it (rm -rf "$X/…") are seen.
             const marked = evaluator.scriptIndex >= 0 ? markedWord(words[offset + evaluator.scriptIndex]) : null;
             if (marked !== null && marked.replaceAll(DYNAMIC_MARKER, '').trim() !== '') {
-              parseScript(marked, evaluator.dialect, depth + 1, 'shell-c');
+              parseScript(marked, evaluator.dialect, depth + 1, 'shell-c', command.rootOffset);
             }
-          } else parseScript(evaluator.script, evaluator.dialect, depth + 1, 'shell-c');
+          } else parseScript(evaluator.script, evaluator.dialect, depth + 1, 'shell-c', command.rootOffset);
         } else if (argv[0] === 'eval') {
           const parts = argv.slice(1);
           if (parts.some((part) => part === null)) {
             unknown('dynamic-evaluator', 'eval input cannot be reconstructed statically');
             const marked = words.slice(offset + 1).map(markedWord);
             if (marked.every((part) => part !== null)) {
-              parseScript(/** @type {string[]} */ (marked).join(' '), currentDialect, depth + 1, 'eval');
+              parseScript(/** @type {string[]} */ (marked).join(' '), currentDialect, depth + 1, 'eval', command.rootOffset);
             }
-          } else parseScript(/** @type {string[]} */ (parts).join(' '), currentDialect, depth + 1, 'eval');
+          } else parseScript(/** @type {string[]} */ (parts).join(' '), currentDialect, depth + 1, 'eval', command.rootOffset);
         }
 
         walk(node.Assigns, nodeSource, pipelineGroup);
@@ -572,13 +658,21 @@ export function analyzeShellInput(input, options) {
       if (type === 'BinaryCmd') {
         graph.hasCompound = true;
         const opPos = isObject(node.OpPos) && typeof node.OpPos.Offset === 'number' ? node.OpPos.Offset : 0;
-        const operator = text.slice(opPos, opPos + 2);
+        const operator = sliceBytes(opPos, opPos + 2);
         const isPipeline = operator.startsWith('|') && !operator.startsWith('||');
         if (isPipeline) graph.hasPipeline = true;
         const group = isPipeline ? (pipelineGroup ?? ++pipelineCount) : pipelineGroup;
         walk(node.X, nodeSource, group);
         walk(node.Y, nodeSource, group);
         return;
+      }
+      if (type === 'DeclClause') {
+        const variant = isObject(node.Variant) && typeof node.Variant.Value === 'string' ? node.Variant.Value : '';
+        const args = Array.isArray(node.Args) ? node.Args : [];
+        // `declare -x`, `typeset -gx`: a naked option word carrying `x`.
+        const exportFlag = args.some((arg) => isObject(arg) && arg.Naked === true && !isObject(arg.Name) &&
+          /^-[A-Za-z]*x/.test(String(staticWord(arg.Value) ?? '')));
+        recordAssignments(args.filter((arg) => isObject(arg) && isObject(arg.Name)), variant === 'export' || exportFlag);
       }
       if (type === 'CmdSubst') {
         graph.hasSubstitution = true;
@@ -602,48 +696,170 @@ export function analyzeShellInput(input, options) {
     walk(ast.Stmts, source);
   }
 
+  /** @param {unknown} list @param {boolean} exported */
+  function recordAssignments(list, exported) {
+    if (!Array.isArray(list)) return;
+    for (const assign of list) {
+      if (!isObject(assign) || !isObject(assign.Name) || typeof assign.Name.Value !== 'string') continue;
+      const value = assign.Naked === true || !assign.Value ? null : staticWord(assign.Value);
+      graph.assignments?.push({ name: assign.Name.Value, value, exported });
+    }
+  }
+
   parseScript(input.text, dialect, 0, 'top-level');
-  return graph;
+  return finishGraph(graph);
 }
 
 /**
- * Literal `cd` operands that lead a script consisting of one `&&` chain
- * (`cd /tmp/x && cd sub && rm -rf data`). Everything after them runs in the
- * directory they reach, because `&&` stops the chain if a `cd` fails. An
- * operand of '' means a bare `cd` (home). Null for any other shape.
- * @param {Record<string, unknown>} ast @param {string} text
- * @returns {string[]|null}
+ * `env NAME=value cmd` assignments, which unwrapCommand strips with the
+ * wrapper.
+ * @param {Array<string|null>} rawArgv @param {Array<string|null>} argv
+ * @returns {AnalyzedAssignment[]}
  */
-function cdPrefixFromRoot(ast, text) {
-  if (!Array.isArray(ast.Stmts) || ast.Stmts.length !== 1) return null;
+function envOperandAssignments(rawArgv, argv) {
+  /** @type {AnalyzedAssignment[]} */
+  const result = [];
+  for (const word of rawArgv.slice(0, rawArgv.length - argv.length)) {
+    const match = typeof word === 'string' ? /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word) : null;
+    if (match) result.push({ name: match[1], value: match[2], exported: false });
+  }
+  return result;
+}
+
+/**
+ * Give every command the names assigned anywhere in its graph, so a rule
+ * looking at one command can see `GIT_DIR=… git …` or `export GIT_DIR=…; git …`.
+ * @param {ShellGraph} graph
+ */
+function finishGraph(graph) {
+  const names = [...new Set((graph.assignments ?? []).map((item) => item.name))];
+  for (const command of graph.commands) command.graphEnv = names;
+  return graph;
+}
+
+const CD_COMMANDS = new Set(['cd', 'chdir', 'pushd', 'popd']);
+const CWD_COMMANDS = new Set([...CD_COMMANDS, 'source', '.']);
+
+/**
+ * A statement that is a single simple command, as its static argv.
+ * @param {unknown} stmt
+ */
+function simpleArgv(stmt) {
+  if (!isObject(stmt) || stmt.Negated || stmt.Background || stmt.Coprocess) return null;
+  const call = stmt.Cmd;
+  if (!isObject(call) || call.Type !== 'CallExpr' || !Array.isArray(call.Args) || call.Args.length === 0) return null;
+  return { argv: call.Args.map(staticWord), assigns: Array.isArray(call.Assigns) && call.Assigns.length > 0 };
+}
+
+/**
+ * The directory operand of a cwd-changing statement: a path, '' for home,
+ * '-' for `cd -`, null when it cannot be known (`cd "$X"`, `popd`, `pushd +1`).
+ * Undefined when the statement does not change the directory.
+ * @param {unknown} stmt
+ * @returns {string|null|undefined}
+ */
+export function cdOperand(stmt) {
+  const simple = simpleArgv(stmt);
+  if (!simple || typeof simple.argv[0] !== 'string' || !CWD_COMMANDS.has(simple.argv[0])) return undefined;
+  const name = simple.argv[0];
+  if (!CD_COMMANDS.has(name) || name === 'popd' || simple.assigns) return null;
+  return cdArgvOperand(simple.argv);
+}
+
+/**
+ * @param {Array<string|null>} argv `cd`/`chdir`/`pushd` argv
+ * @returns {string|null} the operand, '' for home, '-' for `cd -`
+ *   (the previous directory), null when unknowable
+ */
+export function cdArgvOperand(argv) {
+  const rest = argv.slice(1);
+  while (typeof rest[0] === 'string' && /^-[LPeq@sn]+$/.test(rest[0])) rest.shift();
+  if (rest[0] === '--') rest.shift();
+  if (rest.length === 0) return argv[0] === 'pushd' ? null : '';
+  if (rest.length > 1 || typeof rest[0] !== 'string' || /^[+-]\d+$/.test(rest[0])) return null;
+  if (rest[0] === '-' && argv[0] === 'pushd') return null;
+  return rest[0];
+}
+
+/**
+ * The `cd`s of the script's leading `&&` chain and the commands that only run
+ * once the cds before them succeeded. Recognised shapes: an `&&` chain
+ * (`cd /x && make && cd y && rm -rf data`),
+ * the same inside `( … )` or `{ …; }`, as the condition of an `if` (its
+ * `then` branch), followed by `|| tail` or `; more` (the tail is outside the
+ * exact range), and with redirections on the `cd`.
+ * @param {Record<string, unknown>} ast
+ * @param {(start: number, end: number) => string} sliceBytes
+ * @returns {CdPrefix|null}
+ */
+function cdPrefixFromRoot(ast, sliceBytes) {
+  if (!Array.isArray(ast.Stmts) || ast.Stmts.length === 0) return null;
+  const prefix = chainPrefix(ast.Stmts[0], sliceBytes);
+  if (!prefix) return null;
+  return { ...prefix, complete: prefix.complete && ast.Stmts.length === 1 };
+}
+
+/** @param {unknown} stmt @returns {[number, number]} */
+const stmtRange = (stmt) => isObject(stmt) ? [offsetOf(stmt, 'Pos'), offsetOf(stmt, 'End')] : [0, 0];
+
+/**
+ * @param {unknown} stmt @param {(start: number, end: number) => string} sliceBytes
+ * @returns {CdPrefix|null}
+ */
+function chainPrefix(stmt, sliceBytes) {
+  if (!isObject(stmt) || stmt.Negated || stmt.Background || stmt.Coprocess) return null;
+  const cmd = stmt.Cmd;
+  if (!isObject(cmd)) return null;
+  if ((cmd.Type === 'Subshell' || cmd.Type === 'Block') && Array.isArray(cmd.Stmts) && cmd.Stmts.length) {
+    const inner = chainPrefix(cmd.Stmts[0], sliceBytes);
+    return inner && { ...inner, complete: inner.complete && cmd.Stmts.length === 1 };
+  }
+  if (cmd.Type === 'IfClause' && Array.isArray(cmd.Cond) && cmd.Cond.length === 1) {
+    const condition = chainPrefix(cmd.Cond[0], sliceBytes);
+    if (!condition) return null;
+    const then = Array.isArray(cmd.Then) ? cmd.Then : [];
+    const thenHasCd = then.some((item) => cdOperand(item) !== undefined);
+    const depth = condition.operands.length;
+    return {
+      operands: condition.operands,
+      exact: [...condition.exact, ...(thenHasCd ? [] : then.map((item) => ({ range: stmtRange(item), depth })))],
+      complete: condition.complete && !thenHasCd && !isObject(cmd.Else),
+    };
+  }
   /** @type {unknown[]} */
   const elements = [];
-  /** @param {unknown} stmt */
-  const flatten = (stmt) => {
-    if (!isObject(stmt) || stmt.Negated || stmt.Background || stmt.Coprocess) { elements.push(null); return; }
-    const cmd = stmt.Cmd;
-    if (isObject(cmd) && cmd.Type === 'BinaryCmd') {
-      const opPos = isObject(cmd.OpPos) && typeof cmd.OpPos.Offset === 'number' ? cmd.OpPos.Offset : -1;
-      if (text.slice(opPos, opPos + 2) === '&&') { flatten(cmd.X); flatten(cmd.Y); return; }
+  /** @type {number|null} */
+  let cut = null;
+  /** @param {unknown} item */
+  const flatten = (item) => {
+    const inner = isObject(item) ? item.Cmd : null;
+    if (isObject(item) && !item.Negated && !item.Background && isObject(inner) && inner.Type === 'BinaryCmd') {
+      const opPos = isObject(inner.OpPos) && typeof inner.OpPos.Offset === 'number' ? inner.OpPos.Offset : -1;
+      const operator = sliceBytes(opPos, opPos + 2);
+      if (operator === '&&') { flatten(inner.X); flatten(inner.Y); return; }
+      // `cd x && rm -rf data || true`: the left side is the chain, the
+      // right side runs whether or not the cds succeeded.
+      if (operator === '||' && elements.length === 0) { flatten(inner.X); cut ??= elements.length; return; }
     }
-    elements.push(stmt);
+    elements.push(item);
   };
-  flatten(ast.Stmts[0]);
-  /** @type {string[]} */
+  flatten(stmt);
+  // Every element of an `&&` chain runs only after all the cds before it
+  // succeeded, so it runs in the directory those cds reach.
+  /** @type {Array<string|null>} */
   const operands = [];
-  for (const stmt of elements) {
-    if (!isObject(stmt) || (Array.isArray(stmt.Redirs) && stmt.Redirs.length)) break;
-    const call = stmt.Cmd;
-    if (!isObject(call) || call.Type !== 'CallExpr' || !Array.isArray(call.Args) || (Array.isArray(call.Assigns) && call.Assigns.length)) break;
-    const argv = call.Args.map(staticWord);
-    if (argv[0] !== 'cd') break;
-    const rest = argv.slice(1);
-    while (typeof rest[0] === 'string' && /^-[LPe@]+$/.test(rest[0])) rest.shift();
-    if (rest[0] === '--') rest.shift();
-    if (rest.length > 1 || rest.some((arg) => arg === null || arg === '-')) return null;
-    operands.push(rest.length ? /** @type {string} */ (rest[0]) : '');
+  /** @type {CdPrefix['exact']} */
+  const exact = [];
+  let complete = cut === null;
+  for (let index = 0; index < (cut ?? elements.length); index++) {
+    const operand = cdOperand(elements[index]);
+    const name = simpleArgv(elements[index])?.argv[0];
+    if (operand === undefined) { exact.push({ range: stmtRange(elements[index]), depth: operands.length }); continue; }
+    if (name === 'source' || name === '.') { complete = false; break; }
+    operands.push(operand);
   }
-  return operands.length ? operands : null;
+  if (operands.length === 0) return null;
+  return { operands, exact, complete };
 }
 
 /** @param {Record<string, unknown>} ast @returns {string[]|null} */

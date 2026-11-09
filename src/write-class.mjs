@@ -29,13 +29,13 @@ const SAFE_SINKS = /^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/;
 
 /** Commands whose only effect is output on stdout/stderr, whatever the args. */
 const PURE_READERS = new Set([
-  'ls', 'cat', 'bat', 'head', 'tail', 'less', 'more', 'wc', 'grep', 'egrep', 'fgrep', 'ag',
+  'ls', 'cat', 'bat', 'head', 'tail', 'more', 'wc', 'grep', 'egrep', 'fgrep', 'ag',
   'stat', 'file', 'du', 'df', 'pwd', 'echo', 'printf', 'which', 'whereis', 'type', 'printenv',
   'date', 'whoami', 'id', 'groups', 'uname', 'hostname', 'uptime', 'true', 'false', 'test', '[',
   'basename', 'dirname', 'realpath', 'readlink', 'diff', 'cmp', 'comm', 'cut', 'tr', 'nl', 'column',
   'fold', 'rev', 'tac', 'od', 'strings', 'md5', 'md5sum', 'shasum', 'sha1sum', 'sha256sum', 'cksum',
   'jq', 'cd', 'pushd', 'popd', 'sleep', 'env', 'ps', 'pgrep', 'lsof', 'nproc', 'sw_vers', 'locale',
-  'getconf', 'export', 'unset', 'set', 'declare', 'typeset', 'local', 'readonly', 'help',
+  'getconf', 'unset', 'set', 'declare', 'typeset', 'local', 'readonly', 'help',
   'seq', 'expr', 'paste', 'join', 'look', 'zcat', 'gzcat',
 ]);
 
@@ -92,8 +92,9 @@ function readOnlyGit(command) {
   const { subcommand, args } = git;
   if (args.some((arg) => typeof arg === 'string' && (isLongOption(arg, '--ext-diff') || isLongOption(arg, '--textconv')))) return false;
   if (GIT_READ_SUBCOMMANDS.has(subcommand)) {
-    // A dynamic word here is a ref or path operand in practice; only literal
-    // output-file options turn these subcommands into writes.
+    // A dynamic word can expand to `--output=<file>` or `-O<pager>` as easily
+    // as to a ref, so it makes the command a write.
+    if (args.some((arg) => arg === null)) return false;
     return !args.some((arg) => typeof arg === 'string' &&
       (isLongOption(arg, '--output') || (arg === '-o' && GIT_OUTPUT_SHORT_O.has(subcommand)) ||
         isLongOption(arg, '--open-files-in-pager') || arg.startsWith('-O')));
@@ -224,6 +225,45 @@ function curlIsRead(args) {
   return true;
 }
 
+// awk program text that writes or runs something: output redirection or a
+// pipe from print/printf, a pipe into a quoted command, system(), getline.
+const AWK_WRITES = [
+  /\bprintf?\b[^;{}\n]*[>|]/,
+  /\|\s*"/,
+  /\bsystem\s*\(/,
+  /\bgetline\b/,
+];
+
+/**
+ * awk only reads when its program is static and has none of the writing
+ * constructs above. `-f`/`-i`/`-l`/`-E` load program code the guard cannot
+ * see; `--inplace` edits files.
+ * @param {Array<string|null>} args
+ */
+function awkIsRead(args) {
+  let program = null;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === null) return false;
+    if (arg === '--') { program = args[index + 1] ?? null; break; }
+    if (arg.startsWith('--')) {
+      if (['--file', '--include', '--load', '--exec', '--inplace', '--source'].some((option) => isLongOption(arg, option))) return false;
+      if (!arg.includes('=') && ['--field-separator', '--assign'].some((option) => isLongOption(arg, option))) index++;
+      continue;
+    }
+    if (arg.startsWith('-') && arg !== '-') {
+      const letter = arg[1];
+      if ('fileE'.includes(letter)) return false;
+      if ('Fv'.includes(letter) && arg.length === 2) index++;
+      continue;
+    }
+    program = arg;
+    break;
+  }
+  if (program === null) return false;
+  return !AWK_WRITES.some((pattern) => pattern.test(program));
+}
+
 const NPM_READ = new Set(['ls', 'list', 'll', 'la', 'view', 'info', 'show', 'v', 'outdated', 'explain', 'why', '--version', '-v']);
 
 /** @param {AnalyzedCommand} command */
@@ -248,8 +288,12 @@ export function isReadOnlyCommand(command) {
     case 'awk':
     case 'gawk':
     case 'mawk':
-      return !anyArg(args, (arg) => /^-i/.test(arg) || /^-[^-]*f/.test(arg) || isLongOption(arg, '--inplace') ||
-        isLongOption(arg, '--file') || /[>|]|system|getline/.test(arg));
+      return awkIsRead(args);
+    case 'less':
+      // -o/-O/--log-file/--LOG-FILE copy the input to a file; `+cmd` runs
+      // less commands at start-up (including `s file`).
+      return !anyArg(args, (arg) => /^-[^-]*[oO]/.test(arg) || isLongOption(arg, '--log-file') ||
+        isLongOption(arg, '--LOG-FILE') || arg.startsWith('+'));
     case 'rg':
       return !anyArg(args, (arg) => arg === '--pre' || arg.startsWith('--pre='));
     case 'man':
@@ -276,10 +320,30 @@ export function isReadOnlyCommand(command) {
   }
 }
 
+/**
+ * Variables that make a reader run something else or write: pagers, diff and
+ * ssh helpers, injected git config, less pre/post-processors, loader hooks.
+ */
+const EXEC_CHANNEL_ENV = /^(?:GIT_PAGER|GIT_EXTERNAL_DIFF|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND|GIT_EXEC_PATH|GIT_TEMPLATE_DIR|GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_CONFIG(?:_[A-Z0-9_]+)?|PAGER|MANPAGER|MANOPT|LESSOPEN|LESSCLOSE|LESS|LESSKEY|LESSKEYIN|EDITOR|VISUAL|BASH_ENV|ENV|PROMPT_COMMAND|PATH|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_[A-Z_]+|NODE_OPTIONS|PERL5OPT|PYTHONSTARTUP|GIT_TRACE[A-Z0-9_]*)$/;
+
+/** @param {{name: string, value: string|null}} assignment */
+function isExecChannel({ name, value }) {
+  if (!EXEC_CHANNEL_ENV.test(name)) return false;
+  // Common harmless spellings: no pager, `cat`, git trace to stderr, less
+  // display options without a log file.
+  if (/^(?:GIT_PAGER|PAGER|MANPAGER)$/.test(name) && (value === '' || value === 'cat')) return false;
+  if (/^GIT_TRACE/.test(name) && value !== null && /^(?:[0-2]|true|false)?$/i.test(value)) return false;
+  if (name === 'LESS' && value !== null && !/[oO+]|log-file/i.test(value)) return false;
+  return true;
+}
+
 /** @param {ShellGraph} graph */
 export function isReadOnlyGraph(graph) {
   if (graph.status !== 'safe') return false;
   if (!graph.redirections.every(readOnlyRedirect)) return false;
+  // `export` changes what every later command sees; an exec channel set in
+  // any form (prefix, plain assignment, env operand) can run a writer.
+  if ((graph.assignments ?? []).some((assignment) => assignment.exported || isExecChannel(assignment))) return false;
   return graph.commands.every(isReadOnlyCommand);
 }
 

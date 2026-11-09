@@ -22,6 +22,27 @@ export interface AnalyzedCommand {
   wrappers: string[];
   hasRedirection: boolean;
   pipelineGroup: number | null;
+  /** Byte offset of the top-level command this one belongs to (nested `sh -c` / `eval` commands share their parent's). */
+  rootOffset?: number;
+  /** Variable names assigned anywhere in the command's graph. */
+  graphEnv?: string[];
+}
+
+export interface AnalyzedAssignment {
+  name: string;
+  /** null when dynamic or absent (`export X`). */
+  value: string | null;
+  /** `export` / `declare -x`. */
+  exported: boolean;
+}
+
+export interface CdPrefix {
+  /** One entry per `cd` of the leading `&&` chain: a path, '' = home, '-' = previous, null = dynamic. */
+  operands: Array<string | null>;
+  /** Byte ranges of commands that run after the first `depth` cds succeeded. */
+  exact: Array<{ range: [number, number]; depth: number }>;
+  /** Nothing else in the script runs outside `exact`. */
+  complete: boolean;
 }
 
 export interface AnalyzedRedirection {
@@ -42,8 +63,8 @@ export interface ShellGraph {
   hasCompound: boolean;
   nativePromptArgv: string[] | null;
   redirections: AnalyzedRedirection[];
-  /** Literal `cd` operands leading a single `&&` chain ('' = bare `cd`). */
-  cdPrefix?: string[] | null;
+  cdPrefix?: CdPrefix | null;
+  assignments?: AnalyzedAssignment[];
 }
 
 export type ShellInput =

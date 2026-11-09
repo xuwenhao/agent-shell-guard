@@ -92,6 +92,48 @@ export function mainWorktree(gitRoot) {
   return main === gitRoot ? null : main;
 }
 
+const MAX_SYMREF_DEPTH = 5;
+
+/**
+ * Strip a git-config comment (`;` or `#` outside double quotes) and the
+ * quoting itself from a line.
+ * @param {string} line
+ */
+export function stripConfigComment(line) {
+  let result = '';
+  let quoted = false;
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (char === '\\' && index + 1 < line.length) { result += char + line[++index]; continue; }
+    if (char === '"') { quoted = !quoted; result += char; continue; }
+    if (!quoted && (char === ';' || char === '#')) break;
+    result += char;
+  }
+  return result.trim();
+}
+
+/**
+ * The branch HEAD names, following symbolic refs (`ref: refs/heads/alias`
+ * whose loose file is itself `ref: refs/heads/main`). Null when HEAD is
+ * detached, unreadable, too deeply nested, or a reftable placeholder
+ * (`refs/heads/.invalid`), since the real ref then lives where this lexical
+ * reader cannot see it.
+ * @param {{gitDir: string, commonDir: string}} dirs
+ */
+function headBranch(dirs) {
+  let ref = /^ref:\s*(\S+)\s*$/.exec(readText(join(dirs.gitDir, 'HEAD')) ?? '')?.[1];
+  for (let depth = 0; ref !== undefined && depth < MAX_SYMREF_DEPTH; depth++) {
+    if (!ref.startsWith('refs/heads/')) return null;
+    const name = ref.slice('refs/heads/'.length);
+    if (name === '' || name === '.invalid') return null;
+    const loose = readText(join(dirs.commonDir, ref));
+    const next = loose === null ? null : /^ref:\s*(\S+)\s*$/.exec(loose);
+    if (!next) return name;
+    ref = next[1];
+  }
+  return null;
+}
+
 /**
  * Current branch of a work tree and its configured upstream, read from
  * `HEAD` and the repository `config`. `branch` is null when HEAD is detached
@@ -102,21 +144,20 @@ export function mainWorktree(gitRoot) {
 export function gitHead(gitRoot) {
   const dirs = gitDirs(gitRoot);
   if (!dirs) return { branch: null, upstream: null };
-  const head = /^ref:\s*refs\/heads\/(\S+)\s*$/.exec(readText(join(dirs.gitDir, 'HEAD')) ?? '');
-  if (!head) return { branch: null, upstream: null };
-  const branch = head[1];
+  const branch = headBranch(dirs);
+  if (branch === null) return { branch: null, upstream: null };
   const config = readText(join(dirs.commonDir, 'config')) ?? '';
   /** @type {Record<string, string>} */
   const section = {};
   let inSection = false;
   for (const raw of config.split('\n')) {
-    const line = raw.trim();
-    const header = /^\[\s*branch\s+"(.*)"\s*\]$/.exec(line);
+    const line = stripConfigComment(raw);
+    const header = /^\[\s*branch\s+"(.*)"\s*\]$/i.exec(line);
     if (header) { inSection = header[1] === branch; continue; }
     if (line.startsWith('[')) { inSection = false; continue; }
     if (!inSection) continue;
     const entry = /^([A-Za-z]+)\s*=\s*(.*?)\s*$/.exec(line);
-    if (entry) section[entry[1].toLowerCase()] = entry[2];
+    if (entry) section[entry[1].toLowerCase()] = entry[2].replace(/^"(.*)"$/, '$1');
   }
   const upstream = section.merge ? { remote: section.remote ?? '', merge: section.merge } : null;
   return { branch, upstream };

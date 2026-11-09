@@ -23,8 +23,13 @@ export function setCaseInsensitivePaths(value) {
 
 export const pathsCaseInsensitive = () => caseInsensitive;
 
-/** @param {string} value */
-export const foldCase = (value) => caseInsensitive ? value.toLowerCase() : value;
+/**
+ * APFS compares names after Unicode normalization and case folding, so
+ * `perſonal` (long s) and `PERSONAL` both reach `personal`. Upper- then
+ * lower-casing approximates full case folding (`ſ` → `S` → `s`).
+ * @param {string} value
+ */
+export const foldCase = (value) => caseInsensitive ? value.normalize('NFC').toUpperCase().toLowerCase() : value;
 
 /** @param {string} a @param {string} b */
 const sameName = (a, b) => foldCase(a) === foldCase(b);
@@ -182,8 +187,35 @@ export function firstGlobIndex(text) {
  * @param {string} segment
  */
 export function isFullMatchPattern(segment) {
-  return /^\*+$/.test(segment) || /^\?\*+$/.test(segment) || /^\*+\?$/.test(segment) ||
-    ['.*', '.[!.]*', '.[^.]*', '..?*', '.??*', '[!.]*', '[^.]*'].includes(segment);
+  if (/^\*+$/.test(segment) || /^\?\*+$/.test(segment) || /^\*+\?$/.test(segment) ||
+    ['.*', '.[!.]*', '.[^.]*', '..?*', '.??*', '[!.]*', '[^.]*'].includes(segment)) return true;
+  // A pattern without a single literal character (`[[:alnum:]]*`, `?*?`,
+  // `[!~]*`) is judged as matching everything: deciding which names a class
+  // admits is beyond a lexical check.
+  return segment.includes('*') && withoutClassesAndWildcards(segment) === '';
+}
+
+/**
+ * Remove `*`, `?` and bracket expressions that are not plain character lists
+ * (POSIX classes, negations, ranges). What remains are literal characters.
+ * @param {string} segment
+ */
+function withoutClassesAndWildcards(segment) {
+  let rest = '';
+  for (let index = 0; index < segment.length; index++) {
+    const char = segment[index];
+    if (char === '*' || char === '?') continue;
+    if (char === '[') {
+      let close = segment.indexOf(']', index + 2);
+      if (segment.startsWith('[[:', index)) close = segment.indexOf(':]]', index) + 2;
+      if (close > index) {
+        const body = segment.slice(index + 1, close);
+        if (/^[!^]/.test(body) || body.includes('-') || body.startsWith('[:')) { index = close; continue; }
+      }
+    }
+    rest += char;
+  }
+  return rest;
 }
 
 /**
@@ -309,9 +341,10 @@ function sequenceAlternatives(body) {
  * Candidates for an unresolved (null) argv word: brace alternatives, each a
  * static path or a glob. `null` means the word is genuinely dynamic
  * (variables, substitutions). `overflow` is the resolved literal prefix of a
- * word whose brace expansion was too large to enumerate.
+ * word whose brace expansion was too large to enumerate; `climbs` says a `..`
+ * segment follows the brace, so that prefix bounds nothing.
  * @param {string} display @param {string|null} cwd
- * @returns {{candidates: TargetCandidate[]}|{overflow: ResolvedTarget}|null}
+ * @returns {{candidates: TargetCandidate[]}|{overflow: ResolvedTarget, climbs: boolean}|null}
  */
 export function expandTargetWord(display, cwd) {
   if (isDynamicDisplay(display)) return null;
@@ -322,7 +355,8 @@ export function expandTargetWord(display, cwd) {
     const head = text.slice(0, brace);
     const slash = head.lastIndexOf('/');
     const prefix = slash < 0 ? '.' : slash === 0 ? '/' : head.slice(0, slash);
-    return { overflow: resolveTarget(prefix, cwd) };
+    const climbs = text.slice(brace).split('/').includes('..');
+    return { overflow: resolveTarget(prefix, cwd), climbs };
   }
   return {
     candidates: words.map((word) => {

@@ -67,6 +67,9 @@ export function commandTargets(command) {
   return targets;
 }
 
+/** Environment variables that relocate or reconfigure the repository git acts on. */
+export const GIT_LOCATION_ENV = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_COMMON_DIR|GIT_OBJECT_DIRECTORY|GIT_NAMESPACE|GIT_CONFIG(?:_[A-Z0-9_]+)?)$/;
+
 /**
  * @param {AnalyzedCommand} command
  * @returns {{subcommand: string, args: Array<string|null>, argOffset: number, workDirs: Array<string|null>, gitDirOverride: boolean}|null}
@@ -76,7 +79,9 @@ export function parseGitCommand(command) {
   const valueFlags = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env']);
   /** @type {Array<string|null>} */
   const workDirs = [];
-  let gitDirOverride = false;
+  // `GIT_DIR=… git …` / `export GIT_WORK_TREE=…; git …` relocate the
+  // repository exactly like `--git-dir` / `--work-tree`.
+  let gitDirOverride = (command.graphEnv ?? []).some((name) => GIT_LOCATION_ENV.test(name));
   let index = 1;
   for (; index < command.argv.length; index++) {
     const arg = command.argv[index];

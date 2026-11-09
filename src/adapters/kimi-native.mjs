@@ -6,8 +6,10 @@ import { isNativePromptCovered } from './common.mjs';
 /**
  * Kimi (and Grok, which copies this map) start from the Codex table and widen
  * one entry: `git-discard` covers every clean/checkout/reset/restore/rm form.
- * They also prompt for SQL clients. These hosts have no project sandbox to fall
- * back on, so discarding uncommitted work keeps a native confirmation there.
+ * They also prompt for SQL clients, `chmod` and `gh api`, as their 0.4 rules
+ * did, so chmod 777 and a generic `gh api` DELETE stay a native confirmation
+ * instead of a deny. These hosts have no project sandbox to fall back on, so
+ * discarding uncommitted work keeps a native confirmation there.
  * @type {Map<string, string[][]>}
  */
 export const KIMI_NATIVE_PROMPT_PREFIXES = new Map([
@@ -29,6 +31,8 @@ export const KIMI_NATIVE_PROMPT_PREFIXES = new Map([
     ['git', 'worktree', 'remove', '-f'],
   ]],
   ['destructive-sql', [['psql'], ['mysql'], ['mysqlsh'], ['sqlite3']]],
+  ['chmod-777', [['chmod']]],
+  ['gh-api-delete', [['gh', 'api']]],
 ]);
 
 /** @param {string[]} prefix */

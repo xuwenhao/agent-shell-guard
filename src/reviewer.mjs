@@ -41,6 +41,12 @@ export function redact(command) {
     // NAME=value where the name mentions a token, key, secret or password.
     .replace(new RegExp(String.raw`\b([A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS?)[A-Za-z0-9_]*)=${VALUE}`, 'gi'), '$1=<redacted-secret>')
     .replace(new RegExp(String.raw`(_authToken\s+)${VALUE}`, 'g'), '$1<redacted-secret>')
+    // aws configure set [profile.]aws_secret_access_key <value>
+    .replace(new RegExp(String.raw`(\baws\s+configure\s+set\s+(?:\S+\.)?aws_(?:secret_access_key|session_token|access_key_id)\s+)${VALUE}`, 'gi'), '$1<redacted-secret>')
+    // gh secret set NAME --body <value> / -b <value> / -b<value> / --body=<value>
+    .replace(new RegExp(String.raw`(\bgh\s+secret\s+set\b[^|;&\n]*?\s(?:--body(?:=|\s+)|-b\s*))${VALUE}`, 'g'), '$1<redacted-secret>')
+    // printf <password> | sudo -S …: the piped words are the password.
+    .replace(new RegExp(String.raw`(\b(?:printf|echo)\s+)((?:${VALUE}\s*)+?)(\|\s*sudo\b[^|;&\n]*\s-[A-Za-z]*S)`, 'g'), '$1<redacted-secret> $3')
     .replace(/(hooks\.slack\.com\/services\/)[^\s'"]+/gi, '$1<redacted>')
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, '<redacted-secret>')
     .replace(/\b(?:sk|ghp|gho|ghs|ghu|github_pat|glpat|xox[baprs])[-_A-Za-z0-9]{12,}\b/g, '<redacted-secret>');

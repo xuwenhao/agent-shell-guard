@@ -12,7 +12,7 @@
 import { homedir } from 'node:os';
 import { basename } from 'node:path';
 
-import { analyzeShellInput, selectShellDialect } from './shell-analyzer.mjs';
+import { analyzeShellInput, cdArgvOperand, selectShellDialect, shellEvaluator, unwrapCommand } from './shell-analyzer.mjs';
 import { isPolicyEnabled, permissionTier, resolvePolicyProfile } from './policies/profiles.mjs';
 import {
   commandName,
@@ -34,6 +34,7 @@ import {
 import {
   expandHome,
   expandTargetWord,
+  firstGlobIndex,
   foldCase,
   globCovers,
   isAncestorOrSelf,
@@ -61,6 +62,7 @@ const trunc = (value, length = 160) => value.length > length ? `${value.slice(0,
  *   tier: import('./policies/profiles.mjs').PermissionTier,
  *   cwd: string|null,
  *   trustedCwd: string|null,
+ *   cwdsFor: (command: AnalyzedCommand) => Array<string|null>,
  *   projectDir: string|null,
  *   unsandboxed: boolean,
  *   protectedRoots: string[],
@@ -72,7 +74,8 @@ const trunc = (value, length = 160) => value.length > length ? `${value.slice(0,
 /** @typedef {{value: string|null, display: string}} TargetWord */
 
 const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
-const CWD_CHANGING = new Set(['cd', 'pushd', 'popd', 'source', '.']);
+const CWD_CHANGING = new Set(['cd', 'chdir', 'pushd', 'popd', 'source', '.']);
+const CD_LIKE = new Set(['cd', 'chdir', 'pushd']);
 
 /** @param {string} value */
 function isProtectedRef(value) {
@@ -95,10 +98,38 @@ function mayNameTrunk(value) {
 // --- path targets ------------------------------------------------------------
 
 /**
+ * Run a path check in every directory a command may run in. 'matched' when
+ * every candidate matches, 'unknown' when only some do (or one is unknown).
+ * @param {Array<string|null>} cwds
+ * @param {(cwd: string|null) => 'matched'|'unknown'|null} check
+ * @returns {'matched'|'unknown'|null}
+ */
+function acrossCwds(cwds, check) {
+  let hits = 0;
+  let matched = 0;
+  for (const directory of cwds) {
+    const result = check(directory);
+    if (result) hits++;
+    if (result === 'matched') matched++;
+  }
+  if (hits === 0) return null;
+  return matched === cwds.length ? 'matched' : 'unknown';
+}
+
+/**
+ * zsh glob qualifiers (`*(D)`, `*(.N)`) select among the matches; they never
+ * narrow a pattern to fewer names than it already matches without them, so
+ * they are dropped before judging the pattern.
+ * @param {string} display @param {string|undefined} dialect
+ */
+const withoutGlobQualifier = (display, dialect) =>
+  dialect === 'zsh' ? display.replace(/\([^()/'"]*\)$/, '') : display;
+
+/**
  * @param {TargetWord} target
  * @param {string[]} paths
  * @param {string|null} cwd trusted cwd
- * @param {{ancestors: boolean, dynamicMatches: boolean}} options
+ * @param {{ancestors: boolean, dynamicMatches: boolean, dialect?: string}} options
  * @returns {'matched'|'unknown'|null}
  */
 function targetHitsProtected(target, paths, cwd, options) {
@@ -108,9 +139,12 @@ function targetHitsProtected(target, paths, cwd, options) {
     return resolved.kind === 'absolute' ? 'matched' : 'unknown';
   }
   // Globs and brace expansions: every alternative is checked.
-  const word = expandTargetWord(target.display, cwd);
+  const word = expandTargetWord(withoutGlobQualifier(target.display, options.dialect), cwd);
   if (word === null) return options.dynamicMatches ? 'unknown' : null;
   if ('overflow' in word) {
+    // Too many alternatives to list; a `..` after the brace can climb
+    // anywhere, so only the literal prefix bounds nothing.
+    if (word.climbs) return 'unknown';
     const prefix = word.overflow;
     return paths.some((path) => targetCovers(prefix, path, { ancestors: true })) ? 'unknown' : null;
   }
@@ -131,19 +165,49 @@ function targetHitsProtected(target, paths, cwd, options) {
 /** @param {string} segment */
 const isGitSegment = (segment) => foldCase(segment) === '.git';
 
+/** @param {string} segment */
+const isLiteralSegment = (segment) => firstGlobIndex(segment) < 0;
+
+/**
+ * Paths inside `.git` that are routinely removed to recover or clean up and
+ * hold no history of their own: a submodule's or linked worktree's admin
+ * directory (`modules/<name>`, `worktrees/<name>`), an interrupted rebase's
+ * state, and stale `*.lock` files. `.git` itself, `objects`, `refs`, `modules`
+ * as a whole and everything else stay protected.
+ * @param {string[]} rest segments after `.git`
+ */
+function gitDirTailRecoverable(rest) {
+  if (rest.length === 0) return false;
+  if (foldCase(rest[rest.length - 1]).endsWith('.lock')) return true;
+  if (!isLiteralSegment(rest[0])) return false;
+  const first = foldCase(rest[0]);
+  if ((first === 'modules' || first === 'worktrees') && rest.length >= 2) return true;
+  return first === 'rebase-merge' || first === 'rebase-apply';
+}
+
+/**
+ * @param {string[]} segments
+ * @param {(segment: string) => boolean} isGit
+ */
+function segmentsDeleteGitDir(segments, isGit) {
+  const index = segments.findIndex(isGit);
+  return index >= 0 && !gitDirTailRecoverable(segments.slice(index + 1));
+}
+
 /**
  * Any segment of the target is `.git`: the directory itself, or anything
- * inside it (`.git/objects`, `.git/refs`), or a glob that matches it.
+ * inside it (`.git/objects`, `.git/refs`), or a glob that matches it —
+ * except the recoverable paths of gitDirTailRecoverable.
  * @param {TargetWord} target
  */
 function targetIsGitDir(target) {
-  if (target.value !== null) return targetSegments(resolveTarget(target.value, null)).some(isGitSegment);
+  if (target.value !== null) return segmentsDeleteGitDir(targetSegments(resolveTarget(target.value, null)), isGitSegment);
   const word = expandTargetWord(target.display, null);
   if (word === null || 'overflow' in word) return false;
   return word.candidates.some((candidate) => candidate.kind === 'static'
-    ? targetSegments(candidate.target).some(isGitSegment)
-    : targetSegments(candidate.glob.prefix).some(isGitSegment) ||
-      candidate.glob.pattern.some((segment) => segmentMatches(segment, '.git')));
+    ? segmentsDeleteGitDir(targetSegments(candidate.target), isGitSegment)
+    : segmentsDeleteGitDir([...targetSegments(candidate.glob.prefix), ...candidate.glob.pattern],
+      (segment) => isGitSegment(segment) || (!isLiteralSegment(segment) && segmentMatches(segment, '.git'))));
 }
 
 // --- find ----------------------------------------------------------------------
@@ -174,17 +238,32 @@ function parseFind(command) {
   /** @type {Array<{test: string, value: string|null}>} */
   const tests = [];
   let deletes = false;
+  let negated = false;
   for (; index < argv.length; index++) {
     const arg = argv[index];
-    if (typeof arg !== 'string') continue;
-    if (FIND_NAME_TESTS.has(arg) || FIND_PATH_TESTS.has(arg)) { tests.push({ test: arg, value: argv[++index] ?? null }); continue; }
+    if (typeof arg !== 'string') { negated = false; continue; }
+    if (arg === '!' || arg === '-not') { negated = true; continue; }
+    if (FIND_NAME_TESTS.has(arg) || FIND_PATH_TESTS.has(arg)) {
+      const value = argv[++index] ?? null;
+      // `-not -path './.git/*'` excludes; only positive tests select. Dropping
+      // a negated test can only make the find look broader.
+      if (!negated) tests.push({ test: arg, value });
+      negated = false;
+      continue;
+    }
+    negated = false;
     if (arg === '-delete') { deletes = true; continue; }
     if (['-exec', '-execdir', '-ok', '-okdir'].includes(arg)) {
       /** @type {Array<string|null>} */
       const sub = [];
       for (index++; index < argv.length && argv[index] !== ';' && argv[index] !== '+'; index++) sub.push(argv[index]);
-      if (typeof sub[0] === 'string' && basename(sub[0]) === 'rm' && hasRecursiveFlag(sub)) deletes = true;
-      if (sub[0] === null) deletes = true;
+      // `-exec command rm -rf {}`, `-exec env rm …`, `-exec sudo rm …`
+      const { argv: inner } = unwrapCommand(sub);
+      if (typeof inner[0] === 'string' && basename(inner[0]) === 'rm' && hasRecursiveFlag(inner)) deletes = true;
+      if (inner[0] === null || sub[0] === null) deletes = true;
+      // `-exec sh -c 'rm -rf "$1"' _ {} \;`: whatever the script does, it gets
+      // each match as an argument.
+      if (shellEvaluator(inner)) deletes = true;
     }
   }
   return { starts, tests, deletes };
@@ -289,6 +368,8 @@ function parseCheckoutArgs(git) {
   /** @type {Array<string|null>} */ const positionals = [];
   /** @type {string|null|undefined} */ let createTarget;
   let forceCreate = false;
+  let orphan = false;
+  let detach = false;
   let endOfOptions = false;
 
   for (let index = 0; index < git.args.length; index++) {
@@ -301,8 +382,14 @@ function parseCheckoutArgs(git) {
       const name = eq === -1 ? raw : raw.slice(0, eq);
       flags.push(name);
       const operand = eq === -1 ? undefined : raw.slice(eq + 1);
-      if (name === '--orphan') createTarget = operand ?? git.args[++index] ?? null;
-      else if (operand === undefined && LONG_WITH_OPERAND.has(name)) index++;
+      if (name === '--orphan') { createTarget = operand ?? git.args[++index] ?? null; orphan = true; }
+      else if (name === '--detach') detach = true;
+      // Negations undo an earlier option instead of adding a mode of their own.
+      else if (isLongOption(name, '--no-detach') && name.length >= '--no-d'.length) detach = false;
+      else if (isLongOption(name, '--no-orphan') && name.length >= '--no-or'.length) {
+        if (orphan) createTarget = undefined;
+        orphan = false;
+      } else if (operand === undefined && LONG_WITH_OPERAND.has(name)) index++;
       continue;
     }
     if (raw.startsWith('-') && raw.length > 1) {
@@ -310,6 +397,7 @@ function parseCheckoutArgs(git) {
       for (let cursor = 0; cursor < cluster.length; cursor++) {
         const letter = cluster[cursor];
         letters.push(letter);
+        if (letter === 'd') detach = true;
         if (!SHORT_WITH_OPERAND.includes(letter)) continue;
         const attached = cluster.slice(cursor + 1);
         const operand = attached !== '' ? attached : git.args[++index] ?? null;
@@ -323,7 +411,7 @@ function parseCheckoutArgs(git) {
     }
     positionals.push(raw);
   }
-  return { flags, letters, positionals, createTarget, forceCreate };
+  return { flags, letters, positionals, createTarget, forceCreate, orphan, detach };
 }
 
 /**
@@ -338,15 +426,16 @@ function parseCheckoutArgs(git) {
  */
 function checkoutRule(git) {
   const parsed = parseCheckoutArgs(git);
-  if (parsed.forceCreate && mayNameTrunk(parsed.createTarget)) return 'git-trunk-ref';
+  // `--orphan main` starts a new, parentless `main` when none exists (a fresh
+  // clone, or right after deleting the local branch).
+  if ((parsed.forceCreate || parsed.orphan) && mayNameTrunk(parsed.createTarget)) return 'git-trunk-ref';
   if (git.args.some((arg) => arg === null)) return 'git-discard';
   if (parsed.flags.includes('--')) return 'git-discard';
   // `--pathspec-from-file <file>` restores every path listed in the file, which
   // is a working-tree discard with no positional argument to notice it by.
   if (parsed.flags.some((flag) => isLongOption(flag, '--pathspec-from-file'))) return 'git-discard';
   const forceish = parsed.flags.some((flag) =>
-    ['--force', '--ours', '--theirs', '--merge', '--conflict', '--patch', '--overwrite-ignore',
-      '--no-detach', '--no-orphan']
+    ['--force', '--ours', '--theirs', '--merge', '--conflict', '--patch', '--overwrite-ignore']
       .some((option) => isLongOption(flag, option))) ||
     parsed.letters.some((letter) => 'fmp23'.includes(letter));
   if (forceish) return 'git-discard';
@@ -367,9 +456,9 @@ function checkoutRule(git) {
   // paths, and a deleted tracked file is still a valid pathspec. Only flags git
   // itself refuses to pair with a path count as branch intent (verified on git
   // 2.43: `--detach`/`-d` and `--track`/`--no-track`/`-t`).
-  const refIntent = ['--detach', '--track', '--no-track'];
-  if (parsed.flags.some((flag) => refIntent.includes(flag)) ||
-      parsed.letters.some((letter) => letter === 't' || letter === 'd')) {
+  const refIntent = ['--track', '--no-track'];
+  if (parsed.detach || parsed.flags.some((flag) => refIntent.includes(flag)) ||
+      parsed.letters.some((letter) => letter === 't')) {
     return 'git-low-risk';
   }
   return 'git-discard';
@@ -472,6 +561,12 @@ function gitRule(command) {
   if (subcommand === 'switch') {
     const forceCreate = args.some((arg) => isLongOption(arg, '--force-create')) ? (gitPositionals(git)[0] ?? null) : shortOperand(args, 'C');
     if (forceCreate !== undefined && mayNameTrunk(forceCreate)) return 'git-trunk-ref';
+    const orphanIndex = args.findIndex((arg) => isLongOption(arg, '--orphan') && /** @type {string} */ (arg).length >= '--or'.length);
+    if (orphanIndex >= 0) {
+      const flag = /** @type {string} */ (args[orphanIndex]);
+      const target = flag.includes('=') ? flag.slice(flag.indexOf('=') + 1) : args[orphanIndex + 1] ?? null;
+      if (mayNameTrunk(target)) return 'git-trunk-ref';
+    }
     if (args.some((arg) => isLongOption(arg, '--discard-changes') || isLongOption(arg, '--force') || shortOptionHas(arg, /f/))) return 'git-discard';
     if (forceCreate !== undefined) return 'git-ref-change';
     return args.some((arg) => shortOptionHas(arg, /d/)) ? 'git-low-risk' : null;
@@ -491,9 +586,9 @@ function gitRule(command) {
       isLongOption(arg, '--reschedule-failed-exec') || shortOptionHas(arg, /x/)) ? 'git-exec' : null;
   }
   if (subcommand === 'push') {
-    if (args.some((arg) => isLongOption(arg, '--prune'))) return 'git-push-bulk';
-    return args.some((arg) =>
-      isLongOption(arg, '--delete') || shortOptionHas(arg, /d/) || (typeof arg === 'string' && /^\+?:\S+/.test(arg)))
+    const options = pushOptions(args);
+    if (options.prune) return 'git-push-bulk';
+    return options.delete || args.some((arg) => typeof arg === 'string' && /^\+?:\S+/.test(arg))
       ? 'git-ref-change' : null;
   }
   return null;
@@ -528,15 +623,51 @@ function resetRefIsTrunk(ref, command, ctx) {
   return /^(?:refs\/heads\/)?(?:main|master)$/.test(info.upstream.merge);
 }
 
+const PUSH_VALUE_OPTIONS = ['--repo', '--receive-pack', '--exec', '--push-option'];
+
+/**
+ * `git push` options in order. Short clusters stop at `o`, whose operand is
+ * the rest of the word (`-onone` is a push option, not `-n`); `--dry-run` and
+ * `--no-dry-run` take the last one given.
+ * @param {Array<string|null>} args
+ */
+function pushOptions(args) {
+  const options = { force: false, dryRun: false, delete: false, all: false, mirror: false, prune: false, tags: false };
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (typeof arg !== 'string') continue;
+    if (arg === '--') break;
+    if (arg.startsWith('--')) {
+      if (!arg.includes('=') && PUSH_VALUE_OPTIONS.some((option) => isLongOption(arg, option) && arg.length >= 4)) { index++; continue; }
+      if (isLongOption(arg, '--force') || isLongOption(arg, '--force-with-lease')) options.force = true;
+      else if (isLongOption(arg, '--dry-run')) options.dryRun = true;
+      else if (isLongOption(arg, '--no-dry-run') && arg.length >= '--no-d'.length) options.dryRun = false;
+      else if (isLongOption(arg, '--delete')) options.delete = true;
+      else if (isLongOption(arg, '--all') || isLongOption(arg, '--branches')) options.all = true;
+      else if (isLongOption(arg, '--mirror')) options.mirror = true;
+      else if (isLongOption(arg, '--prune')) options.prune = true;
+      else if (isLongOption(arg, '--tags')) options.tags = true;
+      continue;
+    }
+    if (!arg.startsWith('-') || arg === '-') continue;
+    const cluster = arg.slice(1);
+    for (let cursor = 0; cursor < cluster.length; cursor++) {
+      const letter = cluster[cursor];
+      if (letter === 'o') { if (cursor === cluster.length - 1) index++; break; }
+      if (letter === 'f') options.force = true;
+      if (letter === 'n') options.dryRun = true;
+      if (letter === 'd') options.delete = true;
+    }
+  }
+  return options;
+}
+
 /** @param {AnalyzedCommand} command */
 function forcePush(command) {
   const git = parseGitCommand(command);
   if (git?.subcommand !== 'push') return false;
-  const display = effectiveDisplayArgv(command).slice(git.argOffset);
-  return git.args.some((arg, index) => {
-    const token = arg ?? display[index] ?? '';
-    return isLongOption(token, '--force') || isLongOption(token, '--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
-  });
+  if (pushOptions(git.args).force) return true;
+  return pushPositionals(command).some((ref) => /^\+\S*/.test(ref.display) && ref.display !== '+');
 }
 
 /** @param {AnalyzedCommand} command @returns {Array<{value: string|null, display: string}>} */
@@ -544,7 +675,7 @@ function pushPositionals(command) {
   const git = parseGitCommand(command);
   if (git?.subcommand !== 'push') return [];
   const display = effectiveDisplayArgv(command).slice(git.argOffset);
-  const valueFlags = new Set(['--repo', '--receive-pack', '--exec', '--push-option', '-o']);
+  const valueFlags = new Set([...PUSH_VALUE_OPTIONS, '-o']);
   /** @type {Array<{value: string|null, display: string}>} */
   const positionals = [];
   let options = true;
@@ -554,6 +685,7 @@ function pushPositionals(command) {
     if (options && token === '--') { options = false; continue; }
     if (options && token.startsWith('-')) {
       if (valueFlags.has(token)) index++;
+      else if (!token.startsWith('--') && /^-[^o]*o$/.test(token)) index++;
       continue;
     }
     positionals.push({ value: arg, display: token });
@@ -579,12 +711,18 @@ const isHeadRef = (value) => typeof value === 'string' && /^\+?(?:HEAD|@)$/.test
 function forcePushTarget(command, ctx) {
   const git = parseGitCommand(command);
   if (!git) return null;
-  if (git.args.some((arg) => isLongOption(arg, '--all') || isLongOption(arg, '--branches'))) return 'matched';
+  if (pushOptions(git.args).all) return 'matched';
   const refs = pushRefs(command);
   if (refs.some((ref) => ref.value !== null && isProtectedRef(ref.value))) return 'matched';
+  // `:` / `+:` push every matching branch; a `*` refspec pushes a whole
+  // namespace — both include main/master like `--all`.
+  if (refs.some((ref) => ref.value !== null && (/^\+?:$/.test(ref.value) || ref.value.includes('*')))) return 'matched';
   if (refs.some((ref) => ref.value === null)) return 'unknown';
-  const usesHead = refs.length === 0 ? !git.args.some((arg) => isLongOption(arg, '--tags')) : refs.some((ref) => isHeadRef(ref.value));
+  const usesHead = refs.length === 0 ? !pushOptions(git.args).tags : refs.some((ref) => isHeadRef(ref.value));
   if (!usesHead) return null;
+  // Without a refspec, `-c push.default=…` / `-c remote.<name>.push=…` decide
+  // what is pushed.
+  if (refs.length === 0 && gitGlobalConfigs(command, git).some((entry) => /^(?:push|remote)\./i.test(entry))) return 'unknown';
   const directory = gitWorkDir(git, ctx.trustedCwd);
   if (directory === null) return 'unknown';
   const info = ctx.inspect(directory);
@@ -598,19 +736,35 @@ function forcePushTarget(command, ctx) {
 function pushMirror(command) {
   const git = parseGitCommand(command);
   if (git?.subcommand !== 'push') return false;
-  if (git.args.some((arg) => isLongOption(arg, '--dry-run') || shortOptionHas(arg, /n/))) return false;
-  return git.args.some((arg) => isLongOption(arg, '--mirror'));
+  const options = pushOptions(git.args);
+  return options.mirror && !options.dryRun;
+}
+
+/**
+ * Values of git's global `-c key=value` / `-ckey=value` options.
+ * @param {AnalyzedCommand} command @param {{argOffset: number}} git
+ */
+function gitGlobalConfigs(command, git) {
+  const globals = command.argv.slice(1, git.argOffset - 1);
+  /** @type {string[]} */
+  const entries = [];
+  for (let index = 0; index < globals.length; index++) {
+    const arg = globals[index];
+    if (arg === '-c') { const value = globals[++index]; entries.push(typeof value === 'string' ? value : ''); }
+    else if (typeof arg === 'string' && /^-c./.test(arg)) entries.push(arg.slice(2));
+  }
+  return entries;
 }
 
 /** @param {AnalyzedCommand} command @param {RuleContext} ctx @returns {'matched'|'unknown'|null} */
 function pushDeletesTrunk(command, ctx) {
   const git = parseGitCommand(command);
   if (git?.subcommand !== 'push') return null;
-  if (git.args.some((arg) => isLongOption(arg, '--dry-run') || shortOptionHas(arg, /n/))) return null;
+  const options = pushOptions(git.args);
+  if (options.dryRun) return null;
   const emptySource = /^\+?:(?:refs\/heads\/)?(?:main|master)$/;
   if (pushPositionals(command).some((ref) => typeof ref.value === 'string' && emptySource.test(ref.value))) return 'matched';
-  const deleting = git.args.some((arg) => isLongOption(arg, '--delete') || shortOptionHas(arg, /d/));
-  if (!deleting) return null;
+  if (!options.delete) return null;
   const refs = pushRefs(command);
   if (refs.some((ref) => typeof ref.value === 'string' && TRUNK_REF.test(ref.value.replace(/^\+/, '')))) return 'matched';
   if (refs.some((ref) => ref.value === null)) return 'unknown';
@@ -752,8 +906,9 @@ function gitCleanRoot(command, ctx) {
 
 /** @param {ShellGraph} graph @param {PolicyEnabled} enabled @param {RuleContext} ctx @returns {PolicyMatch|null} */
 function hardPolicy(graph, enabled, ctx) {
-  const cwd = ctx.trustedCwd;
   for (const command of graph.commands) {
+    const cwds = ctx.cwdsFor(command);
+    const dialect = command.dialect;
     const orgWrite = orgRulesetWrite(command);
     if (orgWrite && enabled('org-ruleset-write')) {
       return {
@@ -793,8 +948,15 @@ function hardPolicy(graph, enabled, ctx) {
     }
     const findSource = find?.deletes ? find : xargsRmSource(command, graph);
     if (findSource && enabled('rm-protected-root')) {
-      const hit = findHitsProtected(findSource, ctx.protectedRoots, cwd);
-      if (hit) {
+      /** @type {{target: TargetWord, evaluation: 'matched'|'unknown'}|null} */
+      let hit = null;
+      const evaluation = acrossCwds(cwds, (directory) => {
+        const found = findHitsProtected(findSource, ctx.protectedRoots, directory);
+        if (found) hit ??= found;
+        return found?.evaluation ?? null;
+      });
+      if (hit && evaluation) {
+        hit = { target: /** @type {{target: TargetWord}} */ (hit).target, evaluation };
         return {
           ruleId: 'rm-protected-root', evaluation: hit.evaluation,
           detail: `${find ? 'find 删除' : 'find | xargs rm 删除'}范围覆盖受保护根目录：${trunc(displayCommand(command))}`,
@@ -815,7 +977,8 @@ function hardPolicy(graph, enabled, ctx) {
       /** @type {{target: {display: string}, evaluation: 'matched'|'unknown'}|null} */
       let hit = null;
       for (const target of targets) {
-        const evaluation = targetHitsProtected(target, ctx.protectedRoots, cwd, { ancestors: true, dynamicMatches: true });
+        const evaluation = acrossCwds(cwds, (directory) =>
+          targetHitsProtected(target, ctx.protectedRoots, directory, { ancestors: true, dynamicMatches: true, dialect }));
         if (evaluation) { hit = { target, evaluation }; if (evaluation === 'matched') break; }
       }
       if (hit && enabled('rm-protected-root')) {
@@ -829,12 +992,38 @@ function hardPolicy(graph, enabled, ctx) {
       }
     }
 
+    // `git worktree remove` deletes the worktree directory, ignored files
+    // included; on a protected root that is a recursive delete.
+    const worktreeGit = parseGitCommand(command);
+    if (worktreeGit?.subcommand === 'worktree' && worktreeGit.args[0] === 'remove' && enabled('rm-protected-root')) {
+      /** @type {TargetWord|null} */
+      let removed = null;
+      const evaluation = acrossCwds(cwds, (directory) => {
+        let result = /** @type {'matched'|'unknown'|null} */ (null);
+        for (const target of relocatingTargets(command, directory)) {
+          // A dynamic target is not judged: worktree remove refuses the main
+          // worktree and only deletes registered linked worktrees.
+          const hit = targetHitsProtected(target, ctx.protectedRoots, target.base, { ancestors: true, dynamicMatches: false, dialect });
+          if (hit) { removed ??= target; result = result === 'matched' ? result : hit; }
+        }
+        return result;
+      });
+      if (evaluation && removed) {
+        return {
+          ruleId: 'rm-protected-root', evaluation,
+          detail: `git worktree remove 删除受保护根目录 ${/** @type {TargetWord} */ (removed).display}`,
+          why: 'worktree remove 会连同未跟踪和被忽略的文件删除整个 worktree 目录；目标是受保护根目录（或无法确定）时等同递归删除它。确需移除请交给用户。',
+        };
+      }
+    }
+
     const rsyncDelete = isCommand(command, 'rsync') && command.argv.some((arg) => typeof arg === 'string' && arg.startsWith('--delete'));
     if (rsyncDelete && enabled('rm-protected-root')) {
       const destination = commandTargets(command).at(-1);
       const remote = typeof destination?.value === 'string' && /^[^/]*:/.test(destination.value);
       const evaluation = destination && !remote
-        ? targetHitsProtected(destination, ctx.protectedRoots, cwd, { ancestors: true, dynamicMatches: true })
+        ? acrossCwds(cwds, (directory) =>
+          targetHitsProtected(destination, ctx.protectedRoots, directory, { ancestors: true, dynamicMatches: true, dialect }))
         : null;
       if (destination && evaluation) {
         return {
@@ -852,7 +1041,8 @@ function hardPolicy(graph, enabled, ctx) {
       const ancestors = rmRecursive || isCommand(command, 'mv');
       const targets = lnForce ? commandTargets(command).slice(-1) : commandTargets(command);
       for (const target of targets) {
-        const evaluation = targetHitsProtected(target, ctx.protectedPaths, cwd, { ancestors, dynamicMatches: false });
+        const evaluation = acrossCwds(cwds, (directory) =>
+          targetHitsProtected(target, ctx.protectedPaths, directory, { ancestors, dynamicMatches: false, dialect }));
         if (!evaluation) continue;
         return {
           ruleId: 'rm-protected-path', evaluation,
@@ -938,6 +1128,21 @@ function relocatingTargets(command, cwd) {
       targets.push({ value: arg, display: arg ?? display[index] ?? '<?>' });
     }
     return at(targets, gitWorkDir(git, cwd));
+  }
+  // `git worktree add <path>` creates a checkout wherever <path> points.
+  if (git?.subcommand === 'worktree' && git.args[0] === 'add') {
+    const display = effectiveDisplayArgv(command).slice(git.argOffset);
+    for (let index = 1; index < git.args.length; index++) {
+      const arg = git.args[index];
+      if (arg === '--') { index++; }
+      else if (typeof arg === 'string' && arg.startsWith('-')) {
+        if (['-b', '-B', '--reason'].includes(arg)) index++;
+        continue;
+      }
+      const value = git.args[index];
+      if (value === undefined) break;
+      return at([{ value, display: value ?? display[index] ?? '<?>' }], gitWorkDir(git, cwd));
+    }
   }
   return [];
 }
@@ -1266,33 +1471,95 @@ export function evaluateHookEvent(event, options = {}) {
   try { return evaluate(event, options); } finally { setCaseInsensitivePaths(previous); }
 }
 
+/** @param {string} operand @param {string|null} base */
+function resolveDirectory(operand, base) {
+  const expanded = operand === '' ? homedir() : expandHome(operand);
+  if (expanded.startsWith('/')) return normalizePath(expanded);
+  return base === null ? null : normalizePath(`${base}/${expanded}`);
+}
+
 /**
- * The directory commands run in after the command's own `cd`s, when that is
- * knowable: no cwd change at all, or only literal `cd`s leading a single
- * `&&` chain (`cd /tmp/x && rm -rf data`). Anything else is untrusted (null).
- * @param {ShellGraph} analysis @param {string|null} cwd
+ * The directory after a run of cds. `-` returns to the previous one, which
+ * before the first cd is the shell's unknown OLDPWD.
+ * @param {Array<string|null>} operands @param {string|null} cwd
  */
-function inferCwd(analysis, cwd) {
-  const changes = analysis.commands.filter((item) => CWD_CHANGING.has(commandName(item)));
-  if (changes.length === 0) return cwd;
-  // Every cd goes to the directory the command already runs in: whether or
-  // not each one succeeds, the cwd stays the same.
-  if (cwd !== null && changes.every((item) => {
-    const operands = item.argv.slice(1).filter((arg) => !(typeof arg === 'string' && /^-[LPe@]+$/.test(arg)));
-    if (commandName(item) !== 'cd' || operands.length !== 1 || typeof operands[0] !== 'string') return false;
-    const target = expandHome(operands[0]);
-    return target.startsWith('/') && normalizePath(target) === cwd;
-  })) return cwd;
-  const prefix = analysis.cdPrefix;
-  if (!prefix || prefix.length !== changes.length || changes.some((item) => commandName(item) !== 'cd')) return null;
+function followOperands(operands, cwd) {
   let current = cwd;
-  for (const operand of prefix) {
-    const expanded = operand === '' ? homedir() : expandHome(operand);
-    if (expanded.startsWith('/')) current = normalizePath(expanded);
-    else if (current === null) return null;
-    else current = normalizePath(`${current}/${expanded}`);
+  /** @type {string|null} */
+  let previous = null;
+  for (const operand of operands) {
+    const next = operand === '-' ? previous : operand === null ? null : resolveDirectory(operand, current);
+    previous = current;
+    current = next;
   }
   return current;
+}
+
+const MAX_CWD_CANDIDATES = 32;
+
+/**
+ * Where each command may run, given the hook cwd and the command's own
+ * directory changes.
+ *
+ * - No change (or every `cd` goes to the cwd itself): the hook cwd.
+ * - Commands that only run once a leading run of `cd`s succeeded (an `&&`
+ *   chain, a subshell, `if cd …; then`) and no other change elsewhere: the
+ *   directory those `cd`s reach.
+ * - Anything else: every directory the script can be in — the hook cwd (a
+ *   `cd` that fails leaves it unchanged) and each `cd` target. A `cd` whose
+ *   operand is not literal adds null (unknown), which is the only case where a
+ *   relative target keeps the common-name exemption.
+ *
+ * `trusted` is the single directory every command runs in, when there is one.
+ * @param {ShellGraph} analysis @param {string|null} cwd
+ * @returns {{trusted: string|null, forCommand: (command: AnalyzedCommand) => Array<string|null>}}
+ */
+function cwdModel(analysis, cwd) {
+  const fixed = { trusted: cwd, forCommand: () => [cwd] };
+  const changes = analysis.commands.filter((item) => CWD_CHANGING.has(commandName(item)));
+  if (changes.length === 0) return fixed;
+  if (cwd !== null && changes.every((item) => {
+    if (!CD_LIKE.has(commandName(item))) return false;
+    const operand = cdArgvOperand(item.argv);
+    return typeof operand === 'string' && operand !== '' && expandHome(operand).startsWith('/') &&
+      normalizePath(expandHome(operand)) === cwd;
+  })) return fixed;
+
+  const prefix = analysis.cdPrefix ?? null;
+  const covers = prefix !== null && prefix.operands.length === changes.length &&
+    changes.every((item) => CD_LIKE.has(commandName(item)));
+  const exactDirectory = covers && prefix ? followOperands(prefix.operands, cwd) : null;
+
+  /** @type {Set<string|null>} */
+  const candidates = new Set([cwd]);
+  let earlier = false;
+  for (const item of changes) {
+    const name = commandName(item);
+    const operand = CD_LIKE.has(name) ? cdArgvOperand(item.argv) : null;
+    if (operand === null || operand === '-') {
+      // `cd -` / `popd` go back to a directory already among the candidates.
+      const back = earlier && (name === 'popd' || operand === '-');
+      if (!back) candidates.add(null);
+    } else {
+      for (const base of [...candidates]) candidates.add(resolveDirectory(operand, base));
+    }
+    earlier = true;
+    if (candidates.size > MAX_CWD_CANDIDATES) { candidates.add(null); break; }
+  }
+  const union = [...candidates];
+  const exact = covers && prefix ? prefix.exact : [];
+  const operands = prefix?.operands ?? [];
+  const allAfterEveryCd = exact.every((entry) => entry.depth === operands.length);
+  return {
+    trusted: covers && prefix?.complete && allAfterEveryCd ? exactDirectory : null,
+    forCommand: (command) => {
+      const offset = command.rootOffset;
+      const entry = typeof offset === 'number'
+        ? exact.find(({ range: [start, end] }) => offset >= start && offset < end)
+        : undefined;
+      return entry ? [followOperands(operands.slice(0, entry.depth), cwd)] : union;
+    },
+  };
 }
 
 /**
@@ -1320,11 +1587,13 @@ function evaluate(event, options) {
   const tier = permissionTier(event.permission_mode ?? event.permissionMode, options.host ?? 'claude');
   const enabled = (/** @type {string} */ ruleId) => isPolicyEnabled(ruleId, profile, tier);
   const cwd = eventCwd(event);
+  const cwds = cwdModel(analysis, cwd);
   /** @type {RuleContext} */
   const ctx = {
     tier,
     cwd,
-    trustedCwd: inferCwd(analysis, cwd),
+    trustedCwd: cwds.trusted,
+    cwdsFor: cwds.forCommand,
     projectDir: typeof options.projectDir === 'string' && options.projectDir.startsWith('/') ? normalizePath(options.projectDir) : null,
     unsandboxed: toolInput.dangerouslyDisableSandbox === true,
     protectedRoots: options.protectedRoots ?? ['/'],

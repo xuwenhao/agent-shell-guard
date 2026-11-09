@@ -257,7 +257,12 @@ test('an untrusted cwd (cd in the command, or none) is strict for names on prote
   assert.equal(evaluate(`cd ${CODEBASE} && rm -rf dotfiles`, { cwd: BARE }).evaluation, 'matched');
   // Otherwise the cwd is unknown: specific names on protected paths are denied...
   assert.equal(evaluate('cd "$X" && rm -rf dotfiles', { cwd: BARE }).evaluation, 'unknown');
-  assert.equal(outcome(evaluate('cd /var/empty; rm -rf dotfiles', { cwd: BARE })), 'deny:rm-protected-root');
+  assert.equal(outcome(evaluate('cd "$X"; rm -rf dotfiles', { cwd: BARE })), 'deny:rm-protected-root');
+  // Literal cds outside an `&&` chain: every directory the script can be in
+  // is checked (the hook cwd if the cd fails, the cd target if it succeeds).
+  assert.equal(outcome(evaluate('cd /var/empty; rm -rf dotfiles', { cwd: BARE })), 'allow');
+  assert.equal(outcome(evaluate(`cd ${CODEBASE}; rm -rf dotfiles`, { cwd: BARE })), 'deny:rm-protected-root');
+  assert.equal(outcome(evaluate('cd /var/empty; rm -rf dotfiles', { cwd: CODEBASE })), 'deny:rm-protected-root');
   assert.equal(outcome(evaluate('rm -rf personal/dotfiles')), 'deny:rm-protected-root');
   assert.equal(outcome(evaluate('cd sub && rm -rf .')), 'deny:rm-protected-root');
   assert.equal(outcome(evaluate('cd "$X" && rm -rf *')), 'deny:rm-protected-root');
