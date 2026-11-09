@@ -20,10 +20,11 @@ const DEFAULT_LAUNCHER_PATH = join(homedir(), '.local', 'bin', 'agent-shell-guar
 /**
  * @typedef {{
  *   mode: GuardMode,
- *   profile: 'full'|'dangerous-only'|'off',
+ *   profile: 'full'|'dangerous-only'|'legacy-dangerous'|'off',
  *   shfmtPath: string,
  *   zshPath?: string,
  *   protectedRoots: string[],
+ *   protectedPaths: string[],
  *   nativePrompt: {codex: boolean, grok: boolean, kimi: boolean},
  *   reviewer: ReviewerConfig|null,
  * }} GuardConfig
@@ -62,6 +63,17 @@ export function resolveShfmtPath(explicit, env = process.env) {
     ?? DEFAULT_MANAGED_SHFMT;
 }
 
+/**
+ * Config-file array plus a comma-separated environment list, `~` expanded.
+ * @param {unknown} configured @param {string|undefined} environment
+ */
+function pathList(configured, environment) {
+  const fromFile = Array.isArray(configured) ? configured.filter((value) => typeof value === 'string') : [];
+  const fromEnv = String(environment ?? '').split(',').map((value) => value.trim()).filter(Boolean);
+  return [...fromFile, ...fromEnv].map((value) =>
+    value === '~' ? homedir() : value.startsWith('~/') ? join(homedir(), value.slice(2)) : value);
+}
+
 /** @param {string|undefined} path @param {NodeJS.ProcessEnv} env */
 function readConfigFile(path, env) {
   const target = path || env.AGENT_SHELL_GUARD_CONFIG || DEFAULT_CONFIG_PATH;
@@ -83,7 +95,9 @@ export function loadConfig(options = {}) {
   const rawMode = env.AGENT_SHELL_GUARD_MODE ?? file.mode;
   const mode = rawMode === 'reviewed' ? 'reviewed' : 'strict';
   const rawProfile = env.AGENT_SHELL_GUARD_PROFILE ?? env.GUARD_BASH_PROFILE ?? file.profile;
-  const profile = rawProfile === 'full' || rawProfile === 'off' ? rawProfile : 'dangerous-only';
+  const profile = rawProfile === 'full' || rawProfile === 'off' || rawProfile === 'legacy-dangerous'
+    ? rawProfile
+    : 'dangerous-only';
   const reviewerValue = isObject(file.reviewer) ? file.reviewer : {};
   const reviewerCommand = env.AGENT_SHELL_GUARD_REVIEWER_COMMAND ??
     (typeof reviewerValue.command === 'string' ? reviewerValue.command : '');
@@ -101,15 +115,8 @@ export function loadConfig(options = {}) {
           : 12_000,
       }
     : null;
-  const configuredRoots = Array.isArray(file.protectedRoots)
-    ? file.protectedRoots.filter((value) => typeof value === 'string')
-    : [];
-  const environmentRoots = String(env.AGENT_SHELL_GUARD_PROTECTED_ROOTS ?? '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
-  const protectedRoots = ['/', homedir(), ...configuredRoots, ...environmentRoots].map((value) =>
-    value === '~' ? homedir() : value.startsWith('~/') ? join(homedir(), value.slice(2)) : value);
+  const protectedRoots = ['/', homedir(), ...pathList(file.protectedRoots, env.AGENT_SHELL_GUARD_PROTECTED_ROOTS)];
+  const protectedPaths = pathList(file.protectedPaths, env.AGENT_SHELL_GUARD_PROTECTED_PATHS);
   const nativePromptValue = isObject(file.nativePrompt) ? file.nativePrompt : {};
 
   return {
@@ -121,6 +128,7 @@ export function loadConfig(options = {}) {
     ),
     zshPath: typeof file.zshPath === 'string' ? file.zshPath : undefined,
     protectedRoots: [...new Set(protectedRoots)],
+    protectedPaths: [...new Set(protectedPaths)],
     nativePrompt: {
       codex: booleanOverride(
         env.AGENT_SHELL_GUARD_NATIVE_PROMPT_CODEX,

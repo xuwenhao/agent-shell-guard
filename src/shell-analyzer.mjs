@@ -20,6 +20,7 @@ const DEFAULT_TIMEOUT_MS = 2_000;
 /** @typedef {'bash'|'posix'|'zsh'} ShellDialect */
 /** @typedef {'top-level'|'shell-c'|'eval'|'command-substitution'|'backtick-substitution'|'process-substitution'} CommandSource */
 /** @typedef {{reason: string, detail: string}} AnalysisUnknown */
+/** @typedef {{op: number, fd: string|null, target: string|null}} AnalyzedRedirection */
 /**
  * @typedef {{
  *   argv: Array<string|null>,
@@ -44,6 +45,7 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   hasSubstitution: boolean,
  *   hasCompound: boolean,
  *   nativePromptArgv: string[]|null,
+ *   redirections: AnalyzedRedirection[],
  * }} ShellGraph
  */
 /** @typedef {{kind: 'script', text: string}|{kind: 'argv', argv: string[]}} ShellInput */
@@ -286,7 +288,7 @@ function failedGraph(reason, detail, dialect) {
   return /** @type {ShellGraph} */ ({
     status: 'unknown', dialect, commands: [], unknowns: [{ reason, detail }],
     hasPipeline: false, hasRedirection: false, hasSubstitution: false,
-    hasCompound: false, nativePromptArgv: null,
+    hasCompound: false, nativePromptArgv: null, redirections: [],
   });
 }
 
@@ -316,6 +318,7 @@ export function analyzeShellInput(input, options) {
       commands: [{ argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 }, wrappers, hasRedirection: false, pipelineGroup: null }],
       unknowns: [], hasPipeline: false, hasRedirection: false, hasSubstitution: false,
       hasCompound: false, nativePromptArgv: wrappers.length ? null : rawArgv,
+      redirections: [],
     };
     const evaluator = shellEvaluator(argv);
     if (!evaluator) return graph;
@@ -350,6 +353,7 @@ export function analyzeShellInput(input, options) {
     graph.hasRedirection = nested.hasRedirection;
     graph.hasSubstitution = nested.hasSubstitution;
     graph.hasCompound = nested.hasCompound;
+    graph.redirections = nested.redirections;
     return graph;
   }
 
@@ -366,7 +370,7 @@ export function analyzeShellInput(input, options) {
   const graph = {
     status: 'safe', dialect, commands: [], unknowns: [], hasPipeline: false,
     hasRedirection: false, hasSubstitution: false, hasCompound: false,
-    nativePromptArgv: null,
+    nativePromptArgv: null, redirections: [],
   };
   let commandCount = 0;
   let pipelineCount = 0;
@@ -431,6 +435,21 @@ export function analyzeShellInput(input, options) {
     }
     if (ast.Stmts.length !== 1) graph.hasCompound = true;
 
+    /** @param {unknown} list */
+    function recordRedirections(list) {
+      if (!Array.isArray(list)) return;
+      for (const redirect of list) {
+        if (!isObject(redirect)) continue;
+        graph.hasRedirection = true;
+        const fd = isObject(redirect.N) && typeof redirect.N.Value === 'string' ? redirect.N.Value : null;
+        graph.redirections.push({
+          op: typeof redirect.Op === 'number' ? redirect.Op : -1,
+          fd,
+          target: redirect.Word ? staticWord(redirect.Word) : null,
+        });
+      }
+    }
+
     /** @param {unknown} node @param {CommandSource} nodeSource @param {number|null} [pipelineGroup] */
     function walk(node, nodeSource, pipelineGroup = null) {
       if (Array.isArray(node)) { for (const item of node) walk(item, nodeSource, pipelineGroup); return; }
@@ -442,7 +461,7 @@ export function analyzeShellInput(input, options) {
         if (words.length === 0) {
           walk(node.Assigns, nodeSource, pipelineGroup);
           if (Array.isArray(node.Redirs) && node.Redirs.length) {
-            graph.hasRedirection = true;
+            recordRedirections(node.Redirs);
             walk(node.Redirs, nodeSource, pipelineGroup);
           }
           return;
@@ -473,7 +492,7 @@ export function analyzeShellInput(input, options) {
         walk(node.Assigns, nodeSource, pipelineGroup);
         walk(node.Args, nodeSource, pipelineGroup);
         if (Array.isArray(node.Redirs) && node.Redirs.length) {
-          graph.hasRedirection = true;
+          recordRedirections(node.Redirs);
           walk(node.Redirs, nodeSource, pipelineGroup);
         }
         return;
@@ -504,7 +523,7 @@ export function analyzeShellInput(input, options) {
 
       for (const [key, value] of Object.entries(node)) {
         if (['Pos', 'End', 'Position', 'ValuePos', 'ValueEnd', 'Left', 'Right', 'OpPos', 'Rparen'].includes(key)) continue;
-        if (key === 'Redirs' && Array.isArray(value) && value.length) graph.hasRedirection = true;
+        if (key === 'Redirs' && Array.isArray(value) && value.length) recordRedirections(value);
         walk(value, nodeSource, pipelineGroup);
       }
     }

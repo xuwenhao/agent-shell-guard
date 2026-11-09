@@ -4,10 +4,40 @@
 // Shell syntax is parsed by the pinned shfmt AST analyzer. Policy rules only
 // inspect normalized command argv or one already-parsed data argument; they do
 // not infer quoting, command boundaries, or evaluator semantics with regex.
+// Path comparisons are lexical (the hook `cwd` is joined literally); the only
+// filesystem access is the read-only project inspection in ./project.mjs,
+// used for bypass-mode checks and for spotting a thin project root.
 
-import { basename } from 'node:path';
 import { analyzeShellInput, selectShellDialect } from './shell-analyzer.mjs';
-import { isPolicyEnabled, resolvePolicyProfile } from './policies/profiles.mjs';
+import { isPolicyEnabled, permissionTier, resolvePolicyProfile } from './policies/profiles.mjs';
+import {
+  commandName,
+  commandTargets,
+  displayCommand,
+  effectiveDisplayArgv,
+  gitConfigIsRead,
+  githubApiPath,
+  gitPositionals,
+  hasFlag,
+  hasRecursiveFlag,
+  isCommand,
+  isLongOption,
+  isOrgRulesetEndpoint,
+  parseGhApi,
+  parseGitCommand,
+  shortOptionHas,
+} from './command-utils.mjs';
+import {
+  expandHome,
+  globCovers,
+  lastSegment,
+  normalizePath,
+  parseGlobTarget,
+  resolveTarget,
+  targetCovers,
+} from './path-targets.mjs';
+import { inspectDirectory, memoizeInspector } from './project.mjs';
+import { isExcludedCommandGraph, isReadOnlyGraph } from './write-class.mjs';
 
 /** @param {string} value @param {number} [length] */
 const trunc = (value, length = 160) => value.length > length ? `${value.slice(0, length)}…` : value;
@@ -17,94 +47,21 @@ const trunc = (value, length = 160) => value.length > length ? `${value.slice(0,
 /** @typedef {Parameters<typeof analyzeShellInput>[0]} ShellInput */
 /** @typedef {(ruleId: string) => boolean} PolicyEnabled */
 /** @typedef {{ruleId: string, evaluation: 'matched'|'unknown', detail: string, why: string}} PolicyMatch */
-
-/** @param {AnalyzedCommand} command */
-function effectiveDisplayArgv(command) {
-  const offset = Math.max(0, command.rawArgv.length - command.argv.length);
-  const raw = command.displayArgv.slice(offset);
-  return command.argv.map((arg, index) => arg ?? raw[index] ?? '<?>');
-}
-
-/** @param {AnalyzedCommand} command */
-const displayCommand = (command) => effectiveDisplayArgv(command).join(' ');
-
-/** @param {AnalyzedCommand} command */
-const commandName = (command) => typeof command.argv[0] === 'string' ? basename(command.argv[0]) : '';
-
-/** @param {AnalyzedCommand} command @param {string} name */
-const isCommand = (command, name) => commandName(command) === name;
-
-/** @param {Array<string|null>} argv @param {string} flag */
-function hasFlag(argv, flag) {
-  return argv.some((arg) => arg === flag || (typeof arg === 'string' && arg.startsWith(`${flag}=`)));
-}
-
-/** @param {Array<string|null>} argv */
-function hasRecursiveFlag(argv) {
-  return argv.slice(1).some((arg) => typeof arg === 'string' && (arg === '--recursive' || /^-[^-]*[rR]/.test(arg)));
-}
-
-/** @param {AnalyzedCommand} command */
-function commandTargets(command) {
-  /** @type {Array<{value: string|null, display: string}>} */
-  const targets = [];
-  const display = effectiveDisplayArgv(command);
-  let options = true;
-  for (let index = 1; index < command.argv.length; index++) {
-    const arg = command.argv[index];
-    if (options && arg === '--') { options = false; continue; }
-    if (options && typeof arg === 'string' && arg.startsWith('-')) continue;
-    targets.push({ value: arg, display: arg ?? display[index] ?? '<?>' });
-  }
-  return targets;
-}
-
+/** @typedef {import('./project.mjs').ProjectInfo} ProjectInfo */
 /**
- * Lexically collapse `.` and `..` before any protected-root comparison, so
- * `rm -rf /tmp/../root` is recognised as hitting `/root`. Purely lexical on
- * purpose — a PreToolUse hook must not touch the filesystem — which is also the
- * conservative direction, since it can only make more paths match a root.
- * @param {string} value
+ * @typedef {{
+ *   tier: import('./policies/profiles.mjs').PermissionTier,
+ *   cwd: string|null,
+ *   trustedCwd: string|null,
+ *   unsandboxed: boolean,
+ *   protectedRoots: string[],
+ *   protectedPaths: string[],
+ *   inspect: (directory: string) => ProjectInfo,
+ * }} RuleContext
  */
-function normalizeProtectedRoot(value) {
-  const trimmed = value.replace(/\/\*{1,2}$/, '').replace(/\/+$/, '') || '/';
-  const absolute = trimmed.startsWith('/');
-  /** @type {string[]} */
-  const stack = [];
-  for (const segment of trimmed.split('/')) {
-    if (segment === '' || segment === '.') continue;
-    if (segment === '..') {
-      if (stack.length && stack[stack.length - 1] !== '..') stack.pop();
-      else if (!absolute) stack.push('..');
-      continue;
-    }
-    stack.push(segment);
-  }
-  return absolute ? `/${stack.join('/')}`.replace(/\/$/, '') || '/' : stack.join('/') || '.';
-}
 
-/** @param {string} value @param {string[]} protectedRoots */
-function isProtectedRoot(value, protectedRoots) {
-  const normalized = normalizeProtectedRoot(value);
-  return protectedRoots.some((root) => normalizeProtectedRoot(root) === normalized);
-}
-
-/** @param {string} display @param {string[]} protectedRoots */
-function unknownTargetMayBeProtected(display, protectedRoots) {
-  if (/[`$]|<\(|>\(/.test(display)) return true;
-  let escaped = false;
-  let expansion = -1;
-  for (let index = 0; index < display.length; index++) {
-    if (escaped) { escaped = false; continue; }
-    if (display[index] === '\\') { escaped = true; continue; }
-    if (display[index] === '*' || display[index] === '?' || display[index] === '[') { expansion = index; break; }
-  }
-  if (expansion >= 0) {
-    const prefix = display.slice(0, expansion).replace(/\/+$/, '') || (display.startsWith('/') ? '/' : '.');
-    return isProtectedRoot(prefix, protectedRoots);
-  }
-  return true;
-}
+const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
+const CWD_CHANGING = new Set(['cd', 'pushd', 'popd', 'source', '.']);
 
 /** @param {string} value */
 function isProtectedRef(value) {
@@ -112,107 +69,66 @@ function isProtectedRef(value) {
   return /^(?:refs\/heads\/)?(?:main|master)$/.test(ref) || /:(?:refs\/heads\/)?(?:main|master)$/.test(ref);
 }
 
-/** @param {AnalyzedCommand} command */
-function parseGitCommand(command) {
-  if (!isCommand(command, 'git')) return null;
-  const valueFlags = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env']);
-  let index = 1;
-  for (; index < command.argv.length; index++) {
-    const arg = command.argv[index];
-    if (arg === '--') { index++; break; }
-    if (typeof arg !== 'string') return null;
-    if (!arg.startsWith('-')) break;
-    if (valueFlags.has(arg)) index++;
+/**
+ * A branch operand that may name the trunk: main/master themselves, plus
+ * reflog-relative spellings (`-`, `@{-1}`, `main@{yesterday}`) that resolve to
+ * whatever was checked out before.
+ * @param {string|null|undefined} value
+ */
+function mayNameTrunk(value) {
+  if (typeof value !== 'string') return true;
+  if (value === '-' || value.startsWith('@{')) return true;
+  return TRUNK_REF.test(value.replace(/@\{.*$/, ''));
+}
+
+// --- path targets ------------------------------------------------------------
+
+/**
+ * @param {{value: string|null, display: string}} target
+ * @param {string[]} paths
+ * @param {string|null} cwd trusted cwd
+ * @param {{ancestors: boolean, dynamicMatches: boolean}} options
+ * @returns {'matched'|'unknown'|null}
+ */
+function targetHitsProtected(target, paths, cwd, options) {
+  if (target.value !== null) {
+    const resolved = resolveTarget(target.value, cwd);
+    if (!paths.some((path) => targetCovers(resolved, path, { ancestors: options.ancestors }))) return null;
+    return resolved.kind === 'absolute' ? 'matched' : 'unknown';
   }
-  const subcommand = command.argv[index];
-  if (typeof subcommand !== 'string') return null;
-  return { subcommand, args: command.argv.slice(index + 1), argOffset: index + 1 };
+  const glob = parseGlobTarget(target.display, cwd);
+  if (glob === null) return options.dynamicMatches ? 'unknown' : null;
+  return paths.some((path) => globCovers(glob, path)) ? 'unknown' : null;
 }
 
-/** @param {AnalyzedCommand} command */
-function hardResetOriginRef(command) {
-  const git = parseGitCommand(command);
-  if (git?.subcommand !== 'reset' || !hasFlag(git.args, '--hard')) return null;
-  // 只对用户明确配置的 origin/<ref> 做 main/非 main 分流；其他 ref 仍按通用高风险 reset 处理。
-  return git.args.find((arg) => typeof arg === 'string' && /^origin\//.test(arg)) ?? null;
-}
-
-/** @param {AnalyzedCommand} command */
-function forcePush(command) {
-  const git = parseGitCommand(command);
-  if (git?.subcommand !== 'push') return false;
-  const display = effectiveDisplayArgv(command).slice(git.argOffset);
-  return git.args.some((arg, index) => {
-    const token = arg ?? display[index] ?? '';
-    return isLongOption(token, '--force') || isLongOption(token, '--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
-  });
-}
-
-/** @param {AnalyzedCommand} command */
-function pushRefs(command) {
-  const git = parseGitCommand(command);
-  if (git?.subcommand !== 'push') return [];
-  const display = effectiveDisplayArgv(command).slice(git.argOffset);
-  const valueFlags = new Set(['--repo', '--receive-pack', '--exec', '--push-option', '-o']);
-  /** @type {Array<{value: string|null, display: string}>} */
-  const positionals = [];
-  let options = true;
-  for (let index = 0; index < git.args.length; index++) {
-    const arg = git.args[index];
-    const token = arg ?? display[index] ?? '<?>';
-    if (options && token === '--') { options = false; continue; }
-    if (options && token.startsWith('-')) {
-      if (valueFlags.has(token)) index++;
-      continue;
-    }
-    positionals.push({ value: arg, display: token });
-  }
-  return positionals.slice(1);
+/** @param {{value: string|null, display: string}} target */
+function targetIsGitDir(target) {
+  if (target.value !== null) return lastSegment(resolveTarget(target.value, null)) === '.git';
+  const text = target.display.replace(/["']/g, '').replace(/\/+$/, '');
+  const segments = text.split('/');
+  return segments[segments.length - 1] === '.git' ||
+    (segments.length > 1 && segments[segments.length - 2] === '.git' && /[*?[]/.test(segments[segments.length - 1]));
 }
 
 /**
- * Git accepts any unambiguous prefix of a long option, so `git worktree remove
- * --for` is a forced removal and `git branch --del` is a deletion. Matching by
- * prefix can only put *more* commands in the destructive class, which is the
- * safe direction — an abbreviation that is actually ambiguous makes git itself
- * refuse the command. The flags that *loosen* a classification (checkout's ref
- * intent) deliberately keep their exact spelling: an abbreviation there simply
- * fails to loosen, which is conservative in the same direction.
- * @param {string|null|undefined} arg @param {string} option
+ * Resolve the directory a git command runs in: the trusted cwd, then each
+ * `-C`. `--git-dir`/`--work-tree` make the target unknowable.
+ * @param {NonNullable<ReturnType<typeof parseGitCommand>>} git @param {string|null} cwd
  */
-function isLongOption(arg, option) {
-  if (typeof arg !== 'string' || !arg.startsWith('--') || arg.length < 3) return false;
-  const name = arg.split('=')[0];
-  return option.startsWith(name);
-}
-
-/** @param {string|null} arg @param {RegExp} letters */
-function shortOptionHas(arg, letters) {
-  return typeof arg === 'string' && /^-[^-]/.test(arg) && letters.test(arg.slice(1));
-}
-
-/**
- * Positional arguments of a git subcommand.
- * @param {{args: Array<string|null>}} git
- * @param {Set<string>} [valueFlags]
- */
-function gitPositionals(git, valueFlags = new Set()) {
-  /** @type {Array<string|null>} */
-  const positionals = [];
-  let options = true;
-  for (let index = 0; index < git.args.length; index++) {
-    const arg = git.args[index];
-    if (options && arg === '--') { options = false; continue; }
-    if (options && typeof arg === 'string' && arg.startsWith('-')) {
-      if (valueFlags.has(arg)) index++;
-      continue;
-    }
-    positionals.push(arg);
+function gitWorkDir(git, cwd) {
+  if (git.gitDirOverride) return null;
+  let directory = cwd;
+  for (const value of git.workDirs) {
+    if (value === null) return null;
+    const expanded = expandHome(value);
+    if (expanded.startsWith('/')) directory = normalizePath(expanded);
+    else if (directory === null) return null;
+    else directory = normalizePath(`${directory}/${expanded}`);
   }
-  return positionals;
+  return directory;
 }
 
-const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
+// --- git classification ------------------------------------------------------
 
 /**
  * Split checkout's argv the way git does. Short options cluster (`-qB`) and may
@@ -271,61 +187,50 @@ function parseCheckoutArgs(git) {
 /**
  * `git checkout` is two commands under one name: switching or creating a branch
  * (cheap, reversible) and restoring paths from a tree-ish (silently discards
- * edits). Only the second needs a human. A lone positional can be either, and
- * nothing in the argv settles it, so it stays destructive unless an explicit
- * branch-intent flag says otherwise.
+ * edits). A lone positional can be either, and nothing in the argv settles it,
+ * so it stays a discard unless an explicit branch-intent flag says otherwise.
+ * `-B` resets an existing branch tip: trunk (or unresolvable) targets are
+ * `git-trunk-ref`, others `git-ref-change`.
  * @param {{args: Array<string|null>}} git
- * @returns {'git-destructive'|'git-low-risk'|null}
+ * @returns {'git-discard'|'git-trunk-ref'|'git-ref-change'|'git-low-risk'|null}
  */
 function checkoutRule(git) {
-  if (git.args.some((arg) => arg === null)) return 'git-destructive';
   const parsed = parseCheckoutArgs(git);
-  if (parsed.flags.includes('--')) return 'git-destructive';
+  if (parsed.forceCreate && mayNameTrunk(parsed.createTarget)) return 'git-trunk-ref';
+  if (git.args.some((arg) => arg === null)) return 'git-discard';
+  if (parsed.flags.includes('--')) return 'git-discard';
   // `--pathspec-from-file <file>` restores every path listed in the file, which
   // is a working-tree discard with no positional argument to notice it by.
-  if (parsed.flags.some((flag) => isLongOption(flag, '--pathspec-from-file'))) return 'git-destructive';
+  if (parsed.flags.some((flag) => isLongOption(flag, '--pathspec-from-file'))) return 'git-discard';
   const forceish = parsed.flags.some((flag) =>
     ['--force', '--ours', '--theirs', '--merge', '--conflict', '--patch', '--overwrite-ignore',
       '--no-detach', '--no-orphan']
       .some((option) => isLongOption(flag, option))) ||
     parsed.letters.some((letter) => 'fmp23'.includes(letter));
-  if (forceish) return 'git-destructive';
-  if (parsed.positionals.some((value) => value === '.' || value === null)) return 'git-destructive';
+  if (forceish) return 'git-discard';
+  if (parsed.positionals.some((value) => value === '.' || value === null)) return 'git-discard';
   // Git expands pathspecs itself, so `git checkout '*.txt'` overwrites matching
-  // modified files even though no file literally named `*.txt` exists — an
-  // existence probe alone would wave it through as a branch name. Refs cannot
-  // contain glob metacharacters, and a leading `:` is pathspec magic.
+  // modified files even though no file literally named `*.txt` exists. Refs
+  // cannot contain glob metacharacters, and a leading `:` is pathspec magic.
   if (parsed.positionals.some((value) => typeof value === 'string' && (/[*?[\]]/.test(value) || value.startsWith(':')))) {
-    return 'git-destructive';
+    return 'git-discard';
   }
   if (parsed.createTarget !== undefined) {
-    // Every -B can discard an existing branch tip, including literal non-trunk
-    // names. Narrow native prefixes cannot cover attached/bundled forms, so all
-    // force-creation remains destructive and uncovered variants fail closed.
-    if (parsed.forceCreate) return 'git-destructive';
+    if (parsed.forceCreate) return 'git-ref-change';
     return 'git-low-risk';
   }
   if (parsed.positionals.length === 0) return 'git-low-risk';
-  if (parsed.positionals.length > 1) return 'git-destructive';
+  if (parsed.positionals.length > 1) return 'git-discard';
   // A lone operand is genuinely ambiguous — git resolves it against both refs and
-  // paths. Filesystem existence cannot settle it either way: a tracked file that
-  // has been deleted is still a valid pathspec (`git checkout tracked.txt`
-  // restores it and discards the deletion) while `existsSync` says no, and with
-  // `git -C <dir>` the probe would be looking in the wrong directory anyway. So
-  // only an explicit branch-intent flag makes this a plain switch.
-  // Only flags git itself refuses to pair with a path count as branch intent —
-  // verified on git 2.43: `--detach`/`-d` and `--track`/`--no-track`/`-t` all
-  // error out on `git checkout <flag> tracked.txt`. `--guess`/`--no-guess` do
-  // not: they only change how a *nonexistent* branch name is second-guessed, and
-  // `git checkout --guess tracked.txt` happily discards the file's edits.
+  // paths, and a deleted tracked file is still a valid pathspec. Only flags git
+  // itself refuses to pair with a path count as branch intent (verified on git
+  // 2.43: `--detach`/`-d` and `--track`/`--no-track`/`-t`).
   const refIntent = ['--detach', '--track', '--no-track'];
-  // `-d` is checkout's short `--detach` (in `git branch` the same letter means
-  // `--delete`, which is why this lives in the checkout rule).
   if (parsed.flags.some((flag) => refIntent.includes(flag)) ||
       parsed.letters.some((letter) => letter === 't' || letter === 'd')) {
     return 'git-low-risk';
   }
-  return 'git-destructive';
+  return 'git-discard';
 }
 
 /** Only explicit, fully static dry-run argv is read-only. Do not infer values
@@ -360,74 +265,153 @@ function cleanIsDryRun(command, args) {
   return dryRun;
 }
 
-/** @param {AnalyzedCommand} command @returns {'git-destructive'|'git-low-risk'|null} */
-function destructiveGitRule(command) {
+/**
+ * Operand of a short option that takes one (`-B name`, `-Bname`, `-qBname`).
+ * @param {Array<string|null>} args @param {string} letter
+ * @returns {string|null|undefined} undefined when the option is absent
+ */
+function shortOperand(args, letter) {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (typeof arg !== 'string' || !/^-[^-]/.test(arg)) continue;
+    const position = arg.indexOf(letter, 1);
+    if (position < 0) continue;
+    const attached = arg.slice(position + 1);
+    return attached !== '' ? attached : args[index + 1] ?? null;
+  }
+  return undefined;
+}
+
+/**
+ * Fine-grained git classification. Returns the rule id or null.
+ * @param {AnalyzedCommand} command
+ * @returns {'git-discard'|'git-trunk-ref'|'git-ref-change'|'git-config-global'|'git-lfs'|'git-exec'|'git-push-bulk'|'git-low-risk'|null}
+ */
+function gitRule(command) {
   const git = parseGitCommand(command);
   if (!git) return null;
   const { subcommand, args } = git;
 
-  if (subcommand === 'clean') return cleanIsDryRun(command, args) ? null : 'git-destructive';
-  if (['reset', 'restore', 'rm'].includes(String(subcommand))) return 'git-destructive';
+  if (subcommand === 'clean') return cleanIsDryRun(command, args) ? null : 'git-discard';
+  if (['reset', 'restore', 'rm'].includes(subcommand)) return 'git-discard';
   if (subcommand === 'checkout') return checkoutRule(git);
-  // `git worktree remove` stays destructive whatever the path looks like. Git
-  // follows a symlinked path to the real worktree, and it deletes gitignored
-  // files (`.env`, `.venv`) even without `--force` — both verified on git 2.43 —
-  // so nothing in the argv proves where the removal lands or what it discards,
-  // and this guard has no filesystem access to find out.
   if (subcommand === 'worktree') {
-    return args[0] === 'remove' || (args[0] === 'add' && args.slice(1).some((arg) => shortOptionHas(arg, /B/)))
-      ? 'git-destructive' : null;
-  }
-  if (subcommand === 'stash') return args[0] === 'drop' || args[0] === 'clear' ? 'git-destructive' : null;
-  if (subcommand === 'config') return args.some((arg) => isLongOption(arg, '--global') || isLongOption(arg, '--system')) ? 'git-destructive' : null;
-  if (subcommand === 'branch') {
-    // `-d` refuses to delete an unmerged branch, so it can only drop a ref whose
-    // commits are reachable elsewhere — not the same class of action as
-    // force-renaming or -moving. `-D` has no such guard: it deletes unmerged
-    // work, and it deletes the branch's own reflog with it (the commits usually
-    // survive in HEAD's reflog, but a branch only ever committed to inside a
-    // worktree that has since been removed loses that too), so it stays a
-    // confirm.
-    const forced = args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /[DfMC]/));
-    if (forced) return 'git-destructive';
-    if (args.some((arg) => isLongOption(arg, '--delete') || shortOptionHas(arg, /d/))) {
-      const targets = gitPositionals(git, new Set(['--contains', '--no-contains', '--merged', '--no-merged', '-u', '--set-upstream-to']));
-      const unresolved = targets.some((value) => value === null);
-      const trunk = targets.some((value) => typeof value === 'string' && TRUNK_REF.test(value));
-      return unresolved || trunk ? 'git-destructive' : 'git-low-risk';
+    if (args[0] === 'remove') {
+      return args.slice(1).some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /f/)) ? 'git-discard' : 'git-ref-change';
+    }
+    if (args[0] === 'add') {
+      const target = shortOperand(args.slice(1), 'B');
+      if (target === undefined) return null;
+      return mayNameTrunk(target) ? 'git-trunk-ref' : 'git-ref-change';
     }
     return null;
   }
+  if (subcommand === 'stash') return args[0] === 'drop' || args[0] === 'clear' ? 'git-discard' : null;
+  if (subcommand === 'config') {
+    if (!args.some((arg) => isLongOption(arg, '--global') || isLongOption(arg, '--system'))) return null;
+    return gitConfigIsRead(git) ? null : 'git-config-global';
+  }
+  if (subcommand === 'branch') {
+    const forced = args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /[DfMC]/));
+    const deleting = args.some((arg) => isLongOption(arg, '--delete') || shortOptionHas(arg, /d/));
+    if (!forced && !deleting) return null;
+    const targets = gitPositionals(git, new Set(['--contains', '--no-contains', '--merged', '--no-merged', '-u', '--set-upstream-to']));
+    const trunk = targets.some((value) => value === null || TRUNK_REF.test(value));
+    if (trunk) return 'git-trunk-ref';
+    // `-d` refuses to delete an unmerged branch; -D/-M/-C/-f on a non-trunk ref
+    // are recoverable from the reflog.
+    return forced ? 'git-ref-change' : 'git-low-risk';
+  }
   if (subcommand === 'tag') {
     const force = args.some((arg) => isLongOption(arg, '--force') || shortOptionHas(arg, /f/));
-    if (force) return 'git-destructive';
+    if (force) return 'git-discard';
     return args.some((arg) => arg === '--delete' || shortOptionHas(arg, /d/)) ? 'git-low-risk' : null;
   }
   if (subcommand === 'switch') {
-    const highRisk = args.some((arg) => isLongOption(arg, '--discard-changes') || isLongOption(arg, '--force') || isLongOption(arg, '--force-create') ||
-      shortOptionHas(arg, /[Cf]/));
-    if (highRisk) return 'git-destructive';
+    const forceCreate = args.some((arg) => isLongOption(arg, '--force-create')) ? (gitPositionals(git)[0] ?? null) : shortOperand(args, 'C');
+    if (forceCreate !== undefined && mayNameTrunk(forceCreate)) return 'git-trunk-ref';
+    if (args.some((arg) => isLongOption(arg, '--discard-changes') || isLongOption(arg, '--force') || shortOptionHas(arg, /f/))) return 'git-discard';
+    if (forceCreate !== undefined) return 'git-ref-change';
     return args.some((arg) => shortOptionHas(arg, /d/)) ? 'git-low-risk' : null;
   }
   if (subcommand === 'submodule') {
     const action = args.find((arg) => typeof arg === 'string' && !arg.startsWith('-'));
-    if (action === 'foreach') return 'git-destructive';
+    if (action === 'foreach') return 'git-exec';
     return action === 'deinit' ? 'git-low-risk' : null;
   }
   if (subcommand === 'lfs') {
     const action = args.find((arg) => typeof arg === 'string' && !arg.startsWith('-'));
-    return ['install', 'migrate', 'uninstall', 'prune'].includes(String(action)) ? 'git-destructive' : null;
+    if (['install', 'migrate', 'uninstall'].includes(String(action))) return 'git-lfs';
+    return action === 'prune' ? 'git-ref-change' : null;
   }
   if (subcommand === 'rebase') {
     return args.some((arg) => isLongOption(arg, '--exec') ||
-      isLongOption(arg, '--reschedule-failed-exec') || shortOptionHas(arg, /x/)) ? 'git-destructive' : null;
+      isLongOption(arg, '--reschedule-failed-exec') || shortOptionHas(arg, /x/)) ? 'git-exec' : null;
   }
   if (subcommand === 'push') {
+    if (args.some((arg) => isLongOption(arg, '--mirror') || isLongOption(arg, '--prune'))) return 'git-push-bulk';
     return args.some((arg) =>
-      isLongOption(arg, '--delete') || isLongOption(arg, '--mirror') || isLongOption(arg, '--prune') ||
-      shortOptionHas(arg, /d/) || (typeof arg === 'string' && /^\+?:\S+/.test(arg))) ? 'git-destructive' : null;
+      isLongOption(arg, '--delete') || shortOptionHas(arg, /d/) || (typeof arg === 'string' && /^\+?:\S+/.test(arg)))
+      ? 'git-ref-change' : null;
   }
   return null;
+}
+
+/** @param {AnalyzedCommand} command */
+function hardResetRef(command) {
+  const git = parseGitCommand(command);
+  if (git?.subcommand !== 'reset' || !hasFlag(git.args, '--hard')) return null;
+  return git.args.find((arg) => typeof arg === 'string' && !arg.startsWith('-')) ?? null;
+}
+
+/** @param {AnalyzedCommand} command */
+function forcePush(command) {
+  const git = parseGitCommand(command);
+  if (git?.subcommand !== 'push') return false;
+  const display = effectiveDisplayArgv(command).slice(git.argOffset);
+  return git.args.some((arg, index) => {
+    const token = arg ?? display[index] ?? '';
+    return isLongOption(token, '--force') || isLongOption(token, '--force-with-lease') || shortOptionHas(token, /f/) || /^\+\S+/.test(token);
+  });
+}
+
+/** @param {AnalyzedCommand} command @returns {Array<{value: string|null, display: string}>} */
+function pushPositionals(command) {
+  const git = parseGitCommand(command);
+  if (git?.subcommand !== 'push') return [];
+  const display = effectiveDisplayArgv(command).slice(git.argOffset);
+  const valueFlags = new Set(['--repo', '--receive-pack', '--exec', '--push-option', '-o']);
+  /** @type {Array<{value: string|null, display: string}>} */
+  const positionals = [];
+  let options = true;
+  for (let index = 0; index < git.args.length; index++) {
+    const arg = git.args[index];
+    const token = arg ?? display[index] ?? '<?>';
+    if (options && token === '--') { options = false; continue; }
+    if (options && token.startsWith('-')) {
+      if (valueFlags.has(token)) index++;
+      continue;
+    }
+    positionals.push({ value: arg, display: token });
+  }
+  return positionals;
+}
+
+/** @param {AnalyzedCommand} command */
+const pushRefs = (command) => pushPositionals(command).slice(1);
+
+/** @param {AnalyzedCommand} command @returns {'matched'|'unknown'|null} */
+function pushDeletesTrunk(command) {
+  const git = parseGitCommand(command);
+  if (git?.subcommand !== 'push') return null;
+  if (git.args.some((arg) => isLongOption(arg, '--dry-run') || shortOptionHas(arg, /n/))) return null;
+  const emptySource = /^\+?:(?:refs\/heads\/)?(?:main|master)$/;
+  if (pushPositionals(command).some((ref) => typeof ref.value === 'string' && emptySource.test(ref.value))) return 'matched';
+  const deleting = git.args.some((arg) => isLongOption(arg, '--delete') || shortOptionHas(arg, /d/));
+  if (!deleting) return null;
+  const refs = pushRefs(command);
+  if (refs.some((ref) => typeof ref.value === 'string' && TRUNK_REF.test(ref.value.replace(/^\+/, '')))) return 'matched';
+  return refs.some((ref) => ref.value === null) ? 'unknown' : null;
 }
 
 /** @param {AnalyzedCommand} command */
@@ -448,78 +432,108 @@ function parseSsh(command) {
   return { host: '(未解析出主机)', rest: '' };
 }
 
-const ORG_RULESET_PATH = /^\/?orgs\/[^/\s]+\/rulesets(?:\/|$)/;
-
-/**
- * `gh api` takes either a path (`orgs/x/rulesets`) or a full URL, and a URL has
- * many spellings that reach the same endpoint: `HTTPS://API.GITHUB.COM/…`, an
- * explicit `:443`, a trailing dot on the host. Case-folding the host and
- * dropping the default port before matching closes those (all verified against
- * gh 2.96). Anything that does not parse as a URL is matched as a path.
- * @param {string} value
- */
-function isOrgRulesetEndpoint(value) {
-  if (!/^https?:\/\//i.test(value)) return ORG_RULESET_PATH.test(value);
-  let url;
-  try { url = new URL(value); } catch { return ORG_RULESET_PATH.test(value); }
-  const host = url.hostname.toLowerCase().replace(/\.$/, '');
-  if (host !== 'api.github.com') return false;
-  if (url.port !== '' && url.port !== '443') return false;
-  return ORG_RULESET_PATH.test(url.pathname);
-}
+// --- gh api ------------------------------------------------------------------
 
 /** @param {AnalyzedCommand} command @returns {{kind: 'matched'|'unknown', endpoint: string}|null} */
 function orgRulesetWrite(command) {
-  if (!isCommand(command, 'gh') || command.argv[1] !== 'api') return null;
-  const args = command.argv.slice(2);
-  const display = effectiveDisplayArgv(command).slice(2);
-  const tokens = args.map((arg, index) => arg ?? display[index] ?? '<?>');
-  const endpointValueFlags = new Set(['-X', '--method', '-f', '-F', '--field', '--raw-field', '--input', '-H', '--header', '--preview', '--cache']);
-  /** @type {{value: string|null, display: string}|null} */
-  let endpointInfo = null;
-  for (let index = 0; index < args.length; index++) {
-    const token = tokens[index];
-    if (token === '--') {
-      index++;
-      endpointInfo = index < args.length ? { value: args[index], display: tokens[index] } : null;
-      break;
-    }
-    if (token.startsWith('-')) {
-      if (endpointValueFlags.has(token)) index++;
-      continue;
-    }
-    endpointInfo = { value: args[index], display: token };
-    break;
-  }
-  const endpoint = typeof endpointInfo?.value === 'string' && isOrgRulesetEndpoint(endpointInfo.value)
-    ? endpointInfo.value
+  const api = parseGhApi(command);
+  if (!api) return null;
+  const endpoint = typeof api.endpoint?.value === 'string' && isOrgRulesetEndpoint(api.endpoint.value)
+    ? api.endpoint.value
     : null;
-  const fieldWrite = tokens.some((arg) =>
-    arg === '-f' || arg === '-F' || arg === '--field' || arg.startsWith('--field=') ||
-    arg === '--raw-field' || arg.startsWith('--raw-field=') || arg === '--input' || arg.startsWith('--input='));
-  let method = '';
-  let methodUnknown = false;
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    const token = tokens[index];
-    if (token === '-X' || token === '--method') {
-      const value = args[index + 1];
-      if (value === null || value === undefined) methodUnknown = true;
-      else if (typeof value === 'string') method = value;
-    } else if (token.startsWith('--method=') || (token.startsWith('-X') && token !== '-X')) {
-      if (arg === null) methodUnknown = true;
-      else method = token.startsWith('--method=') ? token.slice('--method='.length) : token.slice(2);
-    }
-  }
-  const write = fieldWrite || /^(?:PUT|POST|PATCH|DELETE)$/i.test(method);
-  const unknownEndpoint = endpointInfo?.value === null;
+  const write = api.fieldWrite || /^(?:PUT|POST|PATCH|DELETE)$/.test(api.method);
+  const unknownEndpoint = api.endpoint?.value === null;
   if (endpoint && write) return { kind: 'matched', endpoint };
-  if ((endpoint && methodUnknown) || (unknownEndpoint && (write || methodUnknown || fieldWrite))) return { kind: 'unknown', endpoint: endpoint ?? '<?>' };
+  if ((endpoint && api.methodUnknown) || (unknownEndpoint && (write || api.methodUnknown))) return { kind: 'unknown', endpoint: endpoint ?? '<?>' };
   return null;
 }
 
-/** @param {ShellGraph} graph @param {PolicyEnabled} enabled @param {string[]} protectedRoots @returns {PolicyMatch|null} */
-function hardPolicy(graph, enabled, protectedRoots) {
+const REPO_PATH = String.raw`repos/[^/]+/[^/]+`;
+const PROTECTED_DELETE_ENDPOINTS = [
+  new RegExp(`^${REPO_PATH}$`),
+  new RegExp(`^${REPO_PATH}/rulesets(?:/|$)`),
+  new RegExp(`^${REPO_PATH}/branches/[^/]+/protection(?:/|$)`),
+  new RegExp(`^${REPO_PATH}/git/refs/heads/(?:main|master)$`),
+];
+const SENSITIVE_DELETE_ENDPOINTS = [
+  new RegExp(`^(?:${REPO_PATH}|orgs/[^/]+)/(?:keys|hooks|actions/secrets|environments)(?:/|$)`),
+  /^user\/(?:keys|gpg_keys|ssh_signing_keys)(?:\/|$)/,
+];
+
+/**
+ * @param {AnalyzedCommand} command
+ * @returns {{level: 'protected'|'sensitive'|'other', evaluation: 'matched'|'unknown', endpoint: string}|null}
+ */
+function ghApiDelete(command) {
+  const api = parseGhApi(command);
+  if (!api) return null;
+  const isDelete = api.method === 'DELETE';
+  if (!isDelete && !api.methodUnknown) return null;
+  const value = api.endpoint?.value;
+  if (typeof value !== 'string') return null;
+  const path = githubApiPath(value);
+  if (path === null) return null;
+  if (PROTECTED_DELETE_ENDPOINTS.some((pattern) => pattern.test(path))) {
+    return { level: 'protected', evaluation: isDelete ? 'matched' : 'unknown', endpoint: value };
+  }
+  if (!isDelete) return null;
+  const level = SENSITIVE_DELETE_ENDPOINTS.some((pattern) => pattern.test(path)) ? 'sensitive' : 'other';
+  return { level, evaluation: 'matched', endpoint: value };
+}
+
+// --- git clean at a thin project root ------------------------------------------
+
+/**
+ * @param {AnalyzedCommand} command @param {RuleContext} ctx
+ * @returns {{evaluation: 'matched'|'unknown', reason: 'double-force'|'dynamic'|'unknown-cwd'|'project-root'}|null}
+ */
+function gitCleanRoot(command, ctx) {
+  const git = parseGitCommand(command);
+  if (git?.subcommand !== 'clean' || cleanIsDryRun(command, git.args)) return null;
+  let force = 0;
+  let ignored = false;
+  let dynamic = false;
+  let wide = false;
+  let options = true;
+  for (let index = 0; index < git.args.length; index++) {
+    const arg = git.args[index];
+    if (arg === null) { if (options) dynamic = true; else wide = true; continue; }
+    if (options && arg === '--') { options = false; continue; }
+    if (options && arg.startsWith('--')) {
+      if (isLongOption(arg, '--force')) force++;
+      else if (arg === '--exclude') index++;
+      continue;
+    }
+    if (options && arg.startsWith('-') && arg !== '-') {
+      for (let cursor = 1; cursor < arg.length; cursor++) {
+        const letter = arg[cursor];
+        if (letter === 'e') { if (cursor === arg.length - 1) index++; break; }
+        if (letter === 'f') force++;
+        if (letter === 'x' || letter === 'X') ignored = true;
+      }
+      continue;
+    }
+    if (arg.startsWith(':') || arg.startsWith('/') || arg.split('/').includes('..')) wide = true;
+  }
+  // -ff also removes nested repositories (members, .worktrees, data shields).
+  if (force >= 2) return { evaluation: 'matched', reason: 'double-force' };
+  // A dynamic word can carry a second -f.
+  if (dynamic) return { evaluation: 'unknown', reason: 'dynamic' };
+  if (!ignored) return null;
+  const directory = gitWorkDir(git, ctx.trustedCwd);
+  if (directory === null) return { evaluation: 'unknown', reason: 'unknown-cwd' };
+  const info = ctx.inspect(directory);
+  if (info.gitRoot !== null && info.nestedRepos && (info.gitRoot === directory || wide)) {
+    return { evaluation: 'matched', reason: 'project-root' };
+  }
+  return null;
+}
+
+// --- policies ------------------------------------------------------------------
+
+/** @param {ShellGraph} graph @param {PolicyEnabled} enabled @param {RuleContext} ctx @returns {PolicyMatch|null} */
+function hardPolicy(graph, enabled, ctx) {
+  const cwd = ctx.trustedCwd;
   for (const command of graph.commands) {
     const orgWrite = orgRulesetWrite(command);
     if (orgWrite && enabled('org-ruleset-write')) {
@@ -532,22 +546,78 @@ function hardPolicy(graph, enabled, protectedRoots) {
       };
     }
 
-    if (isCommand(command, 'rm') && hasRecursiveFlag(command.argv)) {
+    if (enabled('gh-repo-delete') && isCommand(command, 'gh') && command.argv[1] === 'repo' && command.argv[2] === 'delete') {
+      return {
+        ruleId: 'gh-repo-delete', evaluation: 'matched',
+        detail: `删除 GitHub 仓库：${trunc(displayCommand(command))}`,
+        why: '仓库删除不可恢复（issue、PR、release 一并消失）。需要删除时把仓库名交给用户在 GitHub UI 操作。',
+      };
+    }
+
+    const apiDelete = ghApiDelete(command);
+    if (apiDelete?.level === 'protected' && enabled('gh-api-delete-protected')) {
+      return {
+        ruleId: 'gh-api-delete-protected', evaluation: apiDelete.evaluation,
+        detail: `GitHub API 删除仓库、ruleset、分支保护或主干 ref（${trunc(apiDelete.endpoint)}）`,
+        why: '这些对象删除后无法从 API 恢复，且会解除仓库的保护边界。需要变更时交给用户在 GitHub UI 操作。',
+      };
+    }
+
+    const rmRecursive = isCommand(command, 'rm') && hasRecursiveFlag(command.argv);
+    if (rmRecursive) {
       const targets = commandTargets(command);
-      const protectedTarget = targets.find((target) =>
-        target.value !== null && isProtectedRoot(target.value, protectedRoots));
-      const unknownTarget = targets.find((target) =>
-        target.value === null && unknownTargetMayBeProtected(target.display, protectedRoots));
-      if ((protectedTarget || unknownTarget) && enabled('rm-protected-root')) {
-        const target = protectedTarget ?? unknownTarget;
+      const gitDir = targets.find(targetIsGitDir);
+      if (gitDir && enabled('rm-git-dir')) {
         return {
-          ruleId: 'rm-protected-root', evaluation: protectedTarget ? 'matched' : 'unknown',
-          detail: `递归删除 ${target?.display ?? '<?>'}（root / home / Codebase 顶层目录）`,
-          why: protectedTarget
-            ? '一旦执行整个目录树不可恢复、影响面过大。若确需清理，请改用指向具体子目录的精确路径。'
-            : '递归删除目标无法静态还原，可能指向 root / home / Codebase 顶层目录，必须拒绝。改法：把目标写成字面绝对路径（变量只有在同一条命令里以字面量赋值、且不在 if/for/函数/管道里才能被还原）。',
+          ruleId: 'rm-git-dir', evaluation: 'matched',
+          detail: `递归删除 git 元数据目录 ${gitDir.display}`,
+          why: '删除 .git 会丢掉全部本地提交、分支、stash 和 reflog，无法从工作区恢复。确需重建仓库请交给用户。',
         };
       }
+      /** @type {{target: {display: string}, evaluation: 'matched'|'unknown'}|null} */
+      let hit = null;
+      for (const target of targets) {
+        const evaluation = targetHitsProtected(target, ctx.protectedRoots, cwd, { ancestors: true, dynamicMatches: true });
+        if (evaluation) { hit = { target, evaluation }; if (evaluation === 'matched') break; }
+      }
+      if (hit && enabled('rm-protected-root')) {
+        return {
+          ruleId: 'rm-protected-root', evaluation: hit.evaluation,
+          detail: `递归删除 ${hit.target.display}（受保护根目录或其上级）`,
+          why: hit.evaluation === 'matched'
+            ? '一旦执行整个目录树不可恢复、影响面过大。若确需清理，请改用指向具体子目录的精确路径。'
+            : '递归删除目标无法静态确定（变量、通配符，或相对路径而 cwd 不可信——例如前面有 cd），可能落在受保护根目录上，必须拒绝。改法：把目标写成字面绝对路径，不要在同一条命令里 cd。',
+        };
+      }
+    }
+
+    if (ctx.protectedPaths.length && enabled('rm-protected-path') &&
+        (isCommand(command, 'rm') || isCommand(command, 'unlink') || isCommand(command, 'mv'))) {
+      const ancestors = rmRecursive || isCommand(command, 'mv');
+      for (const target of commandTargets(command)) {
+        const evaluation = targetHitsProtected(target, ctx.protectedPaths, cwd, { ancestors, dynamicMatches: false });
+        if (!evaluation) continue;
+        return {
+          ruleId: 'rm-protected-path', evaluation,
+          detail: `${commandName(command)} 受保护路径 ${target.display}`,
+          why: '该路径在 protectedPaths 中（通常是兼容链接或共享数据入口），删除或移动会让依赖它的脚本和会话失效。确需调整请交给用户。',
+        };
+      }
+    }
+
+    const clean = gitCleanRoot(command, ctx);
+    if (clean && enabled('git-clean-root')) {
+      const reasons = {
+        'double-force': '`git clean -ff` 会连嵌套仓库（成员仓、.worktrees、data 防清理盾）一起删除。',
+        dynamic: 'git clean 参数里有无法静态还原的值，可能带第二个 -f。',
+        'unknown-cwd': 'git clean -x/-X 的执行目录无法确定（hook 没给 cwd，或命令里 cd / git -C 动态），可能是项目根。',
+        'project-root': '在项目根（含成员仓的薄根仓库）执行 git clean -x/-X 会删掉被忽略的项目资产（data 链接、media 等）。',
+      };
+      return {
+        ruleId: 'git-clean-root', evaluation: clean.evaluation,
+        detail: `git clean 可能清掉项目根或嵌套仓库：${trunc(displayCommand(command))}`,
+        why: `${reasons[clean.reason]}改法：到具体成员仓里执行单个 -f 的 git clean，或手动删除明确路径。`,
+      };
     }
 
     if (forcePush(command)) {
@@ -561,20 +631,121 @@ function hardPolicy(graph, enabled, protectedRoots) {
           detail: `force push 到 main/master（${trunc(displayCommand(command))}，含 --force-with-lease / +refspec 形式）`,
           why: protectedRef
             ? '会重写 main/master 的提交历史，其他人基于旧历史的工作会被破坏；主干改动请走 PR 流程。'
-            : 'force push 的目标 ref 无法静态还原，可能是 main/master，必须拒绝。',
+            : 'force push 的目标 ref 无法静态还原，可能是 main/master，必须拒绝。改法：写显式 refspec（如 git push --force-with-lease origin feat/x），即可交给宿主审批。',
         };
       }
+    }
+
+    const trunkDelete = pushDeletesTrunk(command);
+    if (trunkDelete && enabled('push-delete-trunk')) {
+      return {
+        ruleId: 'push-delete-trunk', evaluation: trunkDelete,
+        detail: `删除远端主干分支：${trunc(displayCommand(command))}`,
+        why: trunkDelete === 'matched'
+          ? '删除远端 main/master 会让所有协作者和 CI 失去主干；主干只能由人处理。'
+          : '远端删除的目标 ref 无法静态还原，可能是 main/master。改法：把分支名写成字面量。',
+      };
     }
   }
   return null;
 }
 
+/** @param {AnalyzedCommand} command @returns {Array<{value: string|null, display: string}>} */
+function relocatingTargets(command) {
+  if (isCommand(command, 'rm') && hasRecursiveFlag(command.argv)) return commandTargets(command);
+  if (isCommand(command, 'mv')) return commandTargets(command);
+  if (isCommand(command, 'rsync') && command.argv.some((arg) => typeof arg === 'string' && arg.startsWith('--delete'))) {
+    const targets = commandTargets(command);
+    const destination = targets[targets.length - 1];
+    return destination && !(typeof destination.value === 'string' && /^[^/]*:/.test(destination.value)) ? [destination] : [];
+  }
+  const git = parseGitCommand(command);
+  if (git?.subcommand === 'worktree' && (git.args[0] === 'remove' || git.args[0] === 'move')) {
+    const display = effectiveDisplayArgv(command).slice(git.argOffset);
+    /** @type {Array<{value: string|null, display: string}>} */
+    const targets = [];
+    for (let index = 1; index < git.args.length; index++) {
+      const arg = git.args[index];
+      if (typeof arg === 'string' && arg.startsWith('-')) continue;
+      targets.push({ value: arg, display: arg ?? display[index] ?? '<?>' });
+    }
+    return targets;
+  }
+  return [];
+}
+
 /**
- * @param {ShellGraph} graph @param {PolicyEnabled} enabled
- * @param {string[]} protectedRoots
- * @returns {PolicyMatch|null}
+ * Bypass sessions: a call that runs outside the sandbox (explicit
+ * dangerouslyDisableSandbox, or an excludedCommands-style command) is not
+ * confined to the project, so recursive deletes and moves that land outside
+ * the project root (the outermost repository enclosing cwd, so a thin root's
+ * members and `.worktrees/` count as inside) need a human.
+ * @param {ShellGraph} graph @param {RuleContext} ctx @returns {PolicyMatch|null}
  */
-function confirmationPolicy(graph, enabled, protectedRoots) {
+function unsandboxedOutsideProject(graph, ctx) {
+  if (ctx.tier !== 'bypass') return null;
+  if (!ctx.unsandboxed && !isExcludedCommandGraph(graph)) return null;
+  const root = ctx.cwd ? ctx.inspect(ctx.cwd).projectRoot : null;
+  for (const command of graph.commands) {
+    for (const target of relocatingTargets(command)) {
+      /** @type {'matched'|'unknown'|null} */
+      let evaluation = null;
+      if (target.value === null) evaluation = 'unknown';
+      else {
+        const resolved = resolveTarget(target.value, ctx.trustedCwd);
+        if (resolved.kind === 'relative') evaluation = 'unknown';
+        else if (root === null || !resolved.path.startsWith(`${root}/`)) evaluation = 'matched';
+      }
+      if (!evaluation) continue;
+      return {
+        ruleId: 'unsandboxed-outside-project', evaluation,
+        detail: `沙盒外执行的删除/移动目标在项目根${root ? `（${root}）` : ''}以外：${trunc(displayCommand(command))}`,
+        why: evaluation === 'matched'
+          ? '这条命令不受项目沙盒的写权限约束，bypass 下也不会有其他确认；目标在项目外，需要人确认。'
+          : '这条命令在沙盒外执行，删除/移动目标无法静态确定（变量、通配符或 cwd 不可信），需要人确认。',
+      };
+    }
+  }
+  return null;
+}
+
+const GIT_RULE_TEXT = {
+  'git-discard': {
+    detail: '丢弃工作区或本地状态的 Git 操作',
+    why: '可能丢弃未提交改动、未跟踪文件、stash 或已有 tag 指向，请确认目标和参数。',
+  },
+  'git-trunk-ref': {
+    detail: '删除、重置或覆盖主干（或无法确定的）分支引用',
+    why: '目标是 main/master 或无法静态确定的分支名；主干引用被删除或重置会影响所有基于它的工作。',
+  },
+  'git-ref-change': {
+    detail: '删除或重置非主干分支 / worktree / 远端分支',
+    why: '非主干引用变更通常可从 reflog 或远端恢复；worktree remove 会删除其中被忽略的文件。',
+  },
+  'git-config-global': {
+    detail: '修改用户级或系统级 Git 配置',
+    why: '会改变整台机器上所有仓库的 Git 行为（hooksPath、sshCommand、凭据助手等），请确认键和值。',
+  },
+  'git-lfs': {
+    detail: '安装、卸载 Git LFS 或用 LFS 重写历史',
+    why: 'lfs install/uninstall 会改 Git 配置和 hooks，lfs migrate 会重写提交历史，请确认作用域。',
+  },
+  'git-exec': {
+    detail: '让 Git 执行任意 shell 命令（rebase -x / submodule foreach）',
+    why: '这些子命令会在每一步运行一段 shell，guard 看不到其内容，请确认命令本身。',
+  },
+  'git-push-bulk': {
+    detail: '批量同步或删除远端 refs（push --mirror / --prune）',
+    why: '会删除远端上本地不存在的 refs，可能一次性删掉他人的分支和 tag，请确认 remote。',
+  },
+  'git-low-risk': {
+    detail: '执行会改变本地引用或工作区状态的低风险 Git 操作',
+    why: '该操作不属于重写历史或强制覆盖，但可能删除本地分支/tag、进入 detached HEAD 或解除 submodule 初始化状态。',
+  },
+};
+
+/** @param {ShellGraph} graph @param {PolicyEnabled} enabled @returns {PolicyMatch|null} */
+function confirmationPolicy(graph, enabled) {
   for (const command of graph.commands) {
     const tool = commandName(command);
     if (enabled('remote-exec') && ['ssh', 'scp', 'rsync'].includes(tool) && (tool === 'rsync' || !hasFlag(command.argv, '-G'))) {
@@ -621,7 +792,7 @@ function confirmationPolicy(graph, enabled, protectedRoots) {
         why: '表结构或数据会被删除且通常没有回收站，请确认目标库和表名。',
       };
     }
-    const dynamicSql = ['psql', 'mysql', 'mysqlsh', 'sqlite3'].includes(commandName(command)) &&
+    const dynamicSql = sqlCommand &&
       command.argv.some((arg, index) => (arg === '-c' || arg === '-e') && command.argv[index + 1] === null);
     const dynamicSqlitePositional = isCommand(command, 'sqlite3') &&
       commandTargets(command).slice(1).some((target) => target.value === null);
@@ -641,53 +812,47 @@ function confirmationPolicy(graph, enabled, protectedRoots) {
       };
     }
 
-    if (enabled('gh-repo-delete') && isCommand(command, 'gh') && command.argv[1] === 'repo' && command.argv[2] === 'delete') {
+    const apiDelete = ghApiDelete(command);
+    if (apiDelete?.level === 'sensitive' && enabled('gh-api-delete-sensitive')) {
       return {
-        ruleId: 'gh-repo-delete', evaluation: 'matched',
-        detail: `GitHub 删除操作：${trunc(displayCommand(command))}`,
-        why: 'GitHub 上删除仓库/资源通常不可恢复，请确认目标无误。',
+        ruleId: 'gh-api-delete-sensitive', evaluation: 'matched',
+        detail: `GitHub API 删除部署密钥、webhook、Actions secret 或 environment（${trunc(apiDelete.endpoint)}）`,
+        why: '这些配置删除后需要重新生成或找回凭据，CI/部署会立即失效，请确认目标。',
+      };
+    }
+    if (apiDelete?.level === 'other' && enabled('gh-api-delete')) {
+      return {
+        ruleId: 'gh-api-delete', evaluation: 'matched',
+        detail: `GitHub API 删除操作：${trunc(displayCommand(command))}`,
+        why: 'GitHub API DELETE 通常不可恢复，请确认 endpoint 与目标资源无误。',
       };
     }
 
-    if (isCommand(command, 'gh') && command.argv[1] === 'api') {
-      const deleteMethod = command.argv.some((arg, index) =>
-        (arg === '-X' || arg === '--method') && /^DELETE$/i.test(String(command.argv[index + 1] ?? ''))) ||
-        command.argv.some((arg) => typeof arg === 'string' && /^(?:--method=DELETE|-X=?DELETE)$/i.test(arg));
-      if (deleteMethod && enabled('gh-api-delete')) {
-        return {
-          ruleId: 'gh-api-delete', evaluation: 'matched',
-          detail: `GitHub API 删除操作：${trunc(displayCommand(command))}`,
-          why: 'GitHub API DELETE 通常不可恢复，请确认 endpoint 与目标资源无误。',
-        };
+    const resetRef = hardResetRef(command);
+    if (typeof resetRef === 'string') {
+      const trunk = /^(?:(?:origin|upstream)\/)?(?:main|master)$/.test(resetRef);
+      if (trunk || /^origin\//.test(resetRef)) {
+        const ruleId = trunk ? 'reset-hard-main' : 'reset-hard-remote';
+        if (enabled(ruleId)) {
+          return {
+            ruleId, evaluation: 'matched',
+            detail: `把当前分支硬重置到 ${resetRef}`,
+            why: '本地未推送的提交和工作区改动会被丢弃，请先确认没有需要保留的工作。',
+          };
+        }
+        // An explicit remote-ref reset is otherwise left to the host approval
+        // layer, as in 0.4; full enables reset-hard-remote above.
+        if (!trunk) continue;
       }
     }
 
-    const remote = hardResetOriginRef(command);
-    if (typeof remote === 'string') {
-      const ruleId = /^origin\/(?:main|master)$/.test(remote) ? 'reset-hard-main' : 'reset-hard-remote';
-      if (enabled(ruleId)) {
-        return {
-          ruleId, evaluation: 'matched',
-          detail: `把当前分支硬重置到 ${remote}`,
-          why: '本地未推送的提交和工作区改动会被丢弃，请先确认没有需要保留的工作。',
-        };
-      }
-      // dangerous-only intentionally delegates an explicit non-main remote reset
-      // to the host approval layer; full enables reset-hard-remote above.
-      continue;
-    }
-
-    const gitRule = destructiveGitRule(command);
-    if (gitRule && enabled(gitRule)) {
-      const lowRisk = gitRule === 'git-low-risk';
+    const fine = gitRule(command);
+    if (fine && enabled(fine)) {
+      const text = GIT_RULE_TEXT[fine];
       return {
-        ruleId: gitRule, evaluation: 'matched',
-        detail: lowRisk
-          ? `执行会改变本地引用或工作区状态的低风险 Git 操作：${trunc(displayCommand(command))}`
-          : `执行可能丢弃本地状态或修改全局配置的 Git 操作：${trunc(displayCommand(command))}`,
-        why: lowRisk
-          ? '该操作不属于重写历史或强制覆盖，但可能删除本地分支/tag、进入 detached HEAD 或解除 submodule 初始化状态。'
-          : '这类操作可能删除文件、提交或 worktree，或者改变整台机器的 Git 行为，请确认目标和参数。',
+        ruleId: fine, evaluation: 'matched',
+        detail: `${text.detail}：${trunc(displayCommand(command))}`,
+        why: text.why,
       };
     }
   }
@@ -738,6 +903,8 @@ function confirmationPolicy(graph, enabled, protectedRoots) {
  *   maxRecursion?: number,
  *   maxCommands?: number,
  *   protectedRoots?: string[],
+ *   protectedPaths?: string[],
+ *   inspectDirectory?: (directory: string) => ProjectInfo,
  * }} GuardOptions
  */
 
@@ -759,11 +926,27 @@ function extractInput(input) {
   return { shellInput: null, command: '', description, explicitShell };
 }
 
+/** @param {Record<string, unknown>} event */
+export function eventCwd(event) {
+  const value = event.cwd;
+  return typeof value === 'string' && value.startsWith('/') ? normalizePath(value) : null;
+}
+
+/** @param {Record<string, unknown>} event */
+export function eventToolInput(event) {
+  const value = event.tool_input ?? event.toolInput;
+  return typeof value === 'object' && value !== null ? /** @type {Record<string, unknown>} */ (value) : {};
+}
+
 /**
  * Evaluate a host hook event without reading process I/O or environment state.
  * A null result means the event is outside this guard's shell-tool scope.
  * An `allow` result means the shell input was analyzed and no enabled rule
  * requested intervention.
+ *
+ * Hook fields used besides the tool input: `cwd` (relative-path resolution,
+ * project lookup), `permission_mode` (tiering), and
+ * `tool_input.dangerouslyDisableSandbox`.
  *
  * @param {Record<string, unknown>} event
  * @param {GuardOptions} [options]
@@ -772,8 +955,8 @@ function extractInput(input) {
 export function evaluateHookEvent(event, options = {}) {
   const toolName = String(event.tool_name ?? event.toolName ?? '');
   if (!/^(Bash|shell|local_shell|exec_command|run_terminal_command)$/i.test(toolName)) return null;
-  const { shellInput, command, description, explicitShell } =
-    extractInput(event.tool_input ?? event.toolInput);
+  const toolInput = eventToolInput(event);
+  const { shellInput, command, description, explicitShell } = extractInput(toolInput);
   if (!shellInput) return null;
   const dialect = selectShellDialect({ toolName, explicitShell, envShell: options.envShell });
   const analysis = analyzeShellInput(shellInput, {
@@ -786,9 +969,21 @@ export function evaluateHookEvent(event, options = {}) {
     maxCommands: options.maxCommands,
   });
   const profile = resolvePolicyProfile(options.profile);
-  const enabled = (/** @type {string} */ ruleId) => isPolicyEnabled(ruleId, profile);
+  const tier = permissionTier(event.permission_mode ?? event.permissionMode);
+  const enabled = (/** @type {string} */ ruleId) => isPolicyEnabled(ruleId, profile, tier);
+  const cwd = eventCwd(event);
+  /** @type {RuleContext} */
+  const ctx = {
+    tier,
+    cwd,
+    trustedCwd: analysis.commands.some((item) => CWD_CHANGING.has(commandName(item))) ? null : cwd,
+    unsandboxed: toolInput.dangerouslyDisableSandbox === true,
+    protectedRoots: options.protectedRoots ?? ['/'],
+    protectedPaths: options.protectedPaths ?? [],
+    inspect: memoizeInspector(options.inspectDirectory ?? ((directory) => inspectDirectory(directory))),
+  };
 
-  const hard = hardPolicy(analysis, enabled, options.protectedRoots ?? ['/']);
+  const hard = hardPolicy(analysis, enabled, ctx);
   if (hard) return { kind: 'deny', command, description, analysis, ...hard };
 
   const infrastructureFailure = analysis.unknowns.find((item) =>
@@ -799,6 +994,18 @@ export function evaluateHookEvent(event, options = {}) {
       detail: `shell parser 不可用（${infrastructureFailure.reason}）`,
       why: 'guard 无法建立可靠的 command graph；基础设施故障不受 policy profile 放宽，必须 fail-closed。',
     };
+  }
+
+  if (tier === 'bypass' && enabled('bypass-no-project-sandbox')) {
+    const project = cwd ? ctx.inspect(cwd) : null;
+    if (!project?.sandboxConfigured && !isReadOnlyGraph(analysis)) {
+      const where = project?.gitRoot ?? cwd ?? '(hook 未提供 cwd)';
+      return {
+        kind: 'deny', evaluation: 'matched', ruleId: 'bypass-no-project-sandbox', command, description, analysis,
+        detail: `bypass 会话所在项目（${where}）没有项目沙盒配置，拒绝写类命令：${trunc(command)}`,
+        why: 'bypass 只能在配好项目沙盒的项目里用；先配 .claude/settings.json 或切 auto。（判定：会话 cwd 所在 git 根的 .claude/settings.json + settings.local.json 需有 sandbox.enabled: true，或未禁用且 sandbox.filesystem.allowWrite 非空；/tmp、scratchpad 不算项目。只读命令不受影响。）',
+      };
+    }
   }
 
   if (analysis.status === 'unknown' && enabled('shell-analysis-unknown')) {
@@ -814,7 +1021,10 @@ export function evaluateHookEvent(event, options = {}) {
     };
   }
 
-  const confirmation = confirmationPolicy(analysis, enabled, options.protectedRoots ?? ['/']);
+  const outside = enabled('unsandboxed-outside-project') ? unsandboxedOutsideProject(analysis, ctx) : null;
+  if (outside) return { kind: 'confirm', command, description, analysis, ...outside };
+
+  const confirmation = confirmationPolicy(analysis, enabled);
   if (confirmation) {
     const kind = confirmation.ruleId === 'git-low-risk' ? 'review' : 'confirm';
     return { kind, command, description, analysis, ...confirmation };

@@ -28,8 +28,14 @@ test('Claude, Codex, and Grok config snippets select their adapters', () => {
 
 test('Codex native rules are generated from the adapter policy', () => {
   const snippet = nativeRulesSnippet('codex');
-  assert.match(snippet, /pattern=\["gh","repo","delete"\]/);
+  assert.match(snippet, /pattern=\["git","config","--global"\]/);
+  assert.match(snippet, /pattern=\["git","branch","-D","main"\]/);
   assert.match(snippet, /decision="prompt"/);
+  // 0.5 relaxes these: no Codex prompt is generated for them any more.
+  for (const removed of ['["git","reset"]', '["git","restore"]', '["git","branch","-D"]', '["git","worktree","remove"]',
+    '["git","clean","-f"]', '["git","checkout","--"]', '["gh","repo","delete"]', '["git","push","--delete"]']) {
+    assert.ok(!snippet.includes(`pattern=${removed},`), removed);
+  }
 });
 
 test('Grok native ask rules are generated from the adapter policy', () => {

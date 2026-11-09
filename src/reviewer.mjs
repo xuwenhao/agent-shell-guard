@@ -22,7 +22,7 @@ const SENSITIVE_VALUE_FLAGS = new Set([
 ]);
 
 /** @param {string} command */
-function redact(command) {
+export function redact(command) {
   return command
     .replace(/(authorization:\s*(?:bearer|token)\s+)[^\s'"]+/gi, '$1<redacted>')
     .replace(/([?&](?:access_token|api_key|apikey|token|password)=)[^&\s'"]+/gi, '$1<redacted>')
