@@ -32,7 +32,11 @@ const MEMBER = join(PROJECT, 'member');
 mkdirSync(join(PROJECT, '.git'), { recursive: true });
 mkdirSync(join(MEMBER, '.git'), { recursive: true });
 put(join(PROJECT, '.claude', 'settings.json'), { sandbox: { filesystem: { allowWrite: [PROJECT] } } });
-put(join(MEMBER, '.claude', 'settings.local.json'), { sandbox: { enabled: true } });
+put(join(MEMBER, '.claude', 'settings.local.json'), { sandbox: { filesystem: { allowWrite: ['.'] } } });
+// enabledonly: `sandbox.enabled: true` alone is not a project sandbox (the user level already enables it).
+const ENABLED_ONLY = join(FIXTURE, 'enabledonly');
+mkdirSync(join(ENABLED_ONLY, '.git'), { recursive: true });
+put(join(ENABLED_ONLY, '.claude', 'settings.json'), { sandbox: { enabled: true } });
 // bare: a repo without any project sandbox config.
 const BARE = join(FIXTURE, 'bare');
 mkdirSync(join(BARE, '.git'), { recursive: true });
@@ -91,7 +95,6 @@ test('ask-level rules: silent in auto/default/acceptEdits/missing mode, ask in b
     ['git lfs migrate import --everything', 'git-lfs'],
     ['git rebase -x "npm test" main', 'git-exec'],
     ['git submodule foreach git pull', 'git-exec'],
-    ['git push --mirror backup', 'git-push-bulk'],
     ['git push --prune origin', 'git-push-bulk'],
     ['gh api -X DELETE repos/acme/demo/keys/7', 'gh-api-delete-sensitive'],
     ['gh api -X DELETE repos/acme/demo/hooks/1', 'gh-api-delete-sensitive'],
@@ -101,6 +104,9 @@ test('ask-level rules: silent in auto/default/acceptEdits/missing mode, ask in b
     ['git branch -d master', 'git-trunk-ref'],
     ['git checkout -B main origin/main', 'git-trunk-ref'],
     ['git switch -C main', 'git-trunk-ref'],
+    ['git push origin --delete "$BRANCH"', 'push-delete-dynamic'],
+    ['git reset --hard refs/remotes/origin/main', 'reset-hard-main'],
+    ['git reset --hard upstream/master', 'reset-hard-main'],
   ];
   for (const [command, ruleId] of cases) {
     for (const mode of [undefined, 'auto', 'default', 'acceptEdits', 'plan']) {
@@ -147,7 +153,7 @@ test('deny-level rules are identical in both tiers', () => {
     ['git push origin :main', 'push-delete-trunk'],
     ['git push origin --delete main', 'push-delete-trunk'],
     ['git push -d origin refs/heads/master', 'push-delete-trunk'],
-    ['git push origin --delete "$BRANCH"', 'push-delete-trunk'],
+    ['git push --mirror backup', 'force-push-main'],
     ['git push origin main --force', 'force-push-main'],
     ['rm -rf .git', 'rm-git-dir'],
     ['rm -rf ./member/.git/', 'rm-git-dir'],
@@ -203,7 +209,10 @@ test('git clean -ff is denied anywhere; -x/-X only at a thin project root or unk
   assert.equal(outcome(evaluate(`git -C ${PROJECT} clean -fdx`, { cwd: BARE })), 'deny:git-clean-root');
   assert.equal(outcome(evaluate('git -C .. clean -fdx', { cwd: MEMBER })), 'deny:git-clean-root');
   assert.equal(outcome(evaluate('git clean -fdx')), 'deny:git-clean-root');
-  assert.equal(outcome(evaluate('cd member && git clean -fdx', { cwd: PROJECT })), 'deny:git-clean-root');
+  // A literal cd leading an && chain is followed: this runs in the member repo.
+  assert.equal(outcome(evaluate('cd member && git clean -fdx', { cwd: PROJECT })), 'allow');
+  assert.equal(outcome(evaluate('cd member; git clean -fdx', { cwd: PROJECT })), 'deny:git-clean-root');
+  assert.equal(outcome(evaluate(`cd ${PROJECT} && git clean -fdx`, { cwd: MEMBER })), 'deny:git-clean-root');
   // Plain clean and dry runs stay out of the hard rule.
   assert.equal(outcome(evaluate('git clean -fd', { cwd: PROJECT })), 'allow');
   assert.equal(outcome(evaluate('git clean -ndffx', { cwd: PROJECT })), 'allow');
@@ -242,10 +251,18 @@ test('relative recursive deletes resolve against the hook cwd', () => {
 });
 
 test('an untrusted cwd (cd in the command, or none) is strict for names on protected paths', () => {
-  assert.equal(evaluate('cd /var/empty && rm -rf dotfiles', { cwd: BARE }).ruleId, 'rm-protected-root');
-  assert.equal(evaluate('cd /var/empty && rm -rf dotfiles', { cwd: BARE }).evaluation, 'unknown');
+  // `cd <literal> && …` is followed, so the target resolves against it.
+  assert.equal(outcome(evaluate('cd /var/empty && rm -rf dotfiles', { cwd: BARE })), 'allow');
+  assert.equal(outcome(evaluate(`cd ${CODEBASE} && rm -rf dotfiles`, { cwd: BARE })), 'deny:rm-protected-root');
+  assert.equal(evaluate(`cd ${CODEBASE} && rm -rf dotfiles`, { cwd: BARE }).evaluation, 'matched');
+  // Otherwise the cwd is unknown: specific names on protected paths are denied...
+  assert.equal(evaluate('cd "$X" && rm -rf dotfiles', { cwd: BARE }).evaluation, 'unknown');
+  assert.equal(outcome(evaluate('cd /var/empty; rm -rf dotfiles', { cwd: BARE })), 'deny:rm-protected-root');
   assert.equal(outcome(evaluate('rm -rf personal/dotfiles')), 'deny:rm-protected-root');
   assert.equal(outcome(evaluate('cd sub && rm -rf .')), 'deny:rm-protected-root');
+  assert.equal(outcome(evaluate('cd "$X" && rm -rf *')), 'deny:rm-protected-root');
+  // ...but a single common name (data, build) identifies nothing.
+  assert.equal(outcome(evaluate('cd "$X" && rm -rf data')), 'allow');
   assert.equal(outcome(evaluate('cd sub && rm -rf build', { cwd: BARE })), 'allow');
 });
 
@@ -268,6 +285,7 @@ test('bypass: project sandbox detection follows the git root of cwd', () => {
   assert.equal(inspect(join(PROJECT, 'docs')).sandboxConfigured, true);
   assert.equal(inspect(MEMBER).sandboxConfigured, true);
   assert.equal(inspect(LOCAL_ONLY).sandboxConfigured, true);
+  assert.equal(inspect(ENABLED_ONLY).sandboxConfigured, false);
   assert.equal(inspect(BARE).sandboxConfigured, false);
   assert.equal(inspect(DISABLED).sandboxConfigured, false);
   assert.equal(inspect(PROJECT).nestedRepos, true);
@@ -279,11 +297,11 @@ test('bypass: project sandbox detection follows the git root of cwd', () => {
 
 test('bypass without a project sandbox denies write-class commands and allows reads', () => {
   const denied = ['echo hi > x', 'touch x', 'npm test', 'git commit -m x', 'git fetch', 'python3 script.py',
-    'sed -i s/a/b/ f', 'find . -delete', 'cat a | tee b', 'git branch -D feat', 'ls; touch y', 'gh pr merge 1'];
+    'sed -i s/a/b/ f', 'find . -name "*.pyc" -delete', 'cat a | tee b', 'git branch -D feat', 'ls; touch y', 'gh pr merge 1'];
   const allowed = ['ls', 'git status', 'git log --oneline -5', 'cat README.md | head -n 5', 'rg TODO src 2>/dev/null',
     'git diff main...HEAD', 'git branch --show-current', 'gh pr view 3', 'gh api repos/acme/demo/pulls',
     'echo hi', 'find . -name "*.mjs"', 'sed -n 1,20p a.txt', 'ls > /dev/null 2>&1', 'cd src && ls', 'jq . a.json'];
-  for (const cwd of [BARE, DISABLED, '/', undefined]) {
+  for (const cwd of [BARE, DISABLED, ENABLED_ONLY, '/', undefined]) {
     for (const command of denied) {
       assert.equal(outcome(evaluate(command, { mode: 'bypassPermissions', cwd })), 'deny:bypass-no-project-sandbox', `${cwd}: ${command}`);
     }

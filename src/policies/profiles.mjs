@@ -4,7 +4,13 @@
 // approval layer.
 
 /** @typedef {'full'|'dangerous-only'|'legacy-dangerous'|'off'} PolicyProfile */
-/** @typedef {'relaxed'|'bypass'} PermissionTier */
+/**
+ * `relaxed` / `bypass`: Claude Code sessions, chosen by `permission_mode`.
+ * `native`: hosts without permission modes or a classifier (Codex, Grok,
+ * Kimi). They keep the 0.4 behaviour: a confirmation is delegated to the
+ * host's native prompt rule when one covers it, and denied otherwise.
+ * @typedef {'relaxed'|'bypass'|'native'} PermissionTier
+ */
 
 /** Hard boundaries: deny in every tier of every profile that enables them. */
 export const DENY_RULES = Object.freeze([
@@ -20,10 +26,10 @@ export const DENY_RULES = Object.freeze([
 ]);
 
 /**
- * Confirmation rules that `dangerous-only` emits only in bypass sessions. In
- * auto/default/acceptEdits sessions (and hosts without a permission mode) the
- * guard stays silent and the host's classifier or native rules decide; a hook
- * `ask` would otherwise force a human prompt the classifier cannot answer.
+ * Confirmation rules that `dangerous-only` emits in Claude bypass sessions
+ * and on native-prompt hosts. In Claude auto/default/acceptEdits sessions the
+ * guard stays silent and the classifier decides; a hook `ask` would otherwise
+ * force a human prompt the classifier cannot answer.
  */
 export const ASK_LEVEL_RULES = Object.freeze([
   'destructive-sql',
@@ -34,6 +40,7 @@ export const ASK_LEVEL_RULES = Object.freeze([
   'git-exec',
   'git-push-bulk',
   'gh-api-delete-sensitive',
+  'push-delete-dynamic',
 ]);
 
 /** Rules that only exist for Claude bypass sessions. */
@@ -42,7 +49,10 @@ export const BYPASS_RULES = Object.freeze([
   'unsandboxed-outside-project',
 ]);
 
-/** 0.4 `dangerous-only` confirmations that 0.5 relaxes. */
+/**
+ * 0.4 `dangerous-only` confirmations that 0.5 relaxes for Claude sessions.
+ * Native-prompt hosts keep them.
+ */
 export const RELAXED_RULES = Object.freeze([
   'git-discard',
   'git-ref-change',
@@ -65,16 +75,17 @@ export const FULL_ONLY_RULES = Object.freeze([
 /** @type {Record<PolicyProfile, ReadonlySet<string>>} */
 export const POLICY_PROFILES = {
   full: new Set([...DENY_RULES, ...ASK_LEVEL_RULES, ...BYPASS_RULES, ...RELAXED_RULES, ...FULL_ONLY_RULES]),
-  'dangerous-only': new Set([...DENY_RULES, ...ASK_LEVEL_RULES, ...BYPASS_RULES]),
-  // Rollback switch: the 0.4 dangerous-only confirmation set, in every
-  // permission mode, on top of the 0.5 hard boundaries.
-  'legacy-dangerous': new Set([...DENY_RULES, ...ASK_LEVEL_RULES, ...BYPASS_RULES, ...RELAXED_RULES]),
+  'dangerous-only': new Set([...DENY_RULES, ...ASK_LEVEL_RULES, ...BYPASS_RULES, ...RELAXED_RULES]),
+  // Rollback switch: the 0.4 dangerous-only confirmation set in every
+  // permission mode and on every host, without the 0.5 bypass-session rules.
+  // The 0.5 hard boundaries stay.
+  'legacy-dangerous': new Set([...DENY_RULES, ...ASK_LEVEL_RULES, ...RELAXED_RULES]),
   off: new Set(),
 };
 
-/** Profiles whose ask-level rules defer to the host outside bypass sessions. */
-const TIERED_PROFILES = new Set(['dangerous-only']);
 const ASK_LEVEL = new Set(ASK_LEVEL_RULES);
+const RELAXED = new Set(RELAXED_RULES);
+const BYPASS = new Set(BYPASS_RULES);
 
 /** @param {string|undefined} value @returns {PolicyProfile} */
 export function resolvePolicyProfile(value) {
@@ -89,17 +100,23 @@ export function resolvePolicyProfile(value) {
  */
 export function isPolicyEnabled(ruleId, profile, tier = 'relaxed') {
   if (!POLICY_PROFILES[profile].has(ruleId)) return false;
-  if (TIERED_PROFILES.has(profile) && ASK_LEVEL.has(ruleId) && tier !== 'bypass') return false;
+  if (BYPASS.has(ruleId) && tier !== 'bypass') return false;
+  if (profile !== 'dangerous-only') return true;
+  if (ASK_LEVEL.has(ruleId)) return tier !== 'relaxed';
+  if (RELAXED.has(ruleId)) return tier === 'native';
   return true;
 }
 
 /**
  * Claude Code reports `permission_mode` on hook input. Only
  * `bypassPermissions` selects the bypass tier; `auto`, `default`,
- * `acceptEdits`, `plan`, unknown values and a missing field (Codex, Grok,
- * Kimi, older Claude Code) all use the relaxed tier.
- * @param {unknown} mode @returns {PermissionTier}
+ * `acceptEdits`, `plan`, unknown values and a missing field (older Claude
+ * Code) use the relaxed tier. Other hosts always use the native tier.
+ * @param {unknown} mode
+ * @param {'claude'|'codex'|'grok'|'kimi'} [host] defaults to claude
+ * @returns {PermissionTier}
  */
-export function permissionTier(mode) {
+export function permissionTier(mode, host = 'claude') {
+  if (host !== 'claude') return 'native';
   return mode === 'bypassPermissions' ? 'bypass' : 'relaxed';
 }

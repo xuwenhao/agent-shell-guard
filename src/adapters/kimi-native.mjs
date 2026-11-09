@@ -4,10 +4,10 @@ import { CODEX_NATIVE_PROMPT_PREFIXES } from './codex-native.mjs';
 import { isNativePromptCovered } from './common.mjs';
 
 /**
- * Kimi (and Grok, which copies this map) keeps a medium list: the Codex
- * ask-level prefixes plus the working-tree discard family and destructive SQL.
- * These hosts have no project sandbox to fall back on, so discarding
- * uncommitted work still gets a native confirmation there.
+ * Kimi (and Grok, which copies this map) start from the Codex table and widen
+ * one entry: `git-discard` covers every clean/checkout/reset/restore/rm form.
+ * They also prompt for SQL clients. These hosts have no project sandbox to fall
+ * back on, so discarding uncommitted work keeps a native confirmation there.
  * @type {Map<string, string[][]>}
  */
 export const KIMI_NATIVE_PROMPT_PREFIXES = new Map([
@@ -28,7 +28,6 @@ export const KIMI_NATIVE_PROMPT_PREFIXES = new Map([
     ['git', 'worktree', 'remove', '--force'],
     ['git', 'worktree', 'remove', '-f'],
   ]],
-  ['reset-hard-main', [['git', 'reset']]],
   ['destructive-sql', [['psql'], ['mysql'], ['mysqlsh'], ['sqlite3']]],
 ]);
 

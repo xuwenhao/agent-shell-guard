@@ -28,14 +28,19 @@ test('Claude, Codex, and Grok config snippets select their adapters', () => {
 
 test('Codex native rules are generated from the adapter policy', () => {
   const snippet = nativeRulesSnippet('codex');
-  assert.match(snippet, /pattern=\["git","config","--global"\]/);
-  assert.match(snippet, /pattern=\["git","branch","-D","main"\]/);
   assert.match(snippet, /decision="prompt"/);
-  // 0.5 relaxes these: no Codex prompt is generated for them any more.
-  for (const removed of ['["git","reset"]', '["git","restore"]', '["git","branch","-D"]', '["git","worktree","remove"]',
-    '["git","clean","-f"]', '["git","checkout","--"]', '["gh","repo","delete"]', '["git","push","--delete"]']) {
+  // Codex keeps the 0.4 prompt set (native tier), re-keyed by rule id.
+  for (const kept of ['["git","config","--global"]', '["git","reset"]', '["git","restore"]', '["git","branch","-D"]',
+    '["git","worktree","remove"]', '["git","clean","-f"]', '["git","checkout","--"]', '["git","push","--delete"]',
+    '["git","branch","-d","main"]', '["git","push","--prune"]']) {
+    assert.ok(snippet.includes(`pattern=${kept},`), kept);
+  }
+  // Hard denies need no prompt; a prefix shared by two rules is printed once.
+  for (const removed of ['["gh","repo","delete"]', '["git","push","--mirror"]', '["git","branch","-d"]']) {
     assert.ok(!snippet.includes(`pattern=${removed},`), removed);
   }
+  const lines = snippet.split('\n');
+  assert.equal(new Set(lines).size, lines.length);
 });
 
 test('Grok native ask rules are generated from the adapter policy', () => {

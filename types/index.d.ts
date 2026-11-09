@@ -42,6 +42,8 @@ export interface ShellGraph {
   hasCompound: boolean;
   nativePromptArgv: string[] | null;
   redirections: AnalyzedRedirection[];
+  /** Literal `cd` operands leading a single `&&` chain ('' = bare `cd`). */
+  cdPrefix?: string[] | null;
 }
 
 export type ShellInput =
@@ -65,6 +67,10 @@ export interface ProjectInfo {
   projectRoot: string | null;
   sandboxConfigured: boolean;
   nestedRepos: boolean;
+  /** Checked-out branch; null when HEAD is detached or unreadable. */
+  branch?: string | null;
+  /** Configured upstream of `branch`. */
+  upstream?: { remote: string; merge: string } | null;
 }
 
 export interface GuardOptions extends Omit<AnalyzeOptions, 'dialect'> {
@@ -74,6 +80,14 @@ export interface GuardOptions extends Omit<AnalyzeOptions, 'dialect'> {
   protectedPaths?: string[];
   /** Read-only project lookup; defaults to the filesystem inspector. */
   inspectDirectory?: (directory: string) => ProjectInfo;
+  /** Lookup for the session's project directory; defaults to inspectProjectDir. */
+  inspectProjectDir?: (directory: string) => ProjectInfo;
+  /** Host adapter; only `claude` uses permission-mode tiers. Default `claude`. */
+  host?: 'claude' | 'codex' | 'grok' | 'kimi';
+  /** Claude Code `CLAUDE_PROJECT_DIR`: where project settings are read. */
+  projectDir?: string;
+  /** Fold case in path comparisons; defaults to `process.platform === 'darwin'`. */
+  caseInsensitivePaths?: boolean;
 }
 
 export interface GuardAllow {
@@ -142,8 +156,15 @@ export function inspectDirectory(
   directory: string,
   options?: { ephemeralRoots?: string[] },
 ): ProjectInfo;
+export function inspectProjectDir(
+  projectDir: string,
+  options?: { ephemeralRoots?: string[] },
+): ProjectInfo;
 export function isReadOnlyGraph(graph: ShellGraph): boolean;
-export function permissionTier(mode: unknown): 'relaxed' | 'bypass';
+export function permissionTier(
+  mode: unknown,
+  host?: 'claude' | 'codex' | 'grok' | 'kimi',
+): 'relaxed' | 'bypass' | 'native';
 export function loadConfig(options?: {
   configPath?: string;
   env?: Record<string, string | undefined>;

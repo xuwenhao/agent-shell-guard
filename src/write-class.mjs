@@ -29,13 +29,13 @@ const SAFE_SINKS = /^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/;
 
 /** Commands whose only effect is output on stdout/stderr, whatever the args. */
 const PURE_READERS = new Set([
-  'ls', 'cat', 'bat', 'head', 'tail', 'less', 'more', 'wc', 'grep', 'egrep', 'fgrep', 'rg', 'ag',
+  'ls', 'cat', 'bat', 'head', 'tail', 'less', 'more', 'wc', 'grep', 'egrep', 'fgrep', 'ag',
   'stat', 'file', 'du', 'df', 'pwd', 'echo', 'printf', 'which', 'whereis', 'type', 'printenv',
   'date', 'whoami', 'id', 'groups', 'uname', 'hostname', 'uptime', 'true', 'false', 'test', '[',
   'basename', 'dirname', 'realpath', 'readlink', 'diff', 'cmp', 'comm', 'cut', 'tr', 'nl', 'column',
   'fold', 'rev', 'tac', 'od', 'strings', 'md5', 'md5sum', 'shasum', 'sha1sum', 'sha256sum', 'cksum',
   'jq', 'cd', 'pushd', 'popd', 'sleep', 'env', 'ps', 'pgrep', 'lsof', 'nproc', 'sw_vers', 'locale',
-  'getconf', 'export', 'unset', 'set', 'declare', 'typeset', 'local', 'readonly', 'man', 'help',
+  'getconf', 'export', 'unset', 'set', 'declare', 'typeset', 'local', 'readonly', 'help',
   'seq', 'expr', 'paste', 'join', 'look', 'zcat', 'gzcat',
 ]);
 
@@ -77,16 +77,26 @@ function readOnlyRedirect(redirect) {
 /** @param {Array<string|null>} args @param {(arg: string) => boolean} writes */
 const anyArg = (args, writes) => args.some((arg) => arg === null || writes(arg));
 
+/** Subcommands where `-o` names an output file rather than a mode flag. */
+const GIT_OUTPUT_SHORT_O = new Set(['log', 'show', 'diff', 'whatchanged', 'diff-tree', 'diff-files', 'diff-index', 'range-diff', 'format-patch']);
+
 /** @param {AnalyzedCommand} command */
 function readOnlyGit(command) {
   const git = parseGitCommand(command);
   if (!git || git.gitDirOverride) return false;
+  // Global `-c`/`--config-env` can set core.pager, an alias, diff.external or
+  // core.fsmonitor — each runs an arbitrary command from a "read".
+  const globals = command.argv.slice(1, git.argOffset - 1);
+  if (globals.some((arg) => arg === '-c' || arg === '--config-env' || (typeof arg === 'string' &&
+    (arg.startsWith('--config-env=') || /^-c./.test(arg) || arg.startsWith('--exec-path'))))) return false;
   const { subcommand, args } = git;
+  if (args.some((arg) => typeof arg === 'string' && (isLongOption(arg, '--ext-diff') || isLongOption(arg, '--textconv')))) return false;
   if (GIT_READ_SUBCOMMANDS.has(subcommand)) {
     // A dynamic word here is a ref or path operand in practice; only literal
     // output-file options turn these subcommands into writes.
     return !args.some((arg) => typeof arg === 'string' &&
-      (isLongOption(arg, '--output') || arg === '-o' || isLongOption(arg, '--open-files-in-pager') || arg.startsWith('-O')));
+      (isLongOption(arg, '--output') || (arg === '-o' && GIT_OUTPUT_SHORT_O.has(subcommand)) ||
+        isLongOption(arg, '--open-files-in-pager') || arg.startsWith('-O')));
   }
   if (args.some((arg) => arg === null)) return false;
   const first = args.find((arg) => typeof arg === 'string' && !arg.startsWith('-'));
@@ -122,12 +132,36 @@ function readOnlyGit(command) {
   return false;
 }
 
+/**
+ * `gh api graphql -f query='…'` is a POST, but a query without `mutation`
+ * only reads. Every field value must be static, and `--input` / `@file`
+ * values are unknown content.
+ * @param {AnalyzedCommand} command
+ */
+function graphqlIsQuery(command) {
+  const args = command.argv.slice(2);
+  /** @type {Array<string|null>} */
+  const values = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === null) return false;
+    if (arg === '--input' || arg.startsWith('--input=')) return false;
+    if (['-f', '-F', '--field', '--raw-field'].includes(arg)) { values.push(args[++index] ?? null); continue; }
+    const attached = /^(?:--field=|--raw-field=|-[fF])(.+)$/.exec(arg);
+    if (attached) values.push(attached[1]);
+  }
+  return values.every((value) => typeof value === 'string' && !/\bmutation\b/i.test(value) &&
+    !/^[^=]*=@/.test(value));
+}
+
 /** @param {AnalyzedCommand} command */
 function readOnlyGh(command) {
   const group = command.argv[1];
   if (group === 'api') {
     const api = parseGhApi(command);
-    if (!api || api.fieldWrite || api.methodUnknown) return false;
+    if (!api || api.methodUnknown) return false;
+    if (api.endpoint?.value === 'graphql' && (api.method === '' || api.method === 'POST')) return graphqlIsQuery(command);
+    if (api.fieldWrite) return false;
     return api.method === '' || api.method === 'GET' || api.method === 'HEAD';
   }
   if (typeof group !== 'string') return false;
@@ -137,6 +171,60 @@ function readOnlyGh(command) {
   const action = command.argv[2];
   return typeof action === 'string' && allowed.has(action);
 }
+
+// sed: `s///e` and the `e` command run shell commands; `-f` reads a script
+// the guard cannot see.
+const SED_ADDRESS = String.raw`(?:\d+|\$|\/(?:[^/\\]|\\.)*\/)`;
+const SED_EXEC_COMMAND = new RegExp(String.raw`(?:^|[;\n{])\s*(?:${SED_ADDRESS}(?:\s*,\s*${SED_ADDRESS})?)?\s*!?\s*e(?:\s|;|}|$)`);
+const SED_EXEC_FLAG = new RegExp(String.raw`(?:^|[;\n{}])\s*(?:${SED_ADDRESS}(?:\s*,\s*${SED_ADDRESS})?)?\s*!?\s*s(.)(?:(?!\1)[^\\]|\\.)*\1(?:(?!\1)[^\\]|\\.)*\1[a-zA-Z0-9]*e`);
+
+/** @param {string} arg */
+const sedWrites = (arg) => isLongOption(arg, '--in-place') || /^-[^-]*[iI]/.test(arg) || isLongOption(arg, '--file') ||
+  /^-[^-]*f/.test(arg) || /(?:^|[;{}\s/])w\s*\S/.test(arg) || SED_EXEC_COMMAND.test(arg) || SED_EXEC_FLAG.test(arg);
+
+const CURL_WRITE_LETTERS = 'oOTdFKcD';
+const CURL_VALUE_LETTERS = 'HuAembxwrECYyztUQhPkKcDoTdF';
+const CURL_WRITE_LONG = ['--output', '--output-dir', '--remote-name', '--remote-name-all', '--upload-file', '--data',
+  '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode', '--form', '--form-string', '--json', '--config',
+  '--cookie-jar', '--dump-header', '--trace', '--trace-ascii', '--libcurl', '--stderr', '--etag-save', '--hsts',
+  '--alt-svc', '--create-dirs'];
+
+/**
+ * curl only reads when it fetches to stdout with GET/HEAD: no output file,
+ * upload, request body, cookie/header dump or config file.
+ * @param {Array<string|null>} args
+ */
+function curlIsRead(args) {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === null) return false;
+    if (arg === '--') break;
+    if (arg.startsWith('--')) {
+      const name = arg.split('=')[0];
+      if (CURL_WRITE_LONG.includes(name)) return false;
+      if (name === '--request') {
+        const method = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : args[++index];
+        if (typeof method !== 'string' || !/^(?:GET|HEAD)$/i.test(method)) return false;
+      }
+      continue;
+    }
+    if (!arg.startsWith('-') || arg === '-') continue;
+    const letters = arg.slice(1);
+    for (let cursor = 0; cursor < letters.length; cursor++) {
+      const letter = letters[cursor];
+      if (CURL_WRITE_LETTERS.includes(letter)) return false;
+      if (letter === 'X') {
+        const method = cursor + 1 < letters.length ? letters.slice(cursor + 1) : args[++index];
+        if (typeof method !== 'string' || !/^(?:GET|HEAD)$/i.test(method)) return false;
+        break;
+      }
+      if (CURL_VALUE_LETTERS.includes(letter)) { if (cursor + 1 === letters.length) index++; break; }
+    }
+  }
+  return true;
+}
+
+const NPM_READ = new Set(['ls', 'list', 'll', 'la', 'view', 'info', 'show', 'v', 'outdated', 'explain', 'why', '--version', '-v']);
 
 /** @param {AnalyzedCommand} command */
 export function isReadOnlyCommand(command) {
@@ -156,11 +244,22 @@ export function isReadOnlyCommand(command) {
       return !args.some((arg) => arg === null) && args.filter((arg) => typeof arg === 'string' && !arg.startsWith('-')).length <= 1;
     case 'sed':
     case 'gsed':
-      return !anyArg(args, (arg) => isLongOption(arg, '--in-place') || /^-[^-]*[iI]/.test(arg) || /(?:^|[;{}\s/])w\s*\S/.test(arg));
+      return !anyArg(args, sedWrites);
     case 'awk':
     case 'gawk':
     case 'mawk':
-      return !anyArg(args, (arg) => /^-i/.test(arg) || isLongOption(arg, '--inplace') || /[>|]|system|getline/.test(arg));
+      return !anyArg(args, (arg) => /^-i/.test(arg) || /^-[^-]*f/.test(arg) || isLongOption(arg, '--inplace') ||
+        isLongOption(arg, '--file') || /[>|]|system|getline/.test(arg));
+    case 'rg':
+      return !anyArg(args, (arg) => arg === '--pre' || arg.startsWith('--pre='));
+    case 'man':
+      return !anyArg(args, (arg) => /^-[^-]*P/.test(arg) || isLongOption(arg, '--pager') || /^-[^-]*H/.test(arg) || isLongOption(arg, '--html'));
+    case 'curl':
+      return curlIsRead(args);
+    case 'npm':
+      return args.length > 0 && typeof args[0] === 'string' && NPM_READ.has(args[0]) && !args.some((arg) => arg === null);
+    case 'node':
+      return args.length === 1 && (args[0] === '--version' || args[0] === '-v');
     case 'yq':
       return !anyArg(args, (arg) => isLongOption(arg, '--inplace') || /^-[^-]*i/.test(arg));
     case 'find':

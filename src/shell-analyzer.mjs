@@ -8,6 +8,7 @@ import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import { homedir } from 'node:os';
 import { resolveShfmtPath } from './config.mjs';
+import { DYNAMIC_MARKER, expandBraces } from './path-targets.mjs';
 
 const MAX_INPUT_BYTES = 64 * 1024;
 const MAX_RECURSION = 8;
@@ -46,6 +47,7 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   hasCompound: boolean,
  *   nativePromptArgv: string[]|null,
  *   redirections: AnalyzedRedirection[],
+ *   cdPrefix?: string[]|null,
  * }} ShellGraph
  */
 /** @typedef {{kind: 'script', text: string}|{kind: 'argv', argv: string[]}} ShellInput */
@@ -147,9 +149,51 @@ function staticPart(part, doubleQuoted = false) {
   return null;
 }
 
+/**
+ * Bash and zsh brace-expand unquoted `{a,b}` / `{1..3}` into several words, so
+ * a word containing one has no single static value. Quoted text cannot open
+ * or close a brace, so it is replaced by a placeholder before checking.
+ * @param {unknown[]} parts
+ */
+function hasBraceExpansion(parts) {
+  let skeleton = '';
+  for (const part of parts) {
+    if (isObject(part) && part.Type === 'Lit' && typeof part.Value === 'string') skeleton += part.Value;
+    else skeleton += isObject(part) && (part.Type === 'SglQuoted' || part.Type === 'DblQuoted') ? 'Q' : 'P';
+  }
+  if (!skeleton.includes('{')) return false;
+  const expanded = expandBraces(skeleton);
+  return expanded === null || expanded.length !== 1 || expanded[0] !== skeleton;
+}
+
+/**
+ * Source text of a word with every expansion replaced by DYNAMIC_MARKER, so a
+ * double-quoted `bash -c "rm -rf $DIR"` script can still be parsed for its
+ * structure. Returns null for words that cannot be rebuilt.
+ * @param {unknown} word
+ */
+function markedWord(word) {
+  if (!isObject(word) || !Array.isArray(word.Parts)) return null;
+  let result = '';
+  for (const part of word.Parts) {
+    if (!isObject(part)) return null;
+    if (part.Type === 'Lit' && typeof part.Value === 'string') result += decodeLiteral(part.Value, false);
+    else if (part.Type === 'SglQuoted' && typeof part.Value === 'string') result += part.Value;
+    else if (part.Type === 'DblQuoted') {
+      for (const child of Array.isArray(part.Parts) ? part.Parts : []) {
+        result += isObject(child) && child.Type === 'Lit' && typeof child.Value === 'string'
+          ? decodeLiteral(child.Value, true)
+          : DYNAMIC_MARKER;
+      }
+    } else result += DYNAMIC_MARKER;
+  }
+  return result;
+}
+
 /** @param {unknown} word @returns {string|null} */
 function staticWord(word) {
   if (!isObject(word) || !Array.isArray(word.Parts)) return null;
+  if (hasBraceExpansion(word.Parts)) return null;
   const first = word.Parts[0];
   const firstLiteral = isObject(first) && first.Type === 'Lit' && typeof first.Value === 'string'
     ? first.Value
@@ -162,6 +206,7 @@ function staticWord(word) {
     if (value === null) return null;
     result += value;
   }
+  if (result.includes(DYNAMIC_MARKER)) return null;
   return expandHome ? `${homedir()}${result.slice(1)}` : result;
 }
 
@@ -239,6 +284,17 @@ function unwrapCommand(rawArgv) {
         index += valueOptions.has(arg) ? 2 : 1;
       }
       index++; // duration precedes the wrapped command
+    } else if (name === 'xargs') {
+      // xargs runs its operand as a command with stdin appended as arguments.
+      const valueOptions = new Set(['-I', '-L', '-n', '-P', '-s', '-d', '-E', '-a', '-R', '-S',
+        '--max-args', '--max-lines', '--max-procs', '--max-chars', '--delimiter', '--eof', '--arg-file',
+        '--replace', '--process-slot-var']);
+      while (index < argv.length) {
+        const arg = argv[index];
+        if (arg === '--') { index++; break; }
+        if (typeof arg !== 'string' || !arg.startsWith('-')) break;
+        index += valueOptions.has(arg) ? 2 : 1;
+      }
     } else if (name === 'busybox' || name === 'toybox') {
       if (typeof argv[index] === 'string' && argv[index]?.startsWith('-')) break;
     } else {
@@ -264,7 +320,7 @@ function shellEvaluator(argv) {
   }
   for (let index = 1; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === null) return { dialect: /** @type {ShellDialect} */ (name === 'bash' ? 'bash' : name === 'zsh' ? 'zsh' : 'posix'), script: null };
+    if (arg === null) return { dialect: /** @type {ShellDialect} */ (name === 'bash' ? 'bash' : name === 'zsh' ? 'zsh' : 'posix'), script: null, scriptIndex: -1 };
     if (arg === '--') break;
     if (/^-[^-]*c/.test(arg)) {
       let scriptIndex = index + 1;
@@ -272,6 +328,7 @@ function shellEvaluator(argv) {
       return {
         dialect: /** @type {ShellDialect} */ (name === 'bash' ? 'bash' : name === 'zsh' ? 'zsh' : 'posix'),
         script: typeof argv[scriptIndex] === 'string' ? argv[scriptIndex] : null,
+        scriptIndex,
       };
     }
     if (valueOptions.has(arg)) {
@@ -432,6 +489,7 @@ export function analyzeShellInput(input, options) {
 
     if (depth === 0) {
       graph.nativePromptArgv = nativeArgvFromRoot(ast);
+      graph.cdPrefix = cdPrefixFromRoot(ast, text);
     }
     if (ast.Stmts.length !== 1) graph.hasCompound = true;
 
@@ -479,14 +537,27 @@ export function analyzeShellInput(input, options) {
         graph.commands.push(command);
         if (argv[0] === null || argv.length === 0) unknown('dynamic-command', 'command name cannot be reconstructed statically');
 
+        const offset = rawArgv.length - argv.length;
         const evaluator = shellEvaluator(argv);
         if (evaluator) {
-          if (evaluator.script === null) unknown('dynamic-evaluator', `${String(argv[0])} -c script is dynamic or missing`);
-          else parseScript(evaluator.script, evaluator.dialect, depth + 1, 'shell-c');
+          if (evaluator.script === null) {
+            unknown('dynamic-evaluator', `${String(argv[0])} -c script is dynamic or missing`);
+            // Still parse the script with its expansions marked as unknown
+            // words, so hard boundaries inside it (rm -rf "$X/…") are seen.
+            const marked = evaluator.scriptIndex >= 0 ? markedWord(words[offset + evaluator.scriptIndex]) : null;
+            if (marked !== null && marked.replaceAll(DYNAMIC_MARKER, '').trim() !== '') {
+              parseScript(marked, evaluator.dialect, depth + 1, 'shell-c');
+            }
+          } else parseScript(evaluator.script, evaluator.dialect, depth + 1, 'shell-c');
         } else if (argv[0] === 'eval') {
           const parts = argv.slice(1);
-          if (parts.some((part) => part === null)) unknown('dynamic-evaluator', 'eval input cannot be reconstructed statically');
-          else parseScript(/** @type {string[]} */ (parts).join(' '), currentDialect, depth + 1, 'eval');
+          if (parts.some((part) => part === null)) {
+            unknown('dynamic-evaluator', 'eval input cannot be reconstructed statically');
+            const marked = words.slice(offset + 1).map(markedWord);
+            if (marked.every((part) => part !== null)) {
+              parseScript(/** @type {string[]} */ (marked).join(' '), currentDialect, depth + 1, 'eval');
+            }
+          } else parseScript(/** @type {string[]} */ (parts).join(' '), currentDialect, depth + 1, 'eval');
         }
 
         walk(node.Assigns, nodeSource, pipelineGroup);
@@ -533,6 +604,46 @@ export function analyzeShellInput(input, options) {
 
   parseScript(input.text, dialect, 0, 'top-level');
   return graph;
+}
+
+/**
+ * Literal `cd` operands that lead a script consisting of one `&&` chain
+ * (`cd /tmp/x && cd sub && rm -rf data`). Everything after them runs in the
+ * directory they reach, because `&&` stops the chain if a `cd` fails. An
+ * operand of '' means a bare `cd` (home). Null for any other shape.
+ * @param {Record<string, unknown>} ast @param {string} text
+ * @returns {string[]|null}
+ */
+function cdPrefixFromRoot(ast, text) {
+  if (!Array.isArray(ast.Stmts) || ast.Stmts.length !== 1) return null;
+  /** @type {unknown[]} */
+  const elements = [];
+  /** @param {unknown} stmt */
+  const flatten = (stmt) => {
+    if (!isObject(stmt) || stmt.Negated || stmt.Background || stmt.Coprocess) { elements.push(null); return; }
+    const cmd = stmt.Cmd;
+    if (isObject(cmd) && cmd.Type === 'BinaryCmd') {
+      const opPos = isObject(cmd.OpPos) && typeof cmd.OpPos.Offset === 'number' ? cmd.OpPos.Offset : -1;
+      if (text.slice(opPos, opPos + 2) === '&&') { flatten(cmd.X); flatten(cmd.Y); return; }
+    }
+    elements.push(stmt);
+  };
+  flatten(ast.Stmts[0]);
+  /** @type {string[]} */
+  const operands = [];
+  for (const stmt of elements) {
+    if (!isObject(stmt) || (Array.isArray(stmt.Redirs) && stmt.Redirs.length)) break;
+    const call = stmt.Cmd;
+    if (!isObject(call) || call.Type !== 'CallExpr' || !Array.isArray(call.Args) || (Array.isArray(call.Assigns) && call.Assigns.length)) break;
+    const argv = call.Args.map(staticWord);
+    if (argv[0] !== 'cd') break;
+    const rest = argv.slice(1);
+    while (typeof rest[0] === 'string' && /^-[LPe@]+$/.test(rest[0])) rest.shift();
+    if (rest[0] === '--') rest.shift();
+    if (rest.length > 1 || rest.some((arg) => arg === null || arg === '-')) return null;
+    operands.push(rest.length ? /** @type {string} */ (rest[0]) : '');
+  }
+  return operands.length ? operands : null;
 }
 
 /** @param {Record<string, unknown>} ast @returns {string[]|null} */

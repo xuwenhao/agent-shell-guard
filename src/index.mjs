@@ -1,5 +1,5 @@
 export { evaluateHookEvent, explainGuardDecision } from './guard-core.mjs';
-export { inspectDirectory } from './project.mjs';
+export { inspectDirectory, inspectProjectDir } from './project.mjs';
 export { isReadOnlyGraph } from './write-class.mjs';
 export { permissionTier } from './policies/profiles.mjs';
 export { analyzeShellInput, selectShellDialect } from './shell-analyzer.mjs';

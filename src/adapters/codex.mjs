@@ -11,6 +11,7 @@ export function adaptCodex(event, config) {
   const nestedBlock = reviewerToolBlock(event);
   if (nestedBlock) return nestedBlock;
   const result = evaluateForHost(event, config, {
+    host: 'codex',
     supportsHookPrompt: false,
     nativePromptCovered: (decision) =>
       config.nativePrompt.codex &&

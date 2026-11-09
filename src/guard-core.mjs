@@ -6,7 +6,11 @@
 // not infer quoting, command boundaries, or evaluator semantics with regex.
 // Path comparisons are lexical (the hook `cwd` is joined literally); the only
 // filesystem access is the read-only project inspection in ./project.mjs,
-// used for bypass-mode checks and for spotting a thin project root.
+// used for bypass-mode checks, for spotting a thin project root and for
+// resolving `HEAD` / `@{u}` in push and reset rules.
+
+import { homedir } from 'node:os';
+import { basename } from 'node:path';
 
 import { analyzeShellInput, selectShellDialect } from './shell-analyzer.mjs';
 import { isPolicyEnabled, permissionTier, resolvePolicyProfile } from './policies/profiles.mjs';
@@ -29,14 +33,18 @@ import {
 } from './command-utils.mjs';
 import {
   expandHome,
+  expandTargetWord,
+  foldCase,
   globCovers,
-  lastSegment,
+  isAncestorOrSelf,
   normalizePath,
-  parseGlobTarget,
   resolveTarget,
+  segmentMatches,
+  setCaseInsensitivePaths,
   targetCovers,
+  targetSegments,
 } from './path-targets.mjs';
-import { inspectDirectory, memoizeInspector } from './project.mjs';
+import { inspectDirectory, inspectProjectDir, memoizeInspector } from './project.mjs';
 import { isExcludedCommandGraph, isReadOnlyGraph } from './write-class.mjs';
 
 /** @param {string} value @param {number} [length] */
@@ -53,12 +61,15 @@ const trunc = (value, length = 160) => value.length > length ? `${value.slice(0,
  *   tier: import('./policies/profiles.mjs').PermissionTier,
  *   cwd: string|null,
  *   trustedCwd: string|null,
+ *   projectDir: string|null,
  *   unsandboxed: boolean,
  *   protectedRoots: string[],
  *   protectedPaths: string[],
  *   inspect: (directory: string) => ProjectInfo,
+ *   inspectProject: (directory: string) => ProjectInfo,
  * }} RuleContext
  */
+/** @typedef {{value: string|null, display: string}} TargetWord */
 
 const TRUNK_REF = /^(?:refs\/heads\/)?(?:main|master)$/;
 const CWD_CHANGING = new Set(['cd', 'pushd', 'popd', 'source', '.']);
@@ -84,7 +95,7 @@ function mayNameTrunk(value) {
 // --- path targets ------------------------------------------------------------
 
 /**
- * @param {{value: string|null, display: string}} target
+ * @param {TargetWord} target
  * @param {string[]} paths
  * @param {string|null} cwd trusted cwd
  * @param {{ancestors: boolean, dynamicMatches: boolean}} options
@@ -96,18 +107,149 @@ function targetHitsProtected(target, paths, cwd, options) {
     if (!paths.some((path) => targetCovers(resolved, path, { ancestors: options.ancestors }))) return null;
     return resolved.kind === 'absolute' ? 'matched' : 'unknown';
   }
-  const glob = parseGlobTarget(target.display, cwd);
-  if (glob === null) return options.dynamicMatches ? 'unknown' : null;
-  return paths.some((path) => globCovers(glob, path)) ? 'unknown' : null;
+  // Globs and brace expansions: every alternative is checked.
+  const word = expandTargetWord(target.display, cwd);
+  if (word === null) return options.dynamicMatches ? 'unknown' : null;
+  if ('overflow' in word) {
+    const prefix = word.overflow;
+    return paths.some((path) => targetCovers(prefix, path, { ancestors: true })) ? 'unknown' : null;
+  }
+  /** @type {'matched'|'unknown'|null} */
+  let result = null;
+  for (const candidate of word.candidates) {
+    if (candidate.kind === 'static') {
+      if (!paths.some((path) => targetCovers(candidate.target, path, { ancestors: options.ancestors }))) continue;
+      if (candidate.target.kind === 'absolute') return 'matched';
+      result = 'unknown';
+    } else if (paths.some((path) => globCovers(candidate.glob, path))) {
+      result = 'unknown';
+    }
+  }
+  return result;
 }
 
-/** @param {{value: string|null, display: string}} target */
+/** @param {string} segment */
+const isGitSegment = (segment) => foldCase(segment) === '.git';
+
+/**
+ * Any segment of the target is `.git`: the directory itself, or anything
+ * inside it (`.git/objects`, `.git/refs`), or a glob that matches it.
+ * @param {TargetWord} target
+ */
 function targetIsGitDir(target) {
-  if (target.value !== null) return lastSegment(resolveTarget(target.value, null)) === '.git';
-  const text = target.display.replace(/["']/g, '').replace(/\/+$/, '');
-  const segments = text.split('/');
-  return segments[segments.length - 1] === '.git' ||
-    (segments.length > 1 && segments[segments.length - 2] === '.git' && /[*?[]/.test(segments[segments.length - 1]));
+  if (target.value !== null) return targetSegments(resolveTarget(target.value, null)).some(isGitSegment);
+  const word = expandTargetWord(target.display, null);
+  if (word === null || 'overflow' in word) return false;
+  return word.candidates.some((candidate) => candidate.kind === 'static'
+    ? targetSegments(candidate.target).some(isGitSegment)
+    : targetSegments(candidate.glob.prefix).some(isGitSegment) ||
+      candidate.glob.pattern.some((segment) => segmentMatches(segment, '.git')));
+}
+
+// --- find ----------------------------------------------------------------------
+
+const FIND_NAME_TESTS = new Set(['-name', '-iname', '-lname', '-ilname']);
+const FIND_PATH_TESTS = new Set(['-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex']);
+
+/**
+ * `find` start paths, name/path tests and whether it deletes what it finds
+ * (`-delete`, or `-exec`/`-execdir`/`-ok` running a recursive `rm`).
+ * @param {AnalyzedCommand} command
+ */
+function parseFind(command) {
+  if (!['find', 'gfind'].includes(commandName(command))) return null;
+  const argv = command.argv;
+  const display = effectiveDisplayArgv(command);
+  let index = 1;
+  while (index < argv.length && typeof argv[index] === 'string' && /^-(?:[HLP]|O\d*)$/.test(/** @type {string} */ (argv[index]))) index++;
+  if (argv[index] === '-D') index += 2;
+  /** @type {TargetWord[]} */
+  const starts = [];
+  for (; index < argv.length; index++) {
+    const arg = argv[index];
+    if (typeof arg === 'string' && (arg.startsWith('-') || arg === '(' || arg === '!')) break;
+    starts.push({ value: arg, display: arg ?? display[index] ?? '<?>' });
+  }
+  if (starts.length === 0) starts.push({ value: '.', display: '.' });
+  /** @type {Array<{test: string, value: string|null}>} */
+  const tests = [];
+  let deletes = false;
+  for (; index < argv.length; index++) {
+    const arg = argv[index];
+    if (typeof arg !== 'string') continue;
+    if (FIND_NAME_TESTS.has(arg) || FIND_PATH_TESTS.has(arg)) { tests.push({ test: arg, value: argv[++index] ?? null }); continue; }
+    if (arg === '-delete') { deletes = true; continue; }
+    if (['-exec', '-execdir', '-ok', '-okdir'].includes(arg)) {
+      /** @type {Array<string|null>} */
+      const sub = [];
+      for (index++; index < argv.length && argv[index] !== ';' && argv[index] !== '+'; index++) sub.push(argv[index]);
+      if (typeof sub[0] === 'string' && basename(sub[0]) === 'rm' && hasRecursiveFlag(sub)) deletes = true;
+      if (sub[0] === null) deletes = true;
+    }
+  }
+  return { starts, tests, deletes };
+}
+
+/**
+ * Could a deleting find (or `find … | xargs rm -r`) remove a protected root?
+ * Only when a start path is the root or one of its ancestors, and the name
+ * tests (if any) could select the root or a directory on the way down to it.
+ * @param {{starts: TargetWord[], tests: Array<{test: string, value: string|null}>}} find
+ * @param {string[]} paths @param {string|null} cwd
+ * @returns {{target: TargetWord, evaluation: 'matched'|'unknown'}|null}
+ */
+function findHitsProtected(find, paths, cwd) {
+  for (const start of find.starts) {
+    if (start.value === null) return { target: start, evaluation: 'unknown' };
+    const resolved = resolveTarget(start.value, cwd);
+    for (const path of paths) {
+      if (!targetCovers(resolved, path, { ancestors: true })) continue;
+      const evaluation = resolved.kind === 'absolute' ? 'matched' : 'unknown';
+      if (find.tests.length === 0) return { target: start, evaluation };
+      const root = normalizePath(expandHome(path));
+      const rootSegments = root === '/' ? [] : root.slice(1).split('/');
+      const below = resolved.kind === 'absolute'
+        ? (resolved.path === root ? rootSegments.slice(-1) : rootSegments.slice(targetSegments(resolved).length))
+        : rootSegments;
+      const reaches = find.tests.some((test) => test.value === null || FIND_PATH_TESTS.has(test.test) ||
+        below.some((segment) => segmentMatches(test.value ?? '*', segment, { dotRule: false })));
+      if (reaches) return { target: start, evaluation: 'unknown' };
+    }
+  }
+  return null;
+}
+
+/**
+ * A deleting find whose start path or name/path tests select `.git`.
+ * @param {ReturnType<typeof parseFind>} find
+ */
+function findDeletesGitDir(find) {
+  if (!find?.deletes) return false;
+  if (find.starts.some((start) => start.value !== null && targetSegments(resolveTarget(start.value, null)).some(isGitSegment))) return true;
+  return find.tests.some((test) => typeof test.value === 'string' && (FIND_NAME_TESTS.has(test.test)
+    ? segmentMatches(test.value, '.git', { dotRule: false })
+    : /(?:^|[/*])\\?\.git(?:[/*$]|$)/i.test(test.value)));
+}
+
+/**
+ * `xargs rm -r…` deletes whatever the pipeline feeds it; when a `find` in the
+ * same pipeline produces the list, judge it like a deleting find.
+ * @param {AnalyzedCommand} command @param {ShellGraph} graph
+ */
+function xargsRmSource(command, graph) {
+  if (!command.wrappers.includes('xargs') || !isCommand(command, 'rm') || !hasRecursiveFlag(command.argv)) return null;
+  if (command.pipelineGroup === null) return null;
+  for (const other of graph.commands) {
+    if (other === command || other.pipelineGroup !== command.pipelineGroup) continue;
+    const find = parseFind(other);
+    if (find) return find;
+    // `echo <paths> | xargs rm -rf` deletes exactly those paths.
+    if (['echo', 'printf'].includes(commandName(other))) {
+      const starts = commandTargets(other);
+      if (starts.length) return { starts, tests: [], deletes: true };
+    }
+  }
+  return null;
 }
 
 /**
@@ -349,7 +491,7 @@ function gitRule(command) {
       isLongOption(arg, '--reschedule-failed-exec') || shortOptionHas(arg, /x/)) ? 'git-exec' : null;
   }
   if (subcommand === 'push') {
-    if (args.some((arg) => isLongOption(arg, '--mirror') || isLongOption(arg, '--prune'))) return 'git-push-bulk';
+    if (args.some((arg) => isLongOption(arg, '--prune'))) return 'git-push-bulk';
     return args.some((arg) =>
       isLongOption(arg, '--delete') || shortOptionHas(arg, /d/) || (typeof arg === 'string' && /^\+?:\S+/.test(arg)))
       ? 'git-ref-change' : null;
@@ -362,6 +504,28 @@ function hardResetRef(command) {
   const git = parseGitCommand(command);
   if (git?.subcommand !== 'reset' || !hasFlag(git.args, '--hard')) return null;
   return git.args.find((arg) => typeof arg === 'string' && !arg.startsWith('-')) ?? null;
+}
+
+const TRUNK_SPELLINGS = /^(?:refs\/remotes\/[^/]+\/|remotes\/[^/]+\/|refs\/heads\/|(?:origin|upstream)\/)?(?:main|master)$/;
+const UPSTREAM_REF = /^(.*)@\{(?:u|upstream|push)\}$/i;
+
+/**
+ * Does a `reset --hard` target name the trunk? Covers `main`,
+ * `origin/main`, `refs/remotes/<remote>/main`, `refs/heads/main`, and an
+ * `@{u}` / `<branch>@{upstream}` whose configured upstream is the trunk.
+ * @param {string} ref @param {AnalyzedCommand} command @param {RuleContext} ctx
+ */
+function resetRefIsTrunk(ref, command, ctx) {
+  if (TRUNK_SPELLINGS.test(ref)) return true;
+  const upstream = UPSTREAM_REF.exec(ref);
+  if (!upstream) return false;
+  const git = parseGitCommand(command);
+  const directory = git ? gitWorkDir(git, ctx.trustedCwd) : null;
+  if (directory === null) return false;
+  const info = ctx.inspect(directory);
+  const named = upstream[1] === '' || upstream[1] === 'HEAD' || upstream[1] === '@' ? info.branch : upstream[1];
+  if (typeof named !== 'string' || named !== info.branch || !info.upstream) return false;
+  return /^(?:refs\/heads\/)?(?:main|master)$/.test(info.upstream.merge);
 }
 
 /** @param {AnalyzedCommand} command */
@@ -400,8 +564,46 @@ function pushPositionals(command) {
 /** @param {AnalyzedCommand} command */
 const pushRefs = (command) => pushPositionals(command).slice(1);
 
-/** @param {AnalyzedCommand} command @returns {'matched'|'unknown'|null} */
-function pushDeletesTrunk(command) {
+/** @param {string|null} value */
+const isHeadRef = (value) => typeof value === 'string' && /^\+?(?:HEAD|@)$/.test(value);
+
+/**
+ * Which ref a force push rewrites, as far as the argv and the repository's
+ * HEAD tell. `matched`: main/master (explicitly, via `--all`/`--branches`,
+ * or via `HEAD`/`@`/no refspec while main is checked out). `unknown`: a
+ * dynamic refspec, a detached or unreadable HEAD, or a branch whose upstream
+ * is the trunk (push.default=upstream would push it there).
+ * @param {AnalyzedCommand} command @param {RuleContext} ctx
+ * @returns {'matched'|'unknown'|null}
+ */
+function forcePushTarget(command, ctx) {
+  const git = parseGitCommand(command);
+  if (!git) return null;
+  if (git.args.some((arg) => isLongOption(arg, '--all') || isLongOption(arg, '--branches'))) return 'matched';
+  const refs = pushRefs(command);
+  if (refs.some((ref) => ref.value !== null && isProtectedRef(ref.value))) return 'matched';
+  if (refs.some((ref) => ref.value === null)) return 'unknown';
+  const usesHead = refs.length === 0 ? !git.args.some((arg) => isLongOption(arg, '--tags')) : refs.some((ref) => isHeadRef(ref.value));
+  if (!usesHead) return null;
+  const directory = gitWorkDir(git, ctx.trustedCwd);
+  if (directory === null) return 'unknown';
+  const info = ctx.inspect(directory);
+  if (typeof info.branch !== 'string') return 'unknown';
+  if (TRUNK_REF.test(info.branch)) return 'matched';
+  if (refs.length === 0 && info.upstream && /^(?:refs\/heads\/)?(?:main|master)$/.test(info.upstream.merge)) return 'unknown';
+  return null;
+}
+
+/** @param {AnalyzedCommand} command */
+function pushMirror(command) {
+  const git = parseGitCommand(command);
+  if (git?.subcommand !== 'push') return false;
+  if (git.args.some((arg) => isLongOption(arg, '--dry-run') || shortOptionHas(arg, /n/))) return false;
+  return git.args.some((arg) => isLongOption(arg, '--mirror'));
+}
+
+/** @param {AnalyzedCommand} command @param {RuleContext} ctx @returns {'matched'|'unknown'|null} */
+function pushDeletesTrunk(command, ctx) {
   const git = parseGitCommand(command);
   if (git?.subcommand !== 'push') return null;
   if (git.args.some((arg) => isLongOption(arg, '--dry-run') || shortOptionHas(arg, /n/))) return null;
@@ -411,7 +613,12 @@ function pushDeletesTrunk(command) {
   if (!deleting) return null;
   const refs = pushRefs(command);
   if (refs.some((ref) => typeof ref.value === 'string' && TRUNK_REF.test(ref.value.replace(/^\+/, '')))) return 'matched';
-  return refs.some((ref) => ref.value === null) ? 'unknown' : null;
+  if (refs.some((ref) => ref.value === null)) return 'unknown';
+  if (!refs.some((ref) => isHeadRef(ref.value))) return null;
+  const directory = gitWorkDir(git, ctx.trustedCwd);
+  const branch = directory === null ? undefined : ctx.inspect(directory).branch;
+  if (typeof branch !== 'string') return 'unknown';
+  return TRUNK_REF.test(branch) ? 'matched' : null;
 }
 
 /** @param {AnalyzedCommand} command */
@@ -433,6 +640,16 @@ function parseSsh(command) {
 }
 
 // --- gh api ------------------------------------------------------------------
+
+/** `gh [-R owner/repo] repo delete …` @param {AnalyzedCommand} command */
+function ghRepoDelete(command) {
+  if (!isCommand(command, 'gh')) return false;
+  let index = 1;
+  while (typeof command.argv[index] === 'string' && /** @type {string} */ (command.argv[index]).startsWith('-')) {
+    index += ['-R', '--repo', '--hostname'].includes(/** @type {string} */ (command.argv[index])) ? 2 : 1;
+  }
+  return command.argv[index] === 'repo' && command.argv[index + 1] === 'delete';
+}
 
 /** @param {AnalyzedCommand} command @returns {{kind: 'matched'|'unknown', endpoint: string}|null} */
 function orgRulesetWrite(command) {
@@ -470,6 +687,8 @@ function ghApiDelete(command) {
   const isDelete = api.method === 'DELETE';
   if (!isDelete && !api.methodUnknown) return null;
   const value = api.endpoint?.value;
+  // A dynamic endpoint with DELETE may be the repository itself.
+  if (value === null && isDelete) return { level: 'protected', evaluation: 'unknown', endpoint: api.endpoint?.display ?? '<?>' };
   if (typeof value !== 'string') return null;
   const path = githubApiPath(value);
   if (path === null) return null;
@@ -546,7 +765,7 @@ function hardPolicy(graph, enabled, ctx) {
       };
     }
 
-    if (enabled('gh-repo-delete') && isCommand(command, 'gh') && command.argv[1] === 'repo' && command.argv[2] === 'delete') {
+    if (enabled('gh-repo-delete') && ghRepoDelete(command)) {
       return {
         ruleId: 'gh-repo-delete', evaluation: 'matched',
         detail: `删除 GitHub 仓库：${trunc(displayCommand(command))}`,
@@ -564,6 +783,25 @@ function hardPolicy(graph, enabled, ctx) {
     }
 
     const rmRecursive = isCommand(command, 'rm') && hasRecursiveFlag(command.argv);
+    const find = parseFind(command);
+    if (findDeletesGitDir(find) && enabled('rm-git-dir')) {
+      return {
+        ruleId: 'rm-git-dir', evaluation: 'matched',
+        detail: `find 删除 git 元数据目录：${trunc(displayCommand(command))}`,
+        why: '删除 .git 会丢掉全部本地提交、分支、stash 和 reflog，无法从工作区恢复。确需重建仓库请交给用户。',
+      };
+    }
+    const findSource = find?.deletes ? find : xargsRmSource(command, graph);
+    if (findSource && enabled('rm-protected-root')) {
+      const hit = findHitsProtected(findSource, ctx.protectedRoots, cwd);
+      if (hit) {
+        return {
+          ruleId: 'rm-protected-root', evaluation: hit.evaluation,
+          detail: `${find ? 'find 删除' : 'find | xargs rm 删除'}范围覆盖受保护根目录：${trunc(displayCommand(command))}`,
+          why: '起点是受保护根目录或其上级，且名字条件可能选中受保护目录本身，执行后整棵树不可恢复。改法：起点写到具体子目录，或用 -name 精确限定。',
+        };
+      }
+    }
     if (rmRecursive) {
       const targets = commandTargets(command);
       const gitDir = targets.find(targetIsGitDir);
@@ -571,7 +809,7 @@ function hardPolicy(graph, enabled, ctx) {
         return {
           ruleId: 'rm-git-dir', evaluation: 'matched',
           detail: `递归删除 git 元数据目录 ${gitDir.display}`,
-          why: '删除 .git 会丢掉全部本地提交、分支、stash 和 reflog，无法从工作区恢复。确需重建仓库请交给用户。',
+          why: '删除 .git（或其中的 objects/refs 等）会丢掉本地提交、分支、stash 和 reflog，无法从工作区恢复。确需重建仓库请交给用户。',
         };
       }
       /** @type {{target: {display: string}, evaluation: 'matched'|'unknown'}|null} */
@@ -591,10 +829,29 @@ function hardPolicy(graph, enabled, ctx) {
       }
     }
 
+    const rsyncDelete = isCommand(command, 'rsync') && command.argv.some((arg) => typeof arg === 'string' && arg.startsWith('--delete'));
+    if (rsyncDelete && enabled('rm-protected-root')) {
+      const destination = commandTargets(command).at(-1);
+      const remote = typeof destination?.value === 'string' && /^[^/]*:/.test(destination.value);
+      const evaluation = destination && !remote
+        ? targetHitsProtected(destination, ctx.protectedRoots, cwd, { ancestors: true, dynamicMatches: true })
+        : null;
+      if (destination && evaluation) {
+        return {
+          ruleId: 'rm-protected-root', evaluation,
+          detail: `rsync --delete 的目标覆盖受保护根目录 ${destination.display}`,
+          why: 'rsync --delete 会删除目标里源端没有的一切，目标是受保护根目录或其上级时等于清空整棵树。改法：目标写到具体子目录。',
+        };
+      }
+    }
+
+    const lnForce = isCommand(command, 'ln') && command.argv.some((arg) => typeof arg === 'string' &&
+      (isLongOption(arg, '--force') || shortOptionHas(arg, /f/)));
     if (ctx.protectedPaths.length && enabled('rm-protected-path') &&
-        (isCommand(command, 'rm') || isCommand(command, 'unlink') || isCommand(command, 'mv'))) {
+        (isCommand(command, 'rm') || isCommand(command, 'unlink') || isCommand(command, 'mv') || lnForce)) {
       const ancestors = rmRecursive || isCommand(command, 'mv');
-      for (const target of commandTargets(command)) {
+      const targets = lnForce ? commandTargets(command).slice(-1) : commandTargets(command);
+      for (const target of targets) {
         const evaluation = targetHitsProtected(target, ctx.protectedPaths, cwd, { ancestors, dynamicMatches: false });
         if (!evaluation) continue;
         return {
@@ -620,56 +877,67 @@ function hardPolicy(graph, enabled, ctx) {
       };
     }
 
+    if (pushMirror(command) && enabled('force-push-main')) {
+      return {
+        ruleId: 'force-push-main', evaluation: 'matched',
+        detail: `push --mirror 强制同步全部 refs（${trunc(displayCommand(command))}）`,
+        why: '--mirror 会强制覆盖远端所有分支（含 main/master）并删除远端独有的 refs，等同于对主干 force push；主干改动请走 PR 流程。',
+      };
+    }
+
     if (forcePush(command)) {
-      const refs = pushRefs(command);
-      const protectedRef = refs.find((ref) => ref.value !== null && isProtectedRef(ref.value));
-      const unknownRef = refs.find((ref) => ref.value === null);
-      const unresolvedTarget = refs.length === 0 || unknownRef !== undefined;
-      if ((protectedRef || unresolvedTarget) && enabled('force-push-main')) {
+      const target = forcePushTarget(command, ctx);
+      if (target && enabled('force-push-main')) {
         return {
-          ruleId: 'force-push-main', evaluation: protectedRef ? 'matched' : 'unknown',
-          detail: `force push 到 main/master（${trunc(displayCommand(command))}，含 --force-with-lease / +refspec 形式）`,
-          why: protectedRef
+          ruleId: 'force-push-main', evaluation: target,
+          detail: `force push 到 main/master（${trunc(displayCommand(command))}，含 --force-with-lease / +refspec / HEAD 形式）`,
+          why: target === 'matched'
             ? '会重写 main/master 的提交历史，其他人基于旧历史的工作会被破坏；主干改动请走 PR 流程。'
-            : 'force push 的目标 ref 无法静态还原，可能是 main/master，必须拒绝。改法：写显式 refspec（如 git push --force-with-lease origin feat/x），即可交给宿主审批。',
+            : 'force push 的目标 ref 无法静态确定（refspec 是变量、HEAD 处于 detached 或读不到、或当前分支的上游是主干），可能是 main/master，必须拒绝。改法：写显式 refspec（如 git push --force-with-lease origin feat/x），即可交给宿主审批。',
         };
       }
     }
 
-    const trunkDelete = pushDeletesTrunk(command);
-    if (trunkDelete && enabled('push-delete-trunk')) {
+    if (pushDeletesTrunk(command, ctx) === 'matched' && enabled('push-delete-trunk')) {
       return {
-        ruleId: 'push-delete-trunk', evaluation: trunkDelete,
+        ruleId: 'push-delete-trunk', evaluation: 'matched',
         detail: `删除远端主干分支：${trunc(displayCommand(command))}`,
-        why: trunkDelete === 'matched'
-          ? '删除远端 main/master 会让所有协作者和 CI 失去主干；主干只能由人处理。'
-          : '远端删除的目标 ref 无法静态还原，可能是 main/master。改法：把分支名写成字面量。',
+        why: '删除远端 main/master 会让所有协作者和 CI 失去主干；主干只能由人处理。',
       };
     }
   }
   return null;
 }
 
-/** @param {AnalyzedCommand} command @returns {Array<{value: string|null, display: string}>} */
-function relocatingTargets(command) {
-  if (isCommand(command, 'rm') && hasRecursiveFlag(command.argv)) return commandTargets(command);
-  if (isCommand(command, 'mv')) return commandTargets(command);
+/**
+ * Paths a command deletes or moves, each with the directory a relative path
+ * is resolved against (`git -C` changes it; null = unknown).
+ * @param {AnalyzedCommand} command @param {string|null} cwd
+ * @returns {Array<TargetWord & {base: string|null}>}
+ */
+function relocatingTargets(command, cwd) {
+  /** @param {TargetWord[]} targets @param {string|null} [base] */
+  const at = (targets, base = cwd) => targets.map((target) => ({ ...target, base }));
+  if (isCommand(command, 'rm') && hasRecursiveFlag(command.argv)) return at(commandTargets(command));
+  if (isCommand(command, 'mv')) return at(commandTargets(command));
   if (isCommand(command, 'rsync') && command.argv.some((arg) => typeof arg === 'string' && arg.startsWith('--delete'))) {
     const targets = commandTargets(command);
     const destination = targets[targets.length - 1];
-    return destination && !(typeof destination.value === 'string' && /^[^/]*:/.test(destination.value)) ? [destination] : [];
+    return destination && !(typeof destination.value === 'string' && /^[^/]*:/.test(destination.value)) ? at([destination]) : [];
   }
+  const find = parseFind(command);
+  if (find?.deletes) return at(find.starts);
   const git = parseGitCommand(command);
   if (git?.subcommand === 'worktree' && (git.args[0] === 'remove' || git.args[0] === 'move')) {
     const display = effectiveDisplayArgv(command).slice(git.argOffset);
-    /** @type {Array<{value: string|null, display: string}>} */
+    /** @type {TargetWord[]} */
     const targets = [];
     for (let index = 1; index < git.args.length; index++) {
       const arg = git.args[index];
       if (typeof arg === 'string' && arg.startsWith('-')) continue;
       targets.push({ value: arg, display: arg ?? display[index] ?? '<?>' });
     }
-    return targets;
+    return at(targets, gitWorkDir(git, cwd));
   }
   return [];
 }
@@ -685,16 +953,18 @@ function relocatingTargets(command) {
 function unsandboxedOutsideProject(graph, ctx) {
   if (ctx.tier !== 'bypass') return null;
   if (!ctx.unsandboxed && !isExcludedCommandGraph(graph)) return null;
-  const root = ctx.cwd ? ctx.inspect(ctx.cwd).projectRoot : null;
+  const root = projectInfo(ctx)?.projectRoot ?? null;
+  /** @param {string} path */
+  const inside = (path) => root !== null && path !== root && isAncestorOrSelf(root, path);
   for (const command of graph.commands) {
-    for (const target of relocatingTargets(command)) {
+    for (const target of relocatingTargets(command, ctx.trustedCwd)) {
       /** @type {'matched'|'unknown'|null} */
       let evaluation = null;
       if (target.value === null) evaluation = 'unknown';
       else {
-        const resolved = resolveTarget(target.value, ctx.trustedCwd);
+        const resolved = resolveTarget(target.value, target.base);
         if (resolved.kind === 'relative') evaluation = 'unknown';
-        else if (root === null || !resolved.path.startsWith(`${root}/`)) evaluation = 'matched';
+        else if (!inside(resolved.path)) evaluation = 'matched';
       }
       if (!evaluation) continue;
       return {
@@ -702,11 +972,36 @@ function unsandboxedOutsideProject(graph, ctx) {
         detail: `沙盒外执行的删除/移动目标在项目根${root ? `（${root}）` : ''}以外：${trunc(displayCommand(command))}`,
         why: evaluation === 'matched'
           ? '这条命令不受项目沙盒的写权限约束，bypass 下也不会有其他确认；目标在项目外，需要人确认。'
-          : '这条命令在沙盒外执行，删除/移动目标无法静态确定（变量、通配符或 cwd 不可信），需要人确认。',
+          : '这条命令在沙盒外执行，删除/移动目标无法静态确定（变量、通配符、git -C 或 cwd 不可信），需要人确认。',
+      };
+    }
+    // Discarding git operations act on the repository they run in; outside
+    // the project nothing else stands between them and that repository.
+    const git = parseGitCommand(command);
+    const rule = git ? gitRule(command) : null;
+    if (git && (rule === 'git-discard' || rule === 'git-ref-change')) {
+      const directory = gitWorkDir(git, ctx.trustedCwd);
+      if (directory !== null && (inside(directory) || directory === root)) continue;
+      return {
+        ruleId: 'unsandboxed-outside-project', evaluation: directory === null ? 'unknown' : 'matched',
+        detail: `沙盒外在项目根${root ? `（${root}）` : ''}以外的仓库执行丢弃/改引用的 Git 操作：${trunc(displayCommand(command))}`,
+        why: directory === null
+          ? '这条 Git 命令在沙盒外执行，工作目录无法静态确定（git -C 变量或 cwd 不可信），需要人确认。'
+          : '这条 Git 命令在沙盒外执行、作用于项目以外的仓库，bypass 下也不会有其他确认，需要人确认。',
       };
     }
   }
   return null;
+}
+
+/**
+ * The session's project: the Claude Code launch directory when the host
+ * reports it, else the hook cwd.
+ * @param {RuleContext} ctx
+ */
+function projectInfo(ctx) {
+  if (ctx.projectDir) return ctx.inspectProject(ctx.projectDir);
+  return ctx.cwd ? ctx.inspect(ctx.cwd) : null;
 }
 
 const GIT_RULE_TEXT = {
@@ -735,7 +1030,7 @@ const GIT_RULE_TEXT = {
     why: '这些子命令会在每一步运行一段 shell，guard 看不到其内容，请确认命令本身。',
   },
   'git-push-bulk': {
-    detail: '批量同步或删除远端 refs（push --mirror / --prune）',
+    detail: '批量删除远端 refs（push --prune）',
     why: '会删除远端上本地不存在的 refs，可能一次性删掉他人的分支和 tag，请确认 remote。',
   },
   'git-low-risk': {
@@ -744,8 +1039,8 @@ const GIT_RULE_TEXT = {
   },
 };
 
-/** @param {ShellGraph} graph @param {PolicyEnabled} enabled @returns {PolicyMatch|null} */
-function confirmationPolicy(graph, enabled) {
+/** @param {ShellGraph} graph @param {PolicyEnabled} enabled @param {RuleContext} ctx @returns {PolicyMatch|null} */
+function confirmationPolicy(graph, enabled, ctx) {
   for (const command of graph.commands) {
     const tool = commandName(command);
     if (enabled('remote-exec') && ['ssh', 'scp', 'rsync'].includes(tool) && (tool === 'rsync' || !hasFlag(command.argv, '-G'))) {
@@ -828,10 +1123,18 @@ function confirmationPolicy(graph, enabled) {
       };
     }
 
+    if (pushDeletesTrunk(command, ctx) === 'unknown' && enabled('push-delete-dynamic')) {
+      return {
+        ruleId: 'push-delete-dynamic', evaluation: 'unknown',
+        detail: `删除远端分支，但目标无法静态确定：${trunc(displayCommand(command))}`,
+        why: '远端删除的目标 ref 是变量，可能是 main/master；请确认展开后的分支名。改法：把分支名写成字面量。',
+      };
+    }
+
     const resetRef = hardResetRef(command);
     if (typeof resetRef === 'string') {
-      const trunk = /^(?:(?:origin|upstream)\/)?(?:main|master)$/.test(resetRef);
-      if (trunk || /^origin\//.test(resetRef)) {
+      const trunk = resetRefIsTrunk(resetRef, command, ctx);
+      if (trunk || /^(?:origin\/|refs\/remotes\/|remotes\/)/.test(resetRef) || UPSTREAM_REF.test(resetRef)) {
         const ruleId = trunk ? 'reset-hard-main' : 'reset-hard-remote';
         if (enabled(ruleId)) {
           return {
@@ -905,6 +1208,10 @@ function confirmationPolicy(graph, enabled) {
  *   protectedRoots?: string[],
  *   protectedPaths?: string[],
  *   inspectDirectory?: (directory: string) => ProjectInfo,
+ *   inspectProjectDir?: (directory: string) => ProjectInfo,
+ *   host?: 'claude'|'codex'|'grok'|'kimi',
+ *   projectDir?: string,
+ *   caseInsensitivePaths?: boolean,
  * }} GuardOptions
  */
 
@@ -945,14 +1252,55 @@ export function eventToolInput(event) {
  * requested intervention.
  *
  * Hook fields used besides the tool input: `cwd` (relative-path resolution,
- * project lookup), `permission_mode` (tiering), and
- * `tool_input.dangerouslyDisableSandbox`.
+ * project lookup), `permission_mode` (tiering, Claude only), and
+ * `tool_input.dangerouslyDisableSandbox`. The caller passes the host and, for
+ * Claude Code, the session's `CLAUDE_PROJECT_DIR` as options.
  *
  * @param {Record<string, unknown>} event
  * @param {GuardOptions} [options]
  * @returns {GuardDecision|{kind: 'allow', command: string, description: string, analysis: ShellGraph}|null}
  */
 export function evaluateHookEvent(event, options = {}) {
+  if (options.caseInsensitivePaths === undefined) return evaluate(event, options);
+  const previous = setCaseInsensitivePaths(options.caseInsensitivePaths);
+  try { return evaluate(event, options); } finally { setCaseInsensitivePaths(previous); }
+}
+
+/**
+ * The directory commands run in after the command's own `cd`s, when that is
+ * knowable: no cwd change at all, or only literal `cd`s leading a single
+ * `&&` chain (`cd /tmp/x && rm -rf data`). Anything else is untrusted (null).
+ * @param {ShellGraph} analysis @param {string|null} cwd
+ */
+function inferCwd(analysis, cwd) {
+  const changes = analysis.commands.filter((item) => CWD_CHANGING.has(commandName(item)));
+  if (changes.length === 0) return cwd;
+  // Every cd goes to the directory the command already runs in: whether or
+  // not each one succeeds, the cwd stays the same.
+  if (cwd !== null && changes.every((item) => {
+    const operands = item.argv.slice(1).filter((arg) => !(typeof arg === 'string' && /^-[LPe@]+$/.test(arg)));
+    if (commandName(item) !== 'cd' || operands.length !== 1 || typeof operands[0] !== 'string') return false;
+    const target = expandHome(operands[0]);
+    return target.startsWith('/') && normalizePath(target) === cwd;
+  })) return cwd;
+  const prefix = analysis.cdPrefix;
+  if (!prefix || prefix.length !== changes.length || changes.some((item) => commandName(item) !== 'cd')) return null;
+  let current = cwd;
+  for (const operand of prefix) {
+    const expanded = operand === '' ? homedir() : expandHome(operand);
+    if (expanded.startsWith('/')) current = normalizePath(expanded);
+    else if (current === null) return null;
+    else current = normalizePath(`${current}/${expanded}`);
+  }
+  return current;
+}
+
+/**
+ * @param {Record<string, unknown>} event
+ * @param {GuardOptions} options
+ * @returns {GuardDecision|{kind: 'allow', command: string, description: string, analysis: ShellGraph}|null}
+ */
+function evaluate(event, options) {
   const toolName = String(event.tool_name ?? event.toolName ?? '');
   if (!/^(Bash|shell|local_shell|exec_command|run_terminal_command)$/i.test(toolName)) return null;
   const toolInput = eventToolInput(event);
@@ -969,18 +1317,20 @@ export function evaluateHookEvent(event, options = {}) {
     maxCommands: options.maxCommands,
   });
   const profile = resolvePolicyProfile(options.profile);
-  const tier = permissionTier(event.permission_mode ?? event.permissionMode);
+  const tier = permissionTier(event.permission_mode ?? event.permissionMode, options.host ?? 'claude');
   const enabled = (/** @type {string} */ ruleId) => isPolicyEnabled(ruleId, profile, tier);
   const cwd = eventCwd(event);
   /** @type {RuleContext} */
   const ctx = {
     tier,
     cwd,
-    trustedCwd: analysis.commands.some((item) => CWD_CHANGING.has(commandName(item))) ? null : cwd,
+    trustedCwd: inferCwd(analysis, cwd),
+    projectDir: typeof options.projectDir === 'string' && options.projectDir.startsWith('/') ? normalizePath(options.projectDir) : null,
     unsandboxed: toolInput.dangerouslyDisableSandbox === true,
     protectedRoots: options.protectedRoots ?? ['/'],
     protectedPaths: options.protectedPaths ?? [],
     inspect: memoizeInspector(options.inspectDirectory ?? ((directory) => inspectDirectory(directory))),
+    inspectProject: memoizeInspector(options.inspectProjectDir ?? ((directory) => inspectProjectDir(directory))),
   };
 
   const hard = hardPolicy(analysis, enabled, ctx);
@@ -997,13 +1347,13 @@ export function evaluateHookEvent(event, options = {}) {
   }
 
   if (tier === 'bypass' && enabled('bypass-no-project-sandbox')) {
-    const project = cwd ? ctx.inspect(cwd) : null;
+    const project = projectInfo(ctx);
     if (!project?.sandboxConfigured && !isReadOnlyGraph(analysis)) {
-      const where = project?.gitRoot ?? cwd ?? '(hook 未提供 cwd)';
+      const where = ctx.projectDir ?? project?.gitRoot ?? cwd ?? '(hook 未提供 cwd)';
       return {
         kind: 'deny', evaluation: 'matched', ruleId: 'bypass-no-project-sandbox', command, description, analysis,
         detail: `bypass 会话所在项目（${where}）没有项目沙盒配置，拒绝写类命令：${trunc(command)}`,
-        why: 'bypass 只能在配好项目沙盒的项目里用；先配 .claude/settings.json 或切 auto。（判定：会话 cwd 所在 git 根的 .claude/settings.json + settings.local.json 需有 sandbox.enabled: true，或未禁用且 sandbox.filesystem.allowWrite 非空；/tmp、scratchpad 不算项目。只读命令不受影响。）',
+        why: 'bypass 只能在配好项目沙盒的项目里用；先配 .claude/settings.json 或切 auto。（判定：会话启动目录 CLAUDE_PROJECT_DIR——没有时用 cwd 所在 git 根——的 .claude/settings.json + settings.local.json 需未禁用沙盒且 sandbox.filesystem.allowWrite 非空，linked worktree 还会读主 worktree；只写 sandbox.enabled: true 不算；/tmp、scratchpad 不算项目。只读命令不受影响。）',
       };
     }
   }
@@ -1024,7 +1374,7 @@ export function evaluateHookEvent(event, options = {}) {
   const outside = enabled('unsandboxed-outside-project') ? unsandboxedOutsideProject(analysis, ctx) : null;
   if (outside) return { kind: 'confirm', command, description, analysis, ...outside };
 
-  const confirmation = confirmationPolicy(analysis, enabled);
+  const confirmation = confirmationPolicy(analysis, enabled, ctx);
   if (confirmation) {
     const kind = confirmation.ruleId === 'git-low-risk' ? 'review' : 'confirm';
     return { kind, command, description, analysis, ...confirmation };

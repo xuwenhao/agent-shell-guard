@@ -95,19 +95,31 @@ test('reviewer subprocesses cannot call shell tools recursively', () => {
   }
 });
 
-test('dangerous-only leaves relaxed Git operations to Codex itself (no permission mode = relaxed tier)', () => {
+test('dangerous-only on Codex keeps the 0.4 semantics: delegate when a native prefix covers it, else deny', () => {
   const config = { ...BASE_CONFIG, profile: 'dangerous-only' };
-  for (const command of ['git clean -df', 'git checkout tracked.txt', 'git checkout -Bfeat',
-    'git restore a.ts && git status', 'git branch -D old-feature', 'git worktree remove .worktrees/x',
-    'git reset --hard HEAD~1', 'git stash drop', 'git config --global user.name x']) {
+  for (const command of ['git branch -D old-feature', 'git worktree remove .worktrees/x', 'git reset --hard HEAD~1',
+    'git stash drop', 'git config --global user.name x', 'git clean -f -d', 'git checkout -- a.ts',
+    'git push --delete origin feat/old', 'git branch -D main']) {
     assert.equal(permission(adaptCodex(event(command), config)), 'pass', command);
   }
-  for (const command of ['git push origin main --force', 'gh repo delete acme/old --yes', 'git clean -ffdx']) {
+  // Confirmations without a covering prefix (or in a compound) fail closed, as in 0.4.
+  for (const command of ['git clean -df', 'git checkout tracked.txt', 'git restore a.ts && git status',
+    'chmod 777 x', 'gh api -X DELETE repos/acme/demo/labels/bug']) {
     assert.equal(permission(adaptCodex(event(command), config)), 'deny', command);
+  }
+  for (const command of ['git push origin main --force', 'gh repo delete acme/old --yes', 'git clean -ffdx', 'git push --mirror backup']) {
+    assert.equal(permission(adaptCodex(event(command), config)), 'deny', command);
+  }
+  // Without the installed native rules every confirmation is a deny.
+  const noNative = { ...config, nativePrompt: { codex: false, grok: false, kimi: false } };
+  assert.equal(permission(adaptCodex(event('git reset --hard HEAD~1'), noNative)), 'deny');
+  // Claude without permission_mode is the relaxed tier: the classifier decides.
+  for (const command of ['git reset --hard HEAD~1', 'git clean -df', 'chmod 777 x', 'git config --global user.name x']) {
+    assert.equal(permission(adaptClaude(event(command), config)), 'pass', command);
   }
 });
 
-test('legacy-dangerous on Codex: confirms outside the 0.5 native table fail closed', () => {
+test('legacy-dangerous on Codex: confirms outside the native table fail closed', () => {
   const config = { ...BASE_CONFIG, profile: 'legacy-dangerous' };
   for (const command of ['git clean -df', 'git checkout tracked.txt', 'git branch -q -D old-feature']) {
     assert.equal(permission(adaptCodex(event(command), config)), 'deny', command);
@@ -144,12 +156,15 @@ test('Codex blocked delegation exposes stable diagnostic codes and bounded recov
   assert.doesNotMatch(hard?.hookSpecificOutput.permissionDecisionReason ?? '', /恢复：|guard-diagnostic/);
 });
 
-test('Kimi and Grok keep the medium native list (git-discard still delegated)', () => {
-  for (const command of ['git checkout tracked.txt', 'git clean -df', 'git reset --hard HEAD~1', 'git stash drop']) {
+test('Kimi and Grok keep the medium native list (every clean/checkout form delegated)', () => {
+  for (const command of ['git checkout tracked.txt', 'git clean -df']) {
     assert.equal(permission(adaptCodex(event(command), BASE_CONFIG)), 'deny', command);
     assert.equal(permission(adaptKimi(event(command), BASE_CONFIG)), 'pass', command);
     assert.equal(grokPermission(adaptGrok(grokEvent(command), BASE_CONFIG)), 'pass', command);
   }
-  // Relaxed non-trunk ref changes have no native prompt anywhere any more.
-  assert.equal(permission(adaptKimi(event('git branch -D old-feature'), BASE_CONFIG)), 'deny');
+  for (const command of ['git reset --hard HEAD~1', 'git stash drop', 'git branch -D old-feature']) {
+    assert.equal(permission(adaptCodex(event(command), BASE_CONFIG)), 'pass', command);
+    assert.equal(permission(adaptKimi(event(command), BASE_CONFIG)), 'pass', command);
+    assert.equal(grokPermission(adaptGrok(grokEvent(command), BASE_CONFIG)), 'pass', command);
+  }
 });

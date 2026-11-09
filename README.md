@@ -183,12 +183,14 @@ AGENT_SHELL_GUARD_REVIEWER_TIMEOUT_MS
 
 ## Policy profiles
 
-- `dangerous-only` (default): hard boundaries everywhere; a short list of
-  ask-level confirmations only in Claude bypass sessions (see below).
+- `dangerous-only` (default): hard boundaries everywhere. In Claude Code a
+  short list of ask-level confirmations only in bypass sessions; on Codex,
+  Grok and Kimi the 0.4 confirmation set (see the tier table).
 - `legacy-dangerous`: rollback switch. The 0.4 `dangerous-only` confirmation
   set (including working-tree discards, non-trunk branch deletion, `chmod 777`,
-  generic `gh api` DELETE) in every permission mode, on top of the 0.5 hard
-  boundaries.
+  generic `gh api` DELETE) in every permission mode and on every host, without
+  the 0.5 bypass-session rules (`bypass-no-project-sandbox`,
+  `unsandboxed-outside-project`). The 0.5 hard boundaries stay.
 - `full`: every bundled confirmation and review rule, in every mode.
 - `off`: disables policy rules, but parser infrastructure failure still denies.
 
@@ -199,49 +201,53 @@ Both the CLI configuration and direct library calls default to
 
 Claude Code sends `permission_mode` on hook input. Under `dangerous-only`:
 
-| Hook `permission_mode` | Tier | Ask-level rules | Deny rules | Extra |
-|---|---|---|---|---|
-| `auto`, `default`, `acceptEdits`, `plan`, unknown | relaxed | silent — the auto classifier or host decides | deny | — |
-| missing (Codex, Grok, Kimi, older Claude Code) | relaxed | silent — native rules decide | deny | — |
-| `bypassPermissions` | bypass | `ask` | deny | project-sandbox check, unsandboxed-call check |
+| Host / hook `permission_mode` | Tier | Ask-level rules | 0.4 confirmations relaxed in 0.5 | Deny rules | Extra |
+|---|---|---|---|---|---|
+| Claude: `auto`, `default`, `acceptEdits`, `plan`, unknown, missing | relaxed | silent — the auto classifier decides | silent | deny | — |
+| Claude: `bypassPermissions` | bypass | `ask` | silent (project sandbox) | deny | project-sandbox check, unsandboxed-call check |
+| Codex, Grok, Kimi (any input) | native | confirm | confirm | deny | — |
 
 A hook `ask` in auto mode forces a human prompt the classifier cannot answer,
 so ask-level rules stay silent there. In bypass mode nothing else asks, so the
-guard does.
+guard does. Codex, Grok and Kimi have neither permission modes nor a
+classifier, so they keep the 0.4 behaviour: a confirmation is delegated to the
+host's native prompt rule when one covers the exact command (a single static
+argv), and denied otherwise. The adapter, not the event, decides the host.
 
 ### Rules (`dangerous-only`)
 
 | Rule | Decision | Matches |
 |---|---|---|
 | `org-ruleset-write` | deny | `gh api` writes to `orgs/<org>/rulesets` (path or URL; dynamic endpoint with a write method also denies) |
-| `rm-protected-root` | deny | recursive `rm` of a protected root **or any ancestor of one**; relative targets and globs resolved against the hook `cwd` (below) |
-| `rm-git-dir` | deny | recursive `rm` whose target basename is `.git` (`rm -rf .git`, `rm -rf sub/.git/`, `rm -rf .git/*`) |
-| `rm-protected-path` | deny | `rm` / `unlink` / `mv` on a literal `protectedPaths` entry (recursive `rm` and `mv` also on its ancestors) |
+| `rm-protected-root` | deny | recursive `rm` of a protected root **or any ancestor of one**; relative targets, globs and brace expansions resolved against the hook `cwd` (below). Also `find <ancestor> … -delete` / `-exec rm -r…` whose name tests can select the root, `find … \| xargs rm -r…` and `echo <path> \| xargs rm -r…`, `rsync --delete` into a root, and the same inside a double-quoted `bash -c` / `sh -c` / `eval` script whose expansions are treated as unknown words |
+| `rm-git-dir` | deny | recursive `rm` with a `.git` segment anywhere in the target (`rm -rf .git`, `sub/.git/`, `.git/objects`, `.g*`); `find` that deletes `.git` (`-name .git -exec rm -rf`, `-path '*/.git/*' -delete`) |
+| `rm-protected-path` | deny | `rm` / `unlink` / `mv` / `ln -f` on a literal `protectedPaths` entry (recursive `rm` and `mv` also on its ancestors) |
 | `git-clean-root` | deny | `git clean` with two `-f` anywhere; or `-x`/`-X` when the run directory is a thin project root (a repo with nested member repos), a pathspec widens to it (`:/`, `..`, absolute), or the directory is unknown; or a dynamic option word |
-| `force-push-main` | deny | force push to main/master, or to an unresolvable ref. Write an explicit refspec to hand a non-trunk force push to the host |
-| `push-delete-trunk` | deny | `git push --delete main`, `git push origin :main` (also `refs/heads/`, `master`, unresolvable ref) |
-| `gh-repo-delete` | deny | `gh repo delete` |
-| `gh-api-delete-protected` | deny | `gh api` DELETE on `repos/<o>/<r>`, `…/rulesets…`, `…/branches/<b>/protection…`, `…/git/refs/heads/(main\|master)` |
-| `guard-unavailable` | deny | parser missing / timeout / invalid output (independent of profile) |
+| `force-push-main` | deny | force push whose target is main/master: an explicit refspec, `--all`/`--branches`, or `HEAD`/`@`/no refspec while main/master is checked out (read from the repository's `HEAD`); `push --mirror`. Unknown — a dynamic refspec, detached or unreadable `HEAD`, a current branch whose upstream is main/master — also denies. Write an explicit refspec to hand a non-trunk force push to the host |
+| `push-delete-trunk` | deny | `git push --delete main`, `git push origin :main` (also `refs/heads/`, `master`, `HEAD`/`@` while on main) |
+| `gh-repo-delete` | deny | `gh [-R owner/repo] repo delete` |
+| `gh-api-delete-protected` | deny | `gh api` DELETE on `repos/<o>/<r>`, `…/rulesets…`, `…/branches/<b>/protection…`, `…/git/refs/heads/(main\|master)`, or on a dynamic endpoint |
+| `guard-unavailable` | deny | parser missing / timeout / invalid output (independent of profile, including `off`) |
 | `bypass-no-project-sandbox` | deny (bypass) | write-class command while the session's project has no project sandbox config |
 | `destructive-sql` | ask (bypass) | `psql`/`mysql`/`mysqlsh`/`sqlite3` with DROP TABLE/DATABASE/SCHEMA or TRUNCATE |
-| `reset-hard-main` | ask (bypass) | `git reset --hard` to `main`/`master`/`origin/…`/`upstream/…` |
+| `reset-hard-main` | ask (bypass) | `git reset --hard` to `main`/`master`, `origin/…`/`upstream/…`, `refs/remotes/<r>/…`, `refs/heads/…`, or `@{u}`/`@{upstream}` when the configured upstream is main/master |
 | `git-trunk-ref` | ask (bypass) | `branch -d/-D/-M/-C/-f` on main/master or an unresolvable name; `checkout -B`, `switch -C`, `worktree add -B` on main/master/`-`/`@{…}`/unresolvable |
 | `git-config-global` | ask (bypass) | `git config --global/--system` writes (reads such as `--get`, `--list`, `<key>` alone are silent) |
 | `git-lfs` | ask (bypass) | `git lfs install/uninstall/migrate` |
 | `git-exec` | ask (bypass) | `git rebase -x/--exec`, `git submodule foreach` |
-| `git-push-bulk` | ask (bypass) | `git push --mirror/--prune` |
+| `git-push-bulk` | ask (bypass) | `git push --prune` |
+| `push-delete-dynamic` | ask (bypass) | `git push --delete "$b"`: the deleted ref is a variable |
 | `gh-api-delete-sensitive` | ask (bypass) | `gh api` DELETE on `keys`, `hooks`, `actions/secrets`, `environments` (repo or org), `user/keys` |
-| `unsandboxed-outside-project` | ask (bypass) | an unsandboxed call (below) whose recursive `rm`, `mv`, `git worktree remove/move` or `rsync --delete` target is outside the project root |
+| `unsandboxed-outside-project` | ask (bypass) | an unsandboxed call (below) whose recursive `rm`, `mv`, `find -delete`, `git worktree remove/move` (relative to `git -C`) or `rsync --delete` target is outside the project root; or a discarding / ref-changing git command (`git-discard`, `git-ref-change`) whose repository (`git -C`, `cd`) is outside it |
 
-Silent under `dangerous-only` in every tier (the host, the classifier, or the
-project sandbox handles them): working-tree discards (`git-discard`: `reset`,
+Silent under `dangerous-only` in Claude sessions (the classifier or the
+project sandbox handles them), confirmed on Codex/Grok/Kimi: working-tree discards (`git-discard`: `reset`,
 `restore`, `rm`, `clean -f`, `stash drop/clear`, path-restoring `checkout`,
 `switch -f/--discard-changes`, `worktree remove --force`, `tag -f`),
 non-trunk ref changes (`git-ref-change`: `branch -D/-M/-C`, `worktree remove`
 without force, `worktree add -B`, `checkout -B`, `switch -C`, `push --delete`
 of a non-trunk ref, `lfs prune`), `chmod 777`, and `gh api` DELETE on other
-endpoints. `legacy-dangerous` and `full` still confirm all of these.
+endpoints. `legacy-dangerous` and `full` confirm all of these everywhere.
 
 ### Paths: protected roots, protected paths and the hook cwd
 
@@ -252,28 +258,52 @@ expanded, merged like `protectedRoots`) lists individual paths such as
 compatibility symlinks.
 
 Comparisons stay lexical — no filesystem access, `.`/`..` collapsed — so
-`rm -rf /tmp/../root` is judged as `/root`. A relative target is joined to the
-hook event's `cwd` literally, so `rm -rf dotfiles` from the parent of a
-protected `…/dotfiles` is denied. When the cwd cannot be trusted — the command
-contains `cd`/`pushd`/`popd`/`source`, or the host sent no `cwd` — a relative
-target is denied if its segments appear inside any protected path (some cwd
-would make it land there), and `.`/`..` are denied outright. Globs are
-matched segment-wise against protected paths: `rm -rf ~/Codebase/*` covers
-`~/Codebase/personal`, `rm -rf ~/Codebase/*/node_modules` does not. Deletion
-through a symlink is out of reach; the sandbox's write scope is the backstop.
+`rm -rf /tmp/../root` is judged as `/root`. On macOS (case-insensitive by
+default) paths and `.git` are compared case-insensitively, so
+`rm -rf ~/codebase/Personal` and `rm -rf .GIT` are caught. A relative target is
+joined to the hook event's `cwd` literally, so `rm -rf dotfiles` from the
+parent of a protected `…/dotfiles` is denied.
+
+The command's own `cd` is followed only when it is certain to have happened:
+literal `cd` operands leading a single `&&` chain (`cd /tmp/x && rm -rf data`
+runs in `/tmp/x`). Any other directory change — `cd "$X"`, `cd a; …`,
+`cd a || …`, a subshell, `pushd`/`popd`/`source` — or a hook without `cwd`
+makes the cwd unknown. Then a relative target is denied when its segments
+appear inside a protected path (some cwd would make it land there), except a
+single common name (`data`, `build`, `src`, `tmp`, `node_modules`, …), which
+identifies no particular root; `.` and `..` are denied outright. The trade-off:
+`cd "$X" && rm -rf data` is allowed even though `$X` might be the parent of a
+protected `…/data`, while `cd "$X" && rm -rf dotfiles` and
+`rm -rf devinfra/data` stay denied.
+
+Globs and unquoted brace expansions are expanded into candidates (up to 64;
+beyond that the literal prefix decides). Each glob is matched segment-wise:
+`rm -rf ~/Codebase/*` covers `~/Codebase/personal`,
+`rm -rf ~/Codebase/*/node_modules` does not. Inside a protected root only a
+pattern that matches every entry (`*`, `.*`, `.[!.]*`, …) empties it;
+`tmp-*`, `*.egg-info` or `.worktrees/feat-*` do not. Deletion through a
+symlink is out of reach; the sandbox's write scope is the backstop.
 
 ### Bypass sessions
 
-**Project sandbox check.** From the hook `cwd` the guard walks up to the
-nearest directory containing `.git` (a plain stat, no git subprocess) and reads
-`.claude/settings.json` merged with `.claude/settings.local.json` there
-(objects merge, arrays concatenate, local scalars win). The project counts as
-configured when `sandbox` is an object and either `sandbox.enabled === true`,
-or `sandbox.enabled !== false` and `sandbox.filesystem.allowWrite` is a
-non-empty array. `permissions.blockWritesOutsideWorkingDirectories` comes from
-user-level settings and is not checked. No `cwd`, no git root, unreadable or
-invalid JSON, and any repository under `/tmp`, `/private/tmp`, `/var/folders`,
-`/private/var/folders` or the OS temp dir all count as not configured.
+**Project sandbox check.** Claude Code gives hook processes
+`CLAUDE_PROJECT_DIR`, the directory the session started in and the place it
+reads project settings from (the hook `cwd` follows the Bash tool's persisted
+`cd` instead). The guard reads `.claude/settings.json` merged with
+`.claude/settings.local.json` there (objects merge, arrays concatenate, local
+scalars win). Without `CLAUDE_PROJECT_DIR` it walks up from the hook `cwd` to
+the nearest directory containing `.git` (a plain stat, no git subprocess). A
+linked worktree (`.git` is a file: `member/.worktrees/x`,
+`.claude/worktrees/agent-*`) also reads the main worktree's settings, found
+through `gitdir`/`commondir`, because an untracked `settings.local.json` only
+exists there. The project counts as configured when
+`sandbox.filesystem.allowWrite` is a non-empty array and `sandbox.enabled` is
+not `false`; `enabled: true` alone does not count, since the user-level
+settings already enable the sandbox. `permissions.blockWritesOutsideWorkingDirectories`
+comes from user-level settings and is not checked. No project directory, no
+git root, unreadable or invalid JSON, and any location under `/tmp`,
+`/private/tmp`, `/var/folders`, `/private/var/folders` or the OS temp dir all
+count as not configured.
 
 Without a configured project, bypass sessions get `bypass-no-project-sandbox`
 for every **write-class** command: *"bypass 只能在配好项目沙盒的项目里用；先配
@@ -283,18 +313,26 @@ understood it, every redirection reads or targets `/dev/null`,
 `/dev/stdout`, `/dev/stderr`, `/dev/tty` or an fd, and every command is on the
 reader allowlist:
 
-- plain readers (`ls`, `cat`, `head`, `tail`, `grep`, `rg`, `wc`, `stat`, `du`,
-  `diff`, `jq`, `echo`, `printf`, `pwd`, `cd`, `which`, `ps`, …);
+- plain readers (`ls`, `cat`, `head`, `tail`, `grep`, `wc`, `stat`, `du`,
+  `diff`, `jq`, `echo`, `printf`, `pwd`, `cd`, `which`, `ps`, …), also behind
+  `xargs`;
 - readers with their writing options excluded: `find` (no `-delete`,
-  `-exec*`, `-ok*`, `-fprint*`), `fd` (no exec), `sed` (no `-i`, no `w`),
-  `awk` (no `-i inplace`, redirection, pipe, `system`, `getline`), `sort` (no
-  `-o`), `uniq` (one operand), `tree` (no `-o`), `yq` (no `-i`), `command -v`;
+  `-exec*`, `-ok*`, `-fprint*`), `fd` (no exec), `rg` (no `--pre`), `sed` (no
+  `-i`, `-f`, `w`, `e` command or `s///e` flag), `awk` (no `-f`, `-i inplace`,
+  redirection, pipe, `system`, `getline`), `man` (no `-P`/`-H`), `sort` (no
+  `-o`), `uniq` (one operand), `tree` (no `-o`), `yq` (no `-i`), `command -v`,
+  `curl` to stdout with GET/HEAD (no `-o`/`-O`/`-T`/`-d`/`--data*`/`-F`/`-K`/
+  `-c`/`-D`, no other `-X`), `npm ls/view/info/outdated/explain`,
+  `node --version`;
 - `git` read subcommands (`status`, `log`, `show`, `diff`, `rev-parse`,
   `ls-files`, `blame`, `grep`, …) and the listing forms of `branch`, `tag`,
   `remote`, `worktree list`, `stash list/show`, `config` reads, `reflog`,
-  `submodule status`;
-- `gh` view/list subcommands, `gh search`, `gh auth status`, and `gh api`
-  without fields and with no method or `GET`/`HEAD`.
+  `submodule status` — never with a global `-c`/`--config-env` (pager,
+  fsmonitor, alias and diff drivers run commands), `--ext-diff` or
+  `--textconv`;
+- `gh` view/list subcommands, `gh search`, `gh auth status`, `gh api`
+  without fields and with no method or `GET`/`HEAD`, and `gh api graphql`
+  whose static fields contain no `mutation`.
 
 Everything else — interpreters, package managers, `git fetch`/`commit`,
 `touch`, `tee`, `sudo …`, unknown tools — is a write. False positives only cost
@@ -305,11 +343,14 @@ a deny in a session that should be in auto anyway.
 or the whole command is one of the commands typically listed in
 `sandbox.excludedCommands` (`gh`, `ssh`, `scp`, `rsync`, `tailscale`, `op`,
 `kubectl`, `gcloud`, `docker`, `git push/fetch/pull/clone/worktree`,
-`git branch -d/-D`). Its recursive `rm`, `mv`, `git worktree remove/move`
-and `rsync --delete` targets must be strictly inside the project root, the
-outermost repository enclosing `cwd` below the home directory — so a thin
-root's members and `.worktrees/` are inside even from a member session.
-Anything else, including unresolvable targets, asks.
+`git branch -d/-D`). Its recursive `rm`, `mv`, `find -delete`,
+`git worktree remove/move` (resolved against `git -C`) and `rsync --delete`
+targets must be strictly inside the project root — the outermost repository
+enclosing the project directory (`CLAUDE_PROJECT_DIR`, else the hook `cwd`)
+below the home directory, so a thin root's members and `.worktrees/` are
+inside even from a member session — and so must the repository of a
+discarding or ref-changing git command. Anything else, including unresolvable
+targets, asks.
 
 ### Unsandboxed-call log
 
@@ -323,7 +364,12 @@ with `AGENT_SHELL_GUARD_STATE_DIR`):
 ```
 
 The write is best effort; failures are swallowed and never change the
-decision.
+decision. Redaction covers `Authorization`/`X-Api-Key`/`Cookie` headers, URL
+`user:password@`, `--password=`/`--token …` style flags (quoted or not),
+`-p<password>`, `sshpass -p`, `NAME=value` where the name contains TOKEN, KEY,
+SECRET, PASSWORD or CREDENTIAL (quoted or not), npm `_authToken`, Slack webhook
+paths, `AKIA…` access key ids and common token prefixes (`sk-`, `ghp_`,
+`github_pat_`, `glpat-`, `xox?-`). It is pattern-based, not a guarantee.
 
 ### Argument parsing details
 
@@ -371,45 +417,34 @@ or newer.
 
 ### 0.5 native-rule migration
 
-Hosts without `permission_mode` (Codex, Grok, Kimi) use the relaxed tier, so
-under `dangerous-only` the hook only denies; confirmation comes from each
-host's native rules. Regenerate them with `print-native-rules` after the
-launcher points at 0.5.0, and remove the old entries — the host applies the
-strictest matching rule, so a stale broad prompt keeps prompting.
+Codex, Grok and Kimi keep the 0.4 confirmation set (native tier), so their
+native rules keep the 0.4 prefixes, now generated per rule id. Regenerate them
+with `print-native-rules` after the launcher points at 0.5.0 and remove
+entries that are gone — the host applies the strictest matching rule.
 
-- **Codex** keeps only the ask-level prefixes: trunk `branch -d/-D <main|master>`,
-  `checkout -B <main|master>`, `switch -C <main|master>`, `reset --hard
-  <origin/>main|master`, `config --global/--system`, `lfs install/migrate/uninstall`,
-  `submodule foreach`, `rebase -x/--exec/--reschedule-failed-exec`,
-  `push --mirror/--prune`. Removed: `gh repo delete` (hook deny now),
-  `branch -D/-M/-C`, `worktree remove`, `worktree add -B`, every `clean`,
-  `reset`, `restore`, `checkout`, `rm`, `stash`, `tag`, `switch` discard prefix,
-  `lfs prune`, `push --delete/-d`.
-- **Grok and Kimi** keep a medium list: the Codex list plus the discard
-  family (`git clean`, `git checkout`, `git reset`, `git restore`, `git rm`,
-  `stash drop/clear`, `tag -f/--force`, `switch --discard-changes/-f/--force`,
-  `worktree remove --force/-f`) and destructive SQL clients. Removed:
-  `branch -D/-M/-C`, plain `worktree remove`, `worktree add -B`, `lfs prune`,
-  `push --delete/-d`, `gh repo delete`, broad `chmod` and `gh api`.
+- **Codex**: the 0.4 `git-destructive` list (branch `-D/-M/-C`, trunk
+  `branch -d main|master`, `worktree remove`, `worktree add -B`,
+  `clean -f/--force/-i`, `reset`, `restore`, path-restoring `checkout`
+  forms, `checkout -B`, `rm`, `config --global/--system`, `stash drop/clear`,
+  `tag -f`, `switch -f/--discard-changes/-C/--force-create`,
+  `submodule foreach`, `lfs install/migrate/uninstall/prune`, rebase exec,
+  `push --delete/-d`, `push --prune`). Removed: `gh repo delete` and
+  `push --mirror` (hook denies now). `chmod 777` and generic `gh api` DELETE
+  have no prefix, as in 0.4, and fail closed.
+- **Grok and Kimi**: the Codex list with a wider discard family (`git clean`,
+  `git checkout`, `git reset`, `git restore`, `git rm`, …) plus destructive SQL
+  clients.
 
-With `legacy-dangerous` or `full` the hook still emits confirmations; on
-Codex/Grok/Kimi in strict mode those that no 0.5 native prefix covers fail
+With nativePrompt disabled, or for commands no prefix covers (compound
+chains, `git -C`, variables, attached option values), the confirmation fails
 closed (deny) with a `[guard-diagnostic]` marker, as in 0.4.
-
-Codex native delegation failures in strict mode include a `[guard-diagnostic]` JSON marker with
-`reasonCode`, `ruleId` and `decisionSource`, without adding unsupported fields to
-the host hook schema. Codes distinguish disabled delegation, unsupported shell
-shape, and uncovered native prefixes. For Git rules the message
-explains that `require_escalated` does not bypass hooks: use the tool's `workdir`,
-one static command, and separate subsequent status/read commands. Hard denials do
-not receive this recovery advice. `resolveDecision()` also exposes a typed
-`reasonCode` for consumers.
 
 ### Changes in 0.5.0
 
-- Relaxed `dangerous-only`: working-tree discards, non-trunk ref changes,
-  `chmod 777` and generic `gh api` DELETE no longer confirm; ask-level rules
-  confirm only in Claude bypass sessions.
+- Relaxed `dangerous-only` for Claude Code: working-tree discards, non-trunk
+  ref changes, `chmod 777` and generic `gh api` DELETE no longer confirm;
+  ask-level rules confirm only in bypass sessions. Codex, Grok and Kimi keep
+  the 0.4 set.
 - New hard denies: `rm-git-dir`, `rm-protected-path`, `git-clean-root`,
   `push-delete-trunk`, `gh-api-delete-protected`; `gh repo delete` upgraded to
   deny; `rm-protected-root` resolves relative targets against the hook cwd and
@@ -419,4 +454,35 @@ not receive this recovery advice. `resolveDecision()` also exposes a typed
 - `unsandboxed.jsonl` log; `protectedPaths` config; `legacy-dangerous` profile.
 - The `git-destructive` rule id is split into `git-discard`, `git-trunk-ref`,
   `git-ref-change`, `git-config-global`, `git-lfs`, `git-exec`,
-  `git-push-bulk`.
+  `git-push-bulk`; `push-delete-dynamic` is new. `git push --mirror` is a
+  `force-push-main` deny.
+
+## Known limitations
+
+The guard reads command text and a few repository files. It does not run
+anything, so these are out of reach; the sandbox and the host's own approval
+are the backstop.
+
+- **Symlinks and other aliases of a path.** Targets are compared lexically. A
+  symlink, bind mount, hard link or `$PWD`-relative trick that points into a
+  protected root is not resolved, and `realpath`-style canonicalization
+  (Unicode normalization, `/private/tmp` vs `/tmp`) is not applied.
+- **Deletion by other programs.** Interpreters (`python -c 'shutil.rmtree…'`,
+  `perl`, `node -e`), `rmdir`, `trash`, `git -C <dir> rm -r`, `cp`/`ln`
+  without `-f` over a protected path, `mv .git elsewhere`, a dynamic command
+  name (`$RM -rf …`), aliases and shell functions are not modelled as
+  deletes. `xargs rm -r` is judged only when a `find`, `echo` or `printf` in
+  the same pipeline supplies the list (not here-strings or files).
+- **GitHub writes outside `gh api` REST paths.** GraphQL mutations
+  (`deleteRepository`), `curl` to the REST API, `gh ruleset delete`,
+  `gh repo archive/edit` and `PATCH`/`PUT`/`POST` on protection endpoints are
+  not hard boundaries.
+- **Git configuration that changes a push target.** `HEAD` is resolved from
+  the repository, but `push.default`, `remote.<r>.push` refspecs, global git
+  config and case-folded ref names (`MAIN` on a case-insensitive remote) are
+  not read.
+- **excludedCommands is mirrored, not read.** The list of commands treated as
+  unsandboxed in bypass sessions is a static copy of the managing dotfiles'
+  default, not the live `sandbox.excludedCommands`.
+- **Hosts without `cwd`.** Grok/Kimi payloads may omit `cwd`; relative targets
+  are then judged with the unknown-cwd rule above and `git clean -x` is denied.

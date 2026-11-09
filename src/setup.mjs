@@ -14,7 +14,7 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { CONFIG_PATH, LAUNCHER_PATH, MANAGED_SHFMT_PATH } from './config.mjs';
-import { CODEX_NATIVE_PROMPT_PREFIXES } from './adapters/codex-native.mjs';
+import { CODEX_NATIVE_PROMPT_PREFIXES, uniquePrefixes } from './adapters/codex-native.mjs';
 import { GROK_PERMISSION_PATTERNS } from './adapters/grok-native.mjs';
 import { KIMI_PERMISSION_PATTERNS } from './adapters/kimi-native.mjs';
 
@@ -184,8 +184,7 @@ export function nativeRulesSnippet(host) {
       `[[permission.rules]]\ndecision = "ask"\npattern = ${JSON.stringify(pattern)}\nreason = "agent-shell-guard native confirmation"`,
     ).join('\n\n');
   }
-  return [...CODEX_NATIVE_PROMPT_PREFIXES.values()]
-    .flat()
+  return uniquePrefixes(CODEX_NATIVE_PROMPT_PREFIXES)
     .map((prefix) =>
       `prefix_rule(pattern=${JSON.stringify(prefix)}, decision="prompt", ` +
       'justification="agent-shell-guard native confirmation")',
