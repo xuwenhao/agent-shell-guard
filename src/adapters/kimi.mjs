@@ -11,6 +11,7 @@ export function adaptKimi(event, config) {
   const nestedBlock = reviewerToolBlock(event);
   if (nestedBlock) return nestedBlock;
   const result = evaluateForHost(event, config, {
+    host: 'kimi',
     supportsHookPrompt: false,
     nativePromptCovered: (decision) =>
       config.nativePrompt.kimi &&

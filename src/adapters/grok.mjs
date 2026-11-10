@@ -16,6 +16,7 @@ export function adaptGrok(event, config) {
   const nestedReason = reviewerToolReason(event);
   if (nestedReason) return grokDenyOutput(nestedReason);
   const result = evaluateForHost(event, config, {
+    host: 'grok',
     supportsHookPrompt: false,
     nativePromptCovered: (decision) =>
       config.nativePrompt.grok &&

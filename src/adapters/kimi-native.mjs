@@ -3,20 +3,36 @@
 import { CODEX_NATIVE_PROMPT_PREFIXES } from './codex-native.mjs';
 import { isNativePromptCovered } from './common.mjs';
 
-/** @type {Map<string, string[][]>} */
+/**
+ * Kimi (and Grok, which copies this map) start from the Codex table and widen
+ * one entry: `git-discard` covers every clean/checkout/reset/restore/rm form.
+ * They also prompt for SQL clients, `chmod` and `gh api`, as their 0.4 rules
+ * did, so chmod 777 and a generic `gh api` DELETE stay a native confirmation
+ * instead of a deny. These hosts have no project sandbox to fall back on, so
+ * discarding uncommitted work keeps a native confirmation there.
+ * @type {Map<string, string[][]>}
+ */
 export const KIMI_NATIVE_PROMPT_PREFIXES = new Map([
   ...CODEX_NATIVE_PROMPT_PREFIXES,
-  // Codex 0.4 narrows these prompts only in its own rule format. Kimi (and
-  // Grok, which copies this map) keeps its installed broad confirmation rules.
-  ['git-destructive', [
-    ...(CODEX_NATIVE_PROMPT_PREFIXES.get('git-destructive') ?? [])
-      .filter((prefix) => prefix[1] !== 'clean' && prefix[1] !== 'checkout'),
-    ['git', 'clean'], ['git', 'checkout'],
+  ['git-discard', [
+    ['git', 'clean'],
+    ['git', 'checkout'],
+    ['git', 'reset'],
+    ['git', 'restore'],
+    ['git', 'rm'],
+    ['git', 'stash', 'drop'],
+    ['git', 'stash', 'clear'],
+    ['git', 'tag', '-f'],
+    ['git', 'tag', '--force'],
+    ['git', 'switch', '--discard-changes'],
+    ['git', 'switch', '-f'],
+    ['git', 'switch', '--force'],
+    ['git', 'worktree', 'remove', '--force'],
+    ['git', 'worktree', 'remove', '-f'],
   ]],
   ['destructive-sql', [['psql'], ['mysql'], ['mysqlsh'], ['sqlite3']]],
   ['chmod-777', [['chmod']]],
   ['gh-api-delete', [['gh', 'api']]],
-  ['reset-hard-main', [['git', 'reset']]],
 ]);
 
 /** @param {string[]} prefix */

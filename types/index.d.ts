@@ -22,6 +22,34 @@ export interface AnalyzedCommand {
   wrappers: string[];
   hasRedirection: boolean;
   pipelineGroup: number | null;
+  /** Byte offset of the top-level command this one belongs to (nested `sh -c` / `eval` commands share their parent's). */
+  rootOffset?: number;
+  /** Variable names assigned anywhere in the command's graph. */
+  graphEnv?: string[];
+}
+
+export interface AnalyzedAssignment {
+  name: string;
+  /** null when dynamic or absent (`export X`). */
+  value: string | null;
+  /** `export` / `declare -x`. */
+  exported: boolean;
+}
+
+export interface CdPrefix {
+  /** One entry per `cd` of the leading `&&` chain: a path, '' = home, '-' = previous, null = dynamic. */
+  operands: Array<string | null>;
+  /** Byte ranges of commands that run after the first `depth` cds succeeded. */
+  exact: Array<{ range: [number, number]; depth: number }>;
+  /** Nothing else in the script runs outside `exact`. */
+  complete: boolean;
+}
+
+export interface AnalyzedRedirection {
+  /** shfmt v3.13.1 RedirOperator value */
+  op: number;
+  fd: string | null;
+  target: string | null;
 }
 
 export interface ShellGraph {
@@ -34,6 +62,9 @@ export interface ShellGraph {
   hasSubstitution: boolean;
   hasCompound: boolean;
   nativePromptArgv: string[] | null;
+  redirections: AnalyzedRedirection[];
+  cdPrefix?: CdPrefix | null;
+  assignments?: AnalyzedAssignment[];
 }
 
 export type ShellInput =
@@ -50,10 +81,34 @@ export interface AnalyzeOptions {
   maxCommands?: number;
 }
 
+export interface ProjectInfo {
+  /** Nearest enclosing repository (where project settings are read). */
+  gitRoot: string | null;
+  /** Outermost enclosing repository below home (thin project root). */
+  projectRoot: string | null;
+  sandboxConfigured: boolean;
+  nestedRepos: boolean;
+  /** Checked-out branch; null when HEAD is detached or unreadable. */
+  branch?: string | null;
+  /** Configured upstream of `branch`. */
+  upstream?: { remote: string; merge: string } | null;
+}
+
 export interface GuardOptions extends Omit<AnalyzeOptions, 'dialect'> {
   profile?: string;
   envShell?: string;
   protectedRoots?: string[];
+  protectedPaths?: string[];
+  /** Read-only project lookup; defaults to the filesystem inspector. */
+  inspectDirectory?: (directory: string) => ProjectInfo;
+  /** Lookup for the session's project directory; defaults to inspectProjectDir. */
+  inspectProjectDir?: (directory: string) => ProjectInfo;
+  /** Host adapter; only `claude` uses permission-mode tiers. Default `claude`. */
+  host?: 'claude' | 'codex' | 'grok' | 'kimi';
+  /** Claude Code `CLAUDE_PROJECT_DIR`: where project settings are read. */
+  projectDir?: string;
+  /** Fold case in path comparisons; defaults to `process.platform === 'darwin'`. */
+  caseInsensitivePaths?: boolean;
 }
 
 export interface GuardAllow {
@@ -85,10 +140,11 @@ export interface ReviewerConfig {
 
 export interface GuardConfig {
   mode: 'strict' | 'reviewed';
-  profile: 'full' | 'dangerous-only' | 'off';
+  profile: 'full' | 'dangerous-only' | 'legacy-dangerous' | 'off';
   shfmtPath: string;
   zshPath?: string;
   protectedRoots: string[];
+  protectedPaths: string[];
   nativePrompt: { codex: boolean; grok: boolean; kimi: boolean };
   reviewer: ReviewerConfig | null;
 }
@@ -117,6 +173,19 @@ export function evaluateHookEvent(
   options?: GuardOptions,
 ): GuardDecision | null;
 export function explainGuardDecision(result: GuardIntervention): string;
+export function inspectDirectory(
+  directory: string,
+  options?: { ephemeralRoots?: string[] },
+): ProjectInfo;
+export function inspectProjectDir(
+  projectDir: string,
+  options?: { ephemeralRoots?: string[] },
+): ProjectInfo;
+export function isReadOnlyGraph(graph: ShellGraph): boolean;
+export function permissionTier(
+  mode: unknown,
+  host?: 'claude' | 'codex' | 'grok' | 'kimi',
+): 'relaxed' | 'bypass' | 'native';
 export function loadConfig(options?: {
   configPath?: string;
   env?: Record<string, string | undefined>;

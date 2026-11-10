@@ -10,6 +10,11 @@ export function adaptClaude(event, config) {
   const nestedBlock = reviewerToolBlock(event);
   if (nestedBlock) return nestedBlock;
   const result = evaluateForHost(event, config, {
+    host: 'claude',
+    // Claude Code sets CLAUDE_PROJECT_DIR for hook processes: the directory
+    // the session started in, where it reads project settings. Hook `cwd`
+    // follows the Bash tool's persisted `cd` instead.
+    projectDir: process.env.CLAUDE_PROJECT_DIR,
     supportsHookPrompt: true,
     nativePromptCovered: () => false,
   });

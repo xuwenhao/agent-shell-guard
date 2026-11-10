@@ -4,10 +4,13 @@ import { KIMI_NATIVE_PROMPT_PREFIXES } from './kimi-native.mjs';
 import { isNativePromptCovered } from './common.mjs';
 
 // Grok Build and Kimi both support Bash prefix rules that remain active in
-// their always-approve modes. Keep the policy set aligned while giving each
-// host its own matcher and setup surface.
+// their always-approve modes. Both use the medium list (Codex ask-level
+// prefixes + git-discard + destructive SQL); keep a separate map so the hosts
+// can diverge without touching each other's generated rules.
 /** @type {Map<string, string[][]>} */
-export const GROK_NATIVE_PROMPT_PREFIXES = new Map(KIMI_NATIVE_PROMPT_PREFIXES);
+export const GROK_NATIVE_PROMPT_PREFIXES = new Map(
+  [...KIMI_NATIVE_PROMPT_PREFIXES].map(([ruleId, prefixes]) => [ruleId, prefixes.map((prefix) => [...prefix])]),
+);
 
 /** @param {string[]} prefix */
 function grokPermissionPatterns(prefix) {

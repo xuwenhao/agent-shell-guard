@@ -21,15 +21,35 @@ const SENSITIVE_VALUE_FLAGS = new Set([
   '-u',
 ]);
 
+// A shell word value: double-quoted, single-quoted or bare.
+const VALUE = String.raw`(?:"[^"]*"|'[^']*'|[^\s'"]+)`;
+const SECRET_FLAGS = 'access-token|api-key|apikey|client-secret|credential|credentials|password|passwd|private-key|proxy-user|secret|token|user|auth-token';
+
 /** @param {string} command */
-function redact(command) {
+export function redact(command) {
   return command
-    .replace(/(authorization:\s*(?:bearer|token)\s+)[^\s'"]+/gi, '$1<redacted>')
-    .replace(/([?&](?:access_token|api_key|apikey|token|password)=)[^&\s'"]+/gi, '$1<redacted>')
-    .replace(/((?:--(?:access-token|api-key|apikey|client-secret|credential|credentials|password|passwd|private-key|proxy-user|secret|token|user))=)[^\s'"]+/gi, '$1<redacted-secret>')
-    .replace(/((?:--(?:access-token|api-key|apikey|client-secret|credential|credentials|password|passwd|private-key|proxy-user|secret|token|user)|-u)\s+)[^\s'"]+/gi, '$1<redacted-secret>')
-    .replace(/\b([A-Z0-9_]*(?:API_KEY|PASSWORD|SECRET|TOKEN|CREDENTIALS?))=[^\s'"]+/gi, '$1=<redacted-secret>')
-    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{12,}\b/g, '<redacted-secret>');
+    // Header values: Authorization / X-Api-Key / Cookie, up to the closing quote.
+    .replace(/((?:proxy-)?(?:authorization|x-api-key|api-key|x-auth-token|private-token|cookie)\s*:\s*(?:(?:bearer|token|basic)\s+)?)[^'"\n]+/gi, '$1<redacted>')
+    // URL userinfo: scheme://user:password@host
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@'"]+:)[^\s@'"/]+@/gi, '$1<redacted>@')
+    .replace(/([?&](?:access_token|api_key|apikey|token|password|secret|key)=)[^&\s'"]+/gi, '$1<redacted>')
+    .replace(new RegExp(String.raw`((?:--(?:${SECRET_FLAGS}))=)${VALUE}`, 'gi'), '$1<redacted-secret>')
+    .replace(new RegExp(String.raw`((?:--(?:${SECRET_FLAGS})|-u)\s+)${VALUE}`, 'gi'), '$1<redacted-secret>')
+    // mysql-style attached password (-pSECRET); sshpass / docker login take it separated.
+    .replace(/(\s-p)(?=[^\s-])[^\s'"]+/g, '$1<redacted-secret>')
+    .replace(new RegExp(String.raw`(\b(?:sshpass|(?:docker|podman|helm)\s+(?:registry\s+)?login)\b[^|;&\n]*?\s-p\s+)${VALUE}`, 'g'), '$1<redacted-secret>')
+    // NAME=value where the name mentions a token, key, secret or password.
+    .replace(new RegExp(String.raw`\b([A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS?)[A-Za-z0-9_]*)=${VALUE}`, 'gi'), '$1=<redacted-secret>')
+    .replace(new RegExp(String.raw`(_authToken\s+)${VALUE}`, 'g'), '$1<redacted-secret>')
+    // aws configure set [profile.]aws_secret_access_key <value>
+    .replace(new RegExp(String.raw`(\baws\s+configure\s+set\s+(?:\S+\.)?aws_(?:secret_access_key|session_token|access_key_id)\s+)${VALUE}`, 'gi'), '$1<redacted-secret>')
+    // gh secret set NAME --body <value> / -b <value> / -b<value> / --body=<value>
+    .replace(new RegExp(String.raw`(\bgh\s+secret\s+set\b[^|;&\n]*?\s(?:--body(?:=|\s+)|-b\s*))${VALUE}`, 'g'), '$1<redacted-secret>')
+    // printf <password> | sudo -S …: the piped words are the password.
+    .replace(new RegExp(String.raw`(\b(?:printf|echo)\s+)((?:${VALUE}\s*)+?)(\|\s*sudo\b[^|;&\n]*\s-[A-Za-z]*S)`, 'g'), '$1<redacted-secret> $3')
+    .replace(/(hooks\.slack\.com\/services\/)[^\s'"]+/gi, '$1<redacted>')
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, '<redacted-secret>')
+    .replace(/\b(?:sk|ghp|gho|ghs|ghu|github_pat|glpat|xox[baprs])[-_A-Za-z0-9]{12,}\b/g, '<redacted-secret>');
 }
 
 /** @param {Array<string|null>} argv */

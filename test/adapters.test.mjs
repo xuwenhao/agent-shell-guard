@@ -95,29 +95,42 @@ test('reviewer subprocesses cannot call shell tools recursively', () => {
   }
 });
 
-test('Codex native coverage never silently delegates removed broad Git prefixes', () => {
+test('dangerous-only on Codex keeps the 0.4 semantics: delegate when a native prefix covers it, else deny', () => {
   const config = { ...BASE_CONFIG, profile: 'dangerous-only' };
-  for (const command of ['git clean', 'git clean -df', 'git checkout tracked.txt',
-    'git checkout --forc main', 'git checkout -b feat --force',
-    'git clean --dry-run "$TARGET"', 'git clean -n --no-dry-run',
-    'git checkout --detach HEAD --theirs', 'git checkout -b feat -- a.ts',
-    'git checkout -b "$BRANCH"', 'git -C "$REPO" clean -n',
-    'git checkout -Bfeat', 'git checkout -qB feat', 'git checkout -b feat -B other',
-    'git checkout -b feat --conflict=merge', 'git checkout --detach HEAD --conflict=diff3',
-    'git checkout --track --force -b new main', 'git checkout --track -f -b new main',
-    'git checkout --detach --no-detach tracked.txt', 'git checkout -d --no-det tracked.txt',
-    'git checkout --orphan new --no-orphan tracked.txt', 'git checkout -2 tracked.txt']) {
+  for (const command of ['git branch -D old-feature', 'git worktree remove .worktrees/x', 'git reset --hard HEAD~1',
+    'git stash drop', 'git config --global user.name x', 'git clean -f -d', 'git checkout -- a.ts',
+    'git push --delete origin feat/old', 'git branch -D main']) {
+    assert.equal(permission(adaptCodex(event(command), config)), 'pass', command);
+  }
+  // Confirmations without a covering prefix (or in a compound) fail closed, as in 0.4.
+  for (const command of ['git clean -df', 'git checkout tracked.txt', 'git restore a.ts && git status',
+    'chmod 777 x', 'gh api -X DELETE repos/acme/demo/labels/bug']) {
     assert.equal(permission(adaptCodex(event(command), config)), 'deny', command);
   }
-  for (const command of ['git clean -n', 'git clean --dry-run', 'git checkout -b feat',
-    'git checkout --detach origin/main', 'git clean -f', 'git checkout -- tracked.txt',
-    'git checkout --force main', 'git checkout -B feat']) {
+  for (const command of ['git push origin main --force', 'gh repo delete acme/old --yes', 'git clean -ffdx', 'git push --mirror backup']) {
+    assert.equal(permission(adaptCodex(event(command), config)), 'deny', command);
+  }
+  // Without the installed native rules every confirmation is a deny.
+  const noNative = { ...config, nativePrompt: { codex: false, grok: false, kimi: false } };
+  assert.equal(permission(adaptCodex(event('git reset --hard HEAD~1'), noNative)), 'deny');
+  // Claude without permission_mode is the relaxed tier: the classifier decides.
+  for (const command of ['git reset --hard HEAD~1', 'git clean -df', 'chmod 777 x', 'git config --global user.name x']) {
+    assert.equal(permission(adaptClaude(event(command), config)), 'pass', command);
+  }
+});
+
+test('legacy-dangerous on Codex: confirms outside the native table fail closed', () => {
+  const config = { ...BASE_CONFIG, profile: 'legacy-dangerous' };
+  for (const command of ['git clean -df', 'git checkout tracked.txt', 'git branch -q -D old-feature']) {
+    assert.equal(permission(adaptCodex(event(command), config)), 'deny', command);
+  }
+  for (const command of ['git branch -D main', 'git config --global user.name x', 'git reset --hard origin/main']) {
     assert.equal(permission(adaptCodex(event(command), config)), 'pass', command);
   }
 });
 
 test('Codex blocked delegation exposes stable diagnostic codes and bounded recovery', () => {
-  const config = { ...BASE_CONFIG, profile: 'dangerous-only' };
+  const config = { ...BASE_CONFIG, profile: 'legacy-dangerous' };
   for (const [command, code] of [
     ['git restore a.ts && git status', 'native-prompt-shape-unsupported'],
     ['git -C /tmp/repo restore a.ts', 'native-prompt-prefix-uncovered'],
@@ -129,7 +142,7 @@ test('Codex blocked delegation exposes stable diagnostic codes and bounded recov
     const marker = reason.split('\n').find(line => line.startsWith('[guard-diagnostic] '));
     assert.ok(marker);
     assert.deepEqual(JSON.parse(marker.slice('[guard-diagnostic] '.length)), {
-      reasonCode: code, ruleId: 'git-destructive', decisionSource: 'hook',
+      reasonCode: code, ruleId: 'git-discard', decisionSource: 'hook',
     });
     assert.match(reason, /workdir/);
     assert.match(reason, /require_escalated 不会解除/);
@@ -143,10 +156,14 @@ test('Codex blocked delegation exposes stable diagnostic codes and bounded recov
   assert.doesNotMatch(hard?.hookSpecificOutput.permissionDecisionReason ?? '', /恢复：|guard-diagnostic/);
 });
 
-
-test('Codex-only prefix migration preserves Kimi and Grok broad native confirmations', () => {
-  for (const command of ['git checkout tracked.txt', 'git clean -df', 'git checkout -Bfeat']) {
+test('Kimi and Grok keep the medium native list (every clean/checkout form delegated)', () => {
+  for (const command of ['git checkout tracked.txt', 'git clean -df']) {
     assert.equal(permission(adaptCodex(event(command), BASE_CONFIG)), 'deny', command);
+    assert.equal(permission(adaptKimi(event(command), BASE_CONFIG)), 'pass', command);
+    assert.equal(grokPermission(adaptGrok(grokEvent(command), BASE_CONFIG)), 'pass', command);
+  }
+  for (const command of ['git reset --hard HEAD~1', 'git stash drop', 'git branch -D old-feature']) {
+    assert.equal(permission(adaptCodex(event(command), BASE_CONFIG)), 'pass', command);
     assert.equal(permission(adaptKimi(event(command), BASE_CONFIG)), 'pass', command);
     assert.equal(grokPermission(adaptGrok(grokEvent(command), BASE_CONFIG)), 'pass', command);
   }

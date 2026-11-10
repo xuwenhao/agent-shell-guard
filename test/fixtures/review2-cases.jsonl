@@ -1,0 +1,273 @@
+{"set":"bypass","note":"A1 empty alt","cmd":"rm -rf ~/Codebase/{personal,}","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A2 mid-word","cmd":"rm -rf ~/Codebase/per{s,x}onal","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A3 nested","cmd":"rm -rf ~/Codebase/{a,{personal,b}}","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A4 quoted alt","cmd":"rm -rf ~/Codebase/{\"personal\",x}","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A5 partial quote","cmd":"rm -rf ~/Codebase/{'per'sonal,x}","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A6 trailing slash alt","cmd":"rm -rf ~/Codebase/personal{,/}","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A7 tilde in brace","cmd":"rm -rf {~,/nonexist}/Codebase/personal","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A8 overflow + dotdot","cmd":"rm -rf /usr/{1..70,bin}/../..{HOME}/Codebase/personal","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A9 overflow under root","cmd":"rm -rf ~/Codebase/x{1..100}","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"A10 seq letters","cmd":"rm -rf ~/Codebase/{o..q}ersonal","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A11 overflow comma list + dotdot","cmd":"rm -rf /opt/{a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,a1,b1,c1,d1,e1,f1,g1,h1,i1,j1,k1,l1,m1,n1,o1,p1,q1,r1,s1,t1,u1,v1,w1,x1,y1,z1,a2,b2,c2,d2,e2,f2,g2,h2,i2,j2,k2,l2,m2,n2,homebrew}/../..{HOME}/Codebase/personal","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"A12 brace with dotdot <64","cmd":"rm -rf /usr/{bin,lib}/../..{HOME}/Codebase/personal","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"A13 glob class near-full","cmd":"rm -rf ~/Codebase/personal/[a-z]*","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"A14 glob class near-full2","cmd":"rm -rf ~/Codebase/personal/devinfra/dotfiles/[[:alnum:]]*","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"A15 glob *[!~]","cmd":"rm -rf ~/Codebase/personal/*[!~]","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"A16 brace+glob","cmd":"rm -rf ~/Codebase/personal/{a..z}*","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"A17 zsh qualifier","cmd":"rm -rf ~/Codebase/personal/devinfra/*(D)","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"A18 zsh extglob neg","cmd":"rm -rf ~/Codebase/personal/^nothing","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"A19 zsh recursive glob","cmd":"rm -rf ~/Codebase/personal/**/dotfiles","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"B1 upper","cmd":"rm -rf ~/CODEBASE/PERSONAL","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"B2 long-s","cmd":"rm -rf ~/Codebase/perſonal","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"B3 kelvin","cmd":"rm -rf ~/Codebase/personal/devinfra/dotfiles/../../../../Codebase/personal","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"B4 .git upper w/ subdir","cmd":"rm -rf .GIT/OBJECTS","mode":"auto","expect":"deny:rm-git-dir"}
+{"set":"bypass","note":"B5 .git trailing dot","cmd":"rm -rf .git/.","mode":"auto","expect":"deny:rm-git-dir"}
+{"set":"bypass","note":"B6 git dir via glob class","cmd":"rm -rf .gi[t]","mode":"auto","expect":"deny:rm-git-dir"}
+{"set":"bypass","note":"B7 ansi-c path","cmd":"rm -rf $'{HOME}/Codebase/perso\\x6eal'","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"B8 ansi-c .git","cmd":"rm -rf $'.gi\\x74'","mode":"auto","expect":"deny:rm-git-dir"}
+{"set":"bypass","note":"B9 ansi-c in bash -c","cmd":"bash -c $'rm -rf {HOME}/Codebase/perso\\x6eal'","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"B10 locale string","cmd":"rm -rf $\"{HOME}/Codebase/personal\"","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"E1 find exec sh -c","cmd":"find ~/Codebase/personal -maxdepth 0 -exec sh -c 'rm -rf \"$1\"' _ {} \\;","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"E2 find exec command rm","cmd":"find ~/Codebase/personal -maxdepth 0 -exec command rm -rf {} +","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"E3 find exec env rm","cmd":"find ~/Codebase/personal -maxdepth 0 -exec env rm -rf {} +","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"E4 find exec .git sh","cmd":"find . -name .git -exec sh -c 'rm -rf \"$0\"' {} \\;","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-git-dir"}
+{"set":"bypass","note":"E5 find xargs -0","cmd":"find ~/Codebase -maxdepth 1 -name personal -print0 | xargs -0 rm -rf","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E6 ls | xargs rm","cmd":"ls -d ~/Codebase/personal | xargs rm -rf","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E7 git ls-files xargs","cmd":"cat list.txt | xargs rm -rf","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E8 xargs sh -c","cmd":"find ~/Codebase/personal -maxdepth 0 -print0 | xargs -0 -n1 sh -c 'rm -rf \"$0\"'","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E9 sh -c single","cmd":"sh -c 'rm -rf ~/Codebase/personal'","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"E10 printf | sh","cmd":"printf 'rm -rf %s\\n' ~/Codebase/personal | sh","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E11 echo | bash","cmd":"echo 'rm -rf ~/Codebase/personal' | bash","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E12 heredoc sh","cmd":"sh <<'EOF'\nrm -rf ~/Codebase/personal\nEOF","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E13 herestring bash -s","cmd":"bash -s <<< 'rm -rf ~/Codebase/personal'","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E14 sh -c cmdsubst","cmd":"sh -c \"$(printf 'rm -rf %s' ~/Codebase/personal)\"","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E15 eval cmdsubst","cmd":"eval \"$(echo rm -rf ~/Codebase/personal)\"","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E16 sh -c var","cmd":"bash -c \"rm -rf $HOME/Codebase/personal\"","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E17 source procsubst","cmd":"source <(echo rm -rf ~/Codebase/personal)","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E18 zsh -c single","cmd":"zsh -c 'rm -rf ~/Codebase/personal'","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"E19 sh script file","cmd":"echo 'rm -rf ~/Codebase/personal' > /tmp/x.sh && sh /tmp/x.sh","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E20 find -delete with -name glob root","cmd":"find ~/Codebase/personal/devinfra -maxdepth 1 -name 'dot*' -delete","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E21 find -exec rm -r w/ -o","cmd":"find ~/Codebase -maxdepth 1 \\( -name x -o -name personal \\) -exec rm -rf {} +","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E22 find -execdir","cmd":"find ~/Codebase -maxdepth 1 -name personal -execdir rm -rf {} +","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E23 find -okdir rm","cmd":"find ~/Codebase -maxdepth 1 -name personal -ok rm -rf {} \\;","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E24 find -regex","cmd":"find ~/Codebase -maxdepth 1 -regex '.*/personal' -delete","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E25 find no rm but -exec mv","cmd":"find ~/Codebase -maxdepth 1 -name personal -exec mv {} /tmp/trash \\;","mode":"auto","expect":"allow"}
+{"set":"bypass","note":"E26 xargs -I","cmd":"echo ~/Codebase/personal | xargs -I{} rm -rf {}","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"E27 find | while read rm","cmd":"find ~/Codebase -maxdepth 1 -name personal | while read d; do rm -rf \"$d\"; done","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E28 for loop glob","cmd":"for d in ~/Codebase/*; do rm -rf \"$d\"; done","mode":"auto","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"E29 git clean in sh -c","cmd":"sh -c 'git clean -ffdx'","mode":"auto","expect":"deny:git-clean-root"}
+{"set":"bypass","note":"E30 rm .git via find -path","cmd":"find . -path './.git' -prune -exec rm -rf {} +","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-git-dir"}
+{"set":"bypass","note":"L1 cd ; data","cmd":"cd ~/Codebase/personal/devinfra; rm -rf data","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"L2 subshell cd","cmd":"(cd ~/Codebase/personal/devinfra && rm -rf data)","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"L3 pushd","cmd":"pushd ~/Codebase/personal/devinfra && rm -rf data","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"L4 sh -c cd","cmd":"sh -c 'cd ~/Codebase/personal/devinfra && rm -rf data'","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"L5 cd || exit","cmd":"cd ~/Codebase/personal/devinfra || exit 1; rm -rf data","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"L6 cd && ok","cmd":"cd ~/Codebase/personal/devinfra && rm -rf data","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"L7 zsh chdir","cmd":"chdir ~/Codebase/personal/devinfra && rm -rf dotfiles","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"L8 autocd","cmd":"~/Codebase/personal/devinfra && rm -rf dotfiles","mode":"auto","cwd":"/tmp/x","expect":"allow"}
+{"set":"bypass","note":"L9 cd then dot target","cmd":"cd ~/Codebase/personal/devinfra; rm -rf ./data","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"L10 cd ; infra","cmd":"cd ~/Codebase/personal; rm -rf infra","mode":"auto","cwd":"/tmp/x","expect":"allow"}
+{"set":"bypass","note":"L11 cd then git clean -x","cmd":"cd ~/Codebase/personal/devinfra; git clean -fdx","mode":"auto","cwd":"/tmp/x","expect":"deny:git-clean-root?"}
+{"set":"bypass","note":"L12 if cd","cmd":"if cd ~/Codebase/personal/devinfra; then rm -rf data; fi","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"L13 cd in eval","cmd":"eval cd ~/Codebase/personal/devinfra && rm -rf data","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"bypass","note":"L14 cd && cd - ","cmd":"cd /tmp/x && rm -rf data && cd - && rm -rf data","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra","expect":"deny:rm-protected-root"}
+{"set":"bypass","note":"C1 push matching colon","cmd":"git push -f origin :","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C2 push +:","cmd":"git push origin +:","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C3 wildcard refspec","cmd":"git push -f origin 'refs/heads/*:refs/heads/*'","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C4 +wildcard","cmd":"git push origin '+refs/heads/*:refs/heads/*'","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C5 -c push.default=matching","cmd":"git -c push.default=matching push -f","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main?"}
+{"set":"bypass","note":"C6 GIT_DIR env","cmd":"GIT_DIR={HOME}/other/.git git push -f origin HEAD","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main?"}
+{"set":"bypass","note":"C7 env GIT_DIR","cmd":"env GIT_DIR=/x/.git git push -f origin HEAD","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main?"}
+{"set":"bypass","note":"C8 GIT_CONFIG_PARAMETERS","cmd":"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=matching git push -f","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main?"}
+{"set":"bypass","note":"C9 refs/heads/ma*","cmd":"git push -f origin 'refs/heads/mai*:refs/heads/mai*'","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C10 HEAD:main","cmd":"git push -f origin HEAD:main","mode":"auto","fake":{"branch":"feat/x"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C11 --repo","cmd":"git push -f --repo=origin","mode":"auto","fake":{"branch":"main"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C12 -o value","cmd":"git push -f -o ci.skip origin HEAD","mode":"auto","fake":{"branch":"main"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C13 push.default upstream","cmd":"git push --force","mode":"auto","fake":{"branch":"feat/x","upstream":"refs/heads/main"},"expect":"deny:force-push-main?"}
+{"set":"bypass","note":"C14 delete :main via HEAD","cmd":"git push origin :HEAD","mode":"auto","fake":{"branch":"main"},"expect":"allow"}
+{"set":"bypass","note":"C15 push --delete @","cmd":"git push origin --delete @","mode":"auto","fake":{"branch":"main"},"expect":"deny:push-delete-trunk"}
+{"set":"bypass","note":"C16 push -d main with -n mistaken","cmd":"git push -dn origin main","mode":"auto","fake":{"branch":"feat"},"expect":"allow"}
+{"set":"bypass","note":"C17 force-with-lease=main","cmd":"git push --force-with-lease=main:abc origin HEAD","mode":"auto","fake":{"branch":"main"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C18 --no-verify -f HEAD main","cmd":"git push --no-verify --force origin","mode":"auto","fake":{"branch":"main"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C19 --dry-run? -n in -fn","cmd":"git push -fn origin main","mode":"auto","fake":{"branch":"feat"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C20 pushDeletesTrunk dryrun bypass","cmd":"git push --delete origin main --no-dry-run","mode":"auto","fake":{"branch":"feat"},"expect":"deny:push-delete-trunk"}
+{"set":"bypass","note":"C21 mirror --no-dry-run","cmd":"git push --mirror --dry-run --no-dry-run origin","mode":"auto","fake":{"branch":"feat"},"expect":"deny:force-push-main"}
+{"set":"bypass","note":"C22 -n in -dn","cmd":"git push -nd origin main","mode":"auto","fake":{"branch":"feat"},"expect":"allow"}
+{"set":"bypass","note":"C23 dry-run negated delete","cmd":"git push --dry-run --no-dry-run origin --delete main","mode":"auto","fake":{"branch":"feat"},"expect":"deny:push-delete-trunk"}
+{"set":"head","note":"H onmain HEAD","cmd":"git push -f origin HEAD","mode":"auto","cwd":"{FX}/onmain","expect":"deny:force-push-main"}
+{"set":"head","note":"H onmain bare","cmd":"git push --force-with-lease","mode":"auto","cwd":"{FX}/onmain","expect":"deny:force-push-main"}
+{"set":"head","note":"H base feat bare","cmd":"git push --force-with-lease","mode":"auto","cwd":"{FX}/base","expect":"allow"}
+{"set":"head","note":"H linked wt on main","cmd":"git push -f origin HEAD","mode":"auto","cwd":"{FX}/wt-main","expect":"deny:force-push-main"}
+{"set":"head","note":"H git -C linked wt","cmd":"git -C ../wt-main push -f origin HEAD","mode":"auto","cwd":"{FX}/base","expect":"deny:force-push-main"}
+{"set":"head","note":"H detached","cmd":"git push -f origin HEAD","mode":"auto","cwd":"{FX}/det","expect":"deny:force-push-main?"}
+{"set":"head","note":"H symref alias->main","cmd":"git push -f origin HEAD","mode":"auto","cwd":"{FX}/sym","expect":"deny:force-push-main"}
+{"set":"head","note":"H packed","cmd":"git push -f origin HEAD","mode":"auto","cwd":"{FX}/packed","expect":"deny:force-push-main"}
+{"set":"head","note":"H reftable on main","cmd":"git push -f origin HEAD","mode":"auto","cwd":"{FX}/rt","expect":"deny:force-push-main?"}
+{"set":"head","note":"H reftable bare","cmd":"git push -f","mode":"auto","cwd":"{FX}/rt","expect":"deny:force-push-main?"}
+{"set":"head","note":"H cmt upstream w/ comment","cmd":"git push -f","mode":"auto","cwd":"{FX}/cmt","expect":"deny:force-push-main?"}
+{"set":"head","note":"H subdir","cmd":"git push -f origin @","mode":"auto","cwd":"{FX}/onmain/sub","expect":"deny:force-push-main"}
+{"set":"head","note":"H reset @{u} cmt","cmd":"git reset --hard @{u}","mode":"bypassPermissions","cwd":"{FX}/cmt","fake":null,"expect":"deny:bypass-no-project-sandbox"}
+{"set":"head","note":"H push delete HEAD on main","cmd":"git push origin --delete HEAD","mode":"auto","cwd":"{FX}/onmain","expect":"deny:push-delete-trunk"}
+{"set":"head","note":"H push delete HEAD reftable","cmd":"git push origin --delete HEAD","mode":"auto","cwd":"{FX}/rt","expect":"allow"}
+{"set":"head","note":"H cd && push","cmd":"cd {FX}/onmain && git push -f origin HEAD","mode":"auto","cwd":"{FX}/base","expect":"deny:force-push-main"}
+{"set":"head","note":"H cd ; push","cmd":"cd {FX}/onmain; git push -f origin HEAD","mode":"auto","cwd":"{FX}/base","expect":"deny:force-push-main?"}
+{"set":"head","note":"H GIT_DIR env to main","cmd":"GIT_DIR={FX}/onmain/.git git push -f origin HEAD","mode":"auto","cwd":"{FX}/base","expect":"deny:force-push-main?"}
+{"set":"head","note":"H GIT_WORK_TREE+GIT_DIR export","cmd":"export GIT_DIR={FX}/onmain/.git; git push -f origin HEAD","mode":"auto","cwd":"{FX}/base","expect":"deny:force-push-main?"}
+{"set":"l9","note":"cd && rm || true","cmd":"cd ~/Codebase/personal/devinfra && rm -rf data || true","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"l9","note":"cd 2>/dev/null && rm","cmd":"cd ~/Codebase/personal/devinfra 2>/dev/null && rm -rf data","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"l9","note":"cd && rm ; echo","cmd":"cd ~/Codebase/personal/devinfra && rm -rf data; echo done","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"l9","note":"cd && rm && cd -","cmd":"cd ~/Codebase/personal/devinfra && rm -rf data && cd -","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"l9","note":"cd && rm newline","cmd":"cd ~/Codebase/personal/devinfra\nrm -rf data","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"l9","note":"cd && rm infra","cmd":"cd ~/Codebase/personal/devinfra && rm -rf infra; ls","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"l9","note":"control: from cwd devinfra","cmd":"rm -rf data; echo done","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra","expect":"deny:rm-protected-root"}
+{"set":"l9","note":"control2: cd /tmp/x ; rm data from devinfra","cmd":"cd /tmp/x; rm -rf data","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra","expect":"deny:rm-protected-root?"}
+{"set":"mb","note":"M1 cjk then glob root","cmd":"echo 中文说明 && rm -rf ~/Codebase/personal/*","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"mb","note":"M1b ascii control","cmd":"echo abcdefghijkl && rm -rf ~/Codebase/personal/*","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"mb","note":"M2 cjk then brace","cmd":"echo 中文说明 && rm -rf ~/Codebase/{personal,x}","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root"}
+{"set":"mb","note":"M3 cjk then var","cmd":"echo 中文说明中文说明中文说明 && rm -rf \"$X\"","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"mb","note":"M4 cjk comment then glob","cmd":"# 清理一下\nrm -rf ~/Codebase/*","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"mb","note":"M5 cjk then .g*","cmd":"echo 中文 && rm -rf .g*","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-git-dir"}
+{"set":"mb","note":"M6 cjk then find brace","cmd":"echo 中文说明 && find ~/Codebase/{personal,x} -delete","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"mb","note":"M7 cjk then glob in devinfra","cmd":"echo 中文 && rm -rf ~/Codebase/personal/devinfra/*","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"mb","note":"M8 emoji","cmd":"echo 🙂🙂 && rm -rf ~/Codebase/personal/*","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"mb","note":"M9 cjk then dyn rm cwd=protected","cmd":"echo 中文 && rm -rf build/*","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra/dotfiles","expect":"allow"}
+{"set":"mb","note":"M10 cjk then git push -f var","cmd":"echo 中文 && git push -f origin \"$B\"","mode":"auto","fake":{"branch":"feat"},"expect":"deny:force-push-main?"}
+{"set":"mb","note":"M11 cjk then gh api dyn delete","cmd":"echo 中文 && gh api -X DELETE \"$E\"","mode":"auto","expect":"deny:org-ruleset-write?"}
+{"set":"mb","note":"M12 cjk then rm -rf glob devinfra/da*","cmd":"echo 一二三四五六七八九十一二三四五六七八九十 && rm -rf ~/Codebase/personal/devinfra/da*","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"more","note":"G1 env worktree clean -x","cmd":"GIT_DIR={HOME}/Codebase/personal/devinfra/.git GIT_WORK_TREE={HOME}/Codebase/personal/devinfra git clean -fdx","mode":"auto","cwd":"/tmp/x","expect":"deny:git-clean-root?"}
+{"set":"more","note":"G2 flag worktree clean -x","cmd":"git --work-tree={HOME}/Codebase/personal/devinfra clean -fdx","mode":"auto","cwd":"/tmp/x","expect":"deny:git-clean-root?"}
+{"set":"more","note":"G3 -C thin root clean -x","cmd":"git -C {HOME}/Codebase/personal/devinfra clean -fdx","mode":"auto","cwd":"/tmp/x","expect":"deny:git-clean-root"}
+{"set":"more","note":"G4 mirror -o value w/ n","cmd":"git push --mirror -onone origin","mode":"auto","fake":{"branch":"feat"},"expect":"deny:force-push-main"}
+{"set":"more","note":"G5 delete main -o value w/ n","cmd":"git push origin --delete main -onotify","mode":"auto","fake":{"branch":"feat"},"expect":"deny:push-delete-trunk"}
+{"set":"more","note":"G6 :main -o w/ n","cmd":"git push -onone origin :main","mode":"auto","fake":{"branch":"feat"},"expect":"deny:push-delete-trunk"}
+{"set":"more","note":"G7 alias g","cmd":"g push --force origin main","mode":"auto","fake":{"branch":"feat"},"expect":"allow"}
+{"set":"more","note":"G8 alias gpf!","cmd":"gpf! origin main","mode":"auto","fake":{"branch":"feat"},"expect":"allow"}
+{"set":"more","note":"G9 alias gpod","cmd":"gpod main","mode":"auto","fake":{"branch":"feat"},"expect":"allow"}
+{"set":"more","note":"G10 git clean -f -f separate","cmd":"git clean -f -f -d","mode":"auto","expect":"deny:git-clean-root"}
+{"set":"more","note":"G11 git clean --force --force","cmd":"git clean --force --force","mode":"auto","expect":"deny:git-clean-root"}
+{"set":"more","note":"G12 clean.requireForce=false -c","cmd":"git -c clean.requireForce=false clean -dx","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra","expect":"deny:git-clean-root"}
+{"set":"more","note":"G13 clean -x at thin root","cmd":"git clean -fdx","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra","expect":"deny:git-clean-root"}
+{"set":"more","note":"G14 clean -x subdir of thin root","cmd":"git clean -fdx","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra/docs","expect":"allow"}
+{"set":"more","note":"G15 clean -x . from subdir dotdot","cmd":"git clean -fdx ..","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra/docs","expect":"deny:git-clean-root"}
+{"set":"more","note":"G16 reset hard main bypass ask","cmd":"git reset --hard main","mode":"bypassPermissions","fake":{"configured":true,"branch":"feat"},"expect":"confirm:reset-hard-main"}
+{"set":"more","note":"G17 reset --hard=? ","cmd":"git reset --keep origin/main","mode":"bypassPermissions","fake":{"configured":true,"branch":"feat"},"expect":"allow"}
+{"set":"more","note":"G18 branch -D main bypass","cmd":"git branch -D main","mode":"bypassPermissions","fake":{"configured":true},"expect":"confirm:git-trunk-ref"}
+{"set":"more","note":"G19 update-ref -d main","cmd":"git update-ref -d refs/heads/main","mode":"bypassPermissions","fake":{"configured":true},"expect":"allow"}
+{"set":"more","note":"G20 push -f via refspec + main~0","cmd":"git push origin +main~0:main","mode":"auto","fake":{"branch":"feat"},"expect":"deny:force-push-main"}
+{"set":"more","note":"G21 rm -rf data under thin root literal","cmd":"rm -rf data","mode":"auto","cwd":"{HOME}/Codebase/personal/devinfra","expect":"deny:rm-protected-root"}
+{"set":"more","note":"G22 rm -r -- .git","cmd":"rm -r -- .git","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-git-dir"}
+{"set":"more","note":"G23 rm -R .git","cmd":"rm -fR .git","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-git-dir"}
+{"set":"more","note":"G24 rm --recursive=? .git","cmd":"rm --recursive --force .git","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-git-dir"}
+{"set":"more","note":"G25 rm -d? rmdir","cmd":"rm -rf -- \"$(pwd)\"","mode":"auto","cwd":"/tmp/x","expect":"deny:rm-protected-root?"}
+{"set":"more","note":"G26 unlink protected path","cmd":"unlink ~/Codebase/personal/podcast-production","mode":"auto","expect":"deny:rm-protected-path"}
+{"set":"more","note":"G27 rm protected path trailing slash","cmd":"rm ~/Codebase/personal/podcast-production/","mode":"auto","expect":"deny:rm-protected-path"}
+{"set":"more","note":"G28 rm protected path rel","cmd":"rm podcast-production","mode":"auto","cwd":"{HOME}/Codebase/personal","expect":"deny:rm-protected-path"}
+{"set":"more","note":"G29 ln -sfn over path","cmd":"ln -sfn /x ~/Codebase/personal/podcast-production","mode":"auto","expect":"deny:rm-protected-path"}
+{"set":"more","note":"G30 cp -r over? ","cmd":"cp -R /x/. ~/Codebase/personal/podcast-production","mode":"auto","expect":"allow"}
+{"set":"more","note":"G31 git worktree remove protected wt root","cmd":"git worktree remove --force ~/Codebase/personal/devinfra/dotfiles","mode":"auto","expect":"deny:rm-protected-root"}
+{"set":"more","note":"G32 trash","cmd":"trash ~/Codebase/personal","mode":"auto","expect":"allow"}
+{"set":"more","note":"G33 git rm -r protected","cmd":"git -C ~/Codebase/personal/devinfra rm -r -q dotfiles","mode":"auto","expect":"allow"}
+{"set":"native","note":"N1","host":"grok","tool":"run_terminal_command","cmd":"chmod 777 build/out","expect":"confirm:chmod-777 =>native"}
+{"set":"native","note":"N2","host":"grok","tool":"run_terminal_command","cmd":"gh api -X DELETE repos/o/r/issues/comments/1","expect":"confirm:gh-api-delete =>native"}
+{"set":"native","note":"N3","host":"kimi","tool":"Bash","cmd":"chmod 777 build/out","expect":"confirm:chmod-777 =>native"}
+{"set":"native","note":"N4","host":"kimi","tool":"Bash","cmd":"gh api -X DELETE repos/o/r/issues/comments/1","expect":"confirm:gh-api-delete =>native"}
+{"set":"native","note":"N5","host":"codex","tool":"shell","cmd":"gh api -X DELETE repos/o/r/issues/comments/1","expect":"confirm:gh-api-delete =>deny"}
+{"set":"native","note":"N6","host":"codex","tool":"shell","cmd":"git reset --hard origin/main","expect":"confirm:reset-hard-main =>native"}
+{"set":"native","note":"N7","host":"codex","tool":"shell","cmd":"gh repo delete o/r --yes","expect":"deny:gh-repo-delete"}
+{"set":"native","note":"N8","host":"codex","tool":"shell","cmd":"git push --mirror backup","expect":"deny:force-push-main"}
+{"set":"native","note":"N9","host":"codex","tool":"shell","cmd":"git branch -d main","expect":"confirm:git-trunk-ref =>native"}
+{"set":"native","note":"N10","host":"grok","tool":"run_terminal_command","cmd":"git worktree remove .worktrees/x","expect":"confirm:git-ref-change =>native"}
+{"set":"native","note":"N11","host":"codex","tool":"shell","cmd":"git push origin --delete feat","expect":"confirm:git-ref-change =>deny"}
+{"set":"native","note":"N12","host":"codex","tool":"shell","cmd":"git push --delete origin feat","expect":"confirm:git-ref-change =>native"}
+{"set":"native","note":"N13","host":"codex","tool":"shell","cmd":"git clean -fdx","cwd":"/tmp/x","expect":"confirm:git-discard =>deny"}
+{"set":"native","note":"N14","host":"codex","tool":"shell","cmd":"git stash drop","expect":"confirm:git-discard =>native"}
+{"set":"native","note":"N15","host":"codex","tool":"shell","cmd":"git branch -D feat","expect":"confirm:git-ref-change =>native"}
+{"set":"native","note":"N16","host":"codex","tool":"shell","cmd":"git reset --hard @{u}","fake":{"branch":"feat","upstream":"refs/heads/main"},"expect":"confirm:reset-hard-main =>native"}
+{"set":"native","note":"N17","host":"grok","tool":"run_terminal_command","cmd":"psql -c 'DROP TABLE x'","expect":"confirm:destructive-sql =>native"}
+{"set":"native","note":"N18","host":"codex","tool":"shell","cmd":"git config --global user.name x","expect":"confirm:git-config-global =>native"}
+{"set":"native","note":"N19","host":"codex","tool":"shell","cmd":"git restore .","expect":"confirm:git-discard =>native"}
+{"set":"native","note":"N20","host":"grok","tool":"run_terminal_command","cmd":"git branch -D feat","expect":"confirm:git-ref-change =>native"}
+{"set":"ro","note":"R1 git log --output","cmd":"git log --output=/tmp/x","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R2 git diff --output","cmd":"git diff --output /tmp/x","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R3 git grep -O pager","cmd":"git grep -Otouch foo","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R4 git grep --open-files-in-pager","cmd":"git grep --open-files-in-pager=touch foo","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R5 find -fprint","cmd":"find . -fprint /tmp/x","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R6 find -fprintf","cmd":"find . -fprintf /tmp/x '%p'","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R7 find -fls","cmd":"find . -fls /tmp/x","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R8 uniq writes out","cmd":"uniq a.txt b.txt","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R9 sed w cmd","cmd":"sed -n 'w /tmp/x' f","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R10 sed s///w","cmd":"sed 's/a/b/w /tmp/x' f","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R11 awk system","cmd":"awk 'BEGIN{system(\"touch x\")}'","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R12 awk print >","cmd":"awk '{print > \"/tmp/x\"}' f","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R13 curl --json","cmd":"curl --json '{\"a\":1}' https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R14 curl -XPOST attached","cmd":"curl -XPOST https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R15 curl --request=DELETE","cmd":"curl --request=DELETE https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R16 curl --form-string","cmd":"curl --form-string a=b https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R17 curl --upload-file","cmd":"curl --upload-file f https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R18 curl --output-dir","cmd":"curl --output-dir /tmp --remote-name https://example.com/x","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R19 curl -sSLo","cmd":"curl -sSLo out https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R20 curl --data-urlencode","cmd":"curl --data-urlencode a=b https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R21 curl -X POST with -s","cmd":"curl -s -X POST https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R22 curl config -K","cmd":"curl -Kcfg https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R23 curl -T attached","cmd":"curl -Tf https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R24 curl --remote-name-all","cmd":"curl --remote-name-all https://example.com/x","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R25 curl --dump-header","cmd":"curl --dump-header h.txt https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R26 curl --cookie-jar","cmd":"curl --cookie-jar j https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R27 curl --trace","cmd":"curl --trace t.txt https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R28 curl --etag-save","cmd":"curl --etag-save e https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R29 curl --hsts","cmd":"curl --hsts h https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R30 curl --libcurl","cmd":"curl --libcurl c.c https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R31 curl --stderr","cmd":"curl --stderr e.txt https://example.com","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R32 gh graphql -F file","cmd":"gh api graphql -F query=@q.graphql","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R33 gh graphql dynamic","cmd":"gh api graphql -f query=\"$Q\"","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R34 gh graphql --input","cmd":"gh api graphql --input q.json","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R35 gh graphql mutation lowercase spacing","cmd":"gh api graphql -f query='  mutation{deleteRef(input:{refId:\"x\"}){clientMutationId}}'","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R36 gh graphql named op","cmd":"gh api graphql -f query='query Q { viewer { login } } mutation M { deleteRef(input:{}){clientMutationId} }' -f operationName=M","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R37 gh api GET with --input","cmd":"gh api repos/o/r --input body.json","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R38 npm view w/ --cache","cmd":"npm view left-pad --cache /tmp/c","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R39 npm ls --json > f","cmd":"npm ls --json > deps.json","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R40 node --version -e","cmd":"node -e \"require('fs').writeFileSync('x','')\" --version","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R41 git ls-files -o","cmd":"git ls-files -o --exclude-standard","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R42 git log -o? ","cmd":"git log -p -o /tmp/x","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R43 git show --output","cmd":"git show HEAD --output=x","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R44 git format-patch","cmd":"git format-patch -1","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R45 git archive -o","cmd":"git archive -o x.tar HEAD","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R46 git bundle","cmd":"git bundle create x.bundle HEAD","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R47 git blame --contents","cmd":"git blame --contents f g","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R48 git status (fsmonitor repo cfg)","cmd":"git status","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R49 git -P log","cmd":"git -P log","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R50 git log w/ GIT_PAGER env","cmd":"GIT_PAGER='touch x' git -p log","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R51 git diff GIT_EXTERNAL_DIFF","cmd":"GIT_EXTERNAL_DIFF='touch x' git diff","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R52 PAGER env man","cmd":"PAGER='touch x' man ls","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R53 MANPAGER","cmd":"MANPAGER='touch x' man ls","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R54 env -S","cmd":"env -S 'touch x'","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R55 git config core.pager via env","cmd":"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0='touch x' git -p log","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R56 less with LESSOPEN","cmd":"LESSOPEN='|touch x %s' less f","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R57 rg --pre= attached","cmd":"rg --pre=./x foo","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R58 grep -r","cmd":"grep -r foo .","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R59 jq -n write? ","cmd":"jq . f.json","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R60 find -exec cat","cmd":"find . -name x -exec cat {} +","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R61 tar -tf","cmd":"tar -tf x.tar","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R62 git -c alias","cmd":"git status --porcelain","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R63 date -s? ","cmd":"date","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R64 sort -o attached","cmd":"sort -ox f","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R65 sort --output","cmd":"sort --output=x f","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R66 git log --ext-diff long abbrev","cmd":"git log -p --ext-dif","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R67 xargs with reader but -I","cmd":"ls | xargs -I{} sh -c 'touch {}'","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"ro","note":"R68 mv protected root","cmd":"mv ~/Codebase/personal /tmp/trash","mode":"auto","expect":"deny:rm-protected-path"}
+{"set":"ro","note":"R69 mv then rm","cmd":"mv ~/Codebase/personal/devinfra /tmp/t && rm -rf /tmp/t","mode":"auto","expect":"allow"}
+{"set":"ro","note":"R70 git ls-remote","cmd":"git ls-remote origin","mode":"bypassPermissions","fake":{},"expect":"allow"}
+{"set":"ro","note":"R71 ssh-keygen -F","cmd":"ssh-keygen -F host","mode":"bypassPermissions","fake":{},"expect":"deny:bypass-no-project-sandbox"}
+{"set":"thin","note":"T1 clean -fdx at thin","cmd":"git clean -fdx","mode":"auto","cwd":"{FX}/thin","expect":"deny:git-clean-root"}
+{"set":"thin","note":"T2 env GIT_DIR/WORK_TREE","cmd":"GIT_DIR={FX}/thin/.git GIT_WORK_TREE={FX}/thin git clean -fdx","mode":"auto","cwd":"/tmp/x","expect":"deny:git-clean-root?"}
+{"set":"thin","note":"T3 export GIT_WORK_TREE","cmd":"export GIT_DIR={FX}/thin/.git GIT_WORK_TREE={FX}/thin; git clean -fdx","mode":"auto","cwd":"/tmp/x","expect":"deny:git-clean-root?"}
+{"set":"thin","note":"T4 subdir dotdot","cmd":"git clean -fdx ..","mode":"auto","cwd":"{FX}/thin/docs","expect":"deny:git-clean-root"}
+{"set":"thin","note":"T5 subdir :/","cmd":"git clean -fdx :/","mode":"auto","cwd":"{FX}/thin/docs","expect":"deny:git-clean-root"}
+{"set":"thin","note":"T6 subdir plain","cmd":"git clean -fdx","mode":"auto","cwd":"{FX}/thin/docs","expect":"allow"}
+{"set":"thin","note":"T7 pathspec magic :(top)","cmd":"git clean -fdx ':(top)'","mode":"auto","cwd":"{FX}/thin/docs","expect":"deny:git-clean-root"}
+{"set":"thin","note":"T8 cd ; clean","cmd":"cd {FX}/thin; git clean -fdx","mode":"auto","cwd":"/tmp/x","expect":"deny:git-clean-root?"}
+{"set":"thin","note":"T9 sh -c cd clean","cmd":"sh -c 'cd {FX}/thin && git clean -fdx'","mode":"auto","cwd":"/tmp/x","expect":"deny:git-clean-root?"}
+{"set":"thin","note":"T10 -C rel","cmd":"git -C .. clean -fdx","mode":"auto","cwd":"{FX}/thin/docs","expect":"deny:git-clean-root"}
+{"set":"thin","note":"T11 --exclude=x -x","cmd":"git clean -fd --exclude=x -x","mode":"auto","cwd":"{FX}/thin","expect":"deny:git-clean-root"}
+{"set":"thin","note":"T12 -e attached then x","cmd":"git clean -fdex","mode":"auto","cwd":"{FX}/thin","expect":"allow"}
+{"set":"thin","note":"T13 alias gpristine","cmd":"gpristine","mode":"auto","cwd":"{FX}/thin","expect":"allow"}
