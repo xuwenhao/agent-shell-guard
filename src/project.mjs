@@ -5,7 +5,7 @@
 // never writes, and every failure degrades to "no project / not configured /
 // branch unknown", which is the strict direction.
 
-import { lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { lstatSync, statSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
@@ -320,4 +320,26 @@ export function memoizeInspector(inspect) {
     }
     return info;
   };
+}
+
+/** Nearest .beads directory wins; unreadable paths are deliberately silent.
+ * @param {string|null} directory
+ */
+export function hasBeadsHooks(directory) {
+  if (!directory || !isAbsolute(directory)) return false;
+  let current = resolve(directory);
+  for (;;) {
+    try {
+      if (statSync(join(current, '.beads')).isDirectory()) {
+        return readdirSync(join(current, '.beads', 'hooks')).length > 0;
+      }
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code !== 'ENOENT') return false;
+      // A present .beads without hooks must not fall through to its parent.
+      if (exists(join(current, '.beads'))) return false;
+    }
+    const parent = dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
 }

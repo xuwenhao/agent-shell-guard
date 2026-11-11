@@ -14,6 +14,8 @@
 
 /** Hard boundaries: deny in every tier of every profile that enables them. */
 export const DENY_RULES = Object.freeze([
+  'bd-forbidden-subcommand',
+  'bd-profile-write',
   'org-ruleset-write',
   'rm-protected-root',
   'rm-git-dir',
@@ -32,6 +34,7 @@ export const DENY_RULES = Object.freeze([
  * force a human prompt the classifier cannot answer.
  */
 export const ASK_LEVEL_RULES = Object.freeze([
+  'bd-repo-hooks',
   'destructive-sql',
   'reset-hard-main',
   'git-trunk-ref',

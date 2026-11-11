@@ -35,6 +35,8 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   pipelineGroup: number|null,
  *   rootOffset?: number,
  *   graphEnv?: string[],
+ *   assignmentNames?: string[],
+ *   markedArgv?: Array<string|null>,
  * }} AnalyzedCommand
  */
 /**
@@ -452,6 +454,7 @@ export function analyzeShellInput(input, options) {
       hasCompound: false, nativePromptArgv: wrappers.length ? null : rawArgv,
       redirections: [], assignments: envOperandAssignments(rawArgv, argv),
     };
+    graph.commands[0].assignmentNames = (graph.assignments ?? []).map((item) => item.name);
     const evaluator = shellEvaluator(argv);
     if (!evaluator) return finishGraph(graph);
     graph.nativePromptArgv = null;
@@ -611,15 +614,26 @@ export function analyzeShellInput(input, options) {
         if (++commandCount > maxCommands) { unknown('command-limit', `command graph exceeds ${maxCommands} nodes`); return; }
         const rawArgv = words.map(staticWord);
         const displayArgv = words.map((word) => isObject(word) ? sliceBytes(offsetOf(word, 'Pos'), offsetOf(word, 'End')) : '<?>');
-        const { argv, wrappers } = unwrapCommand(rawArgv);
+        // Only wrapper assignment operands may use marked values; retain null
+        // in the effective argv so dynamic command/data words stay unknown.
+        const wrapperArgv = words.map((word, index) => {
+          const marked = rawArgv[index] === null ? markedWord(word) : rawArgv[index];
+          return rawArgv[index] ?? (marked && /^[A-Za-z_][A-Za-z0-9_]*=/.test(marked) ? marked : null);
+        });
+        const unwrapped = unwrapCommand(wrapperArgv);
+        const wrappers = unwrapped.wrappers;
+        const argv = rawArgv.slice(rawArgv.length - unwrapped.argv.length);
         const span = { start: offsetOf(node, 'Pos'), end: offsetOf(node, 'End') };
+        /** @type {AnalyzedCommand} */
         const command = {
-          argv, rawArgv, displayArgv, dialect: currentDialect, source: nodeSource,
+          argv, rawArgv, displayArgv, markedArgv: words.map(markedWord).slice(rawArgv.length - argv.length), dialect: currentDialect, source: nodeSource,
           span, wrappers, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
           pipelineGroup, rootOffset: rootOffset ?? span.start,
         };
+        const assignmentStart = graph.assignments?.length ?? 0;
         recordAssignments(node.Assigns, false);
-        graph.assignments?.push(...envOperandAssignments(rawArgv, argv));
+        graph.assignments?.push(...envOperandAssignments(wrapperArgv, argv));
+        command.assignmentNames = (graph.assignments ?? []).slice(assignmentStart).map((item) => item.name);
         graph.commands.push(command);
         if (argv[0] === null || argv.length === 0) unknown('dynamic-command', 'command name cannot be reconstructed statically');
 

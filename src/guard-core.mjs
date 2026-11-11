@@ -10,7 +10,8 @@
 // resolving `HEAD` / `@{u}` in push and reset rules.
 
 import { homedir } from 'node:os';
-import { basename } from 'node:path';
+import { basename, isAbsolute, resolve } from 'node:path';
+import { parseBdCommand, BD_FORBIDDEN } from './bd-command.mjs';
 
 import { analyzeShellInput, cdArgvOperand, selectShellDialect, shellEvaluator, unwrapCommand } from './shell-analyzer.mjs';
 import { isPolicyEnabled, permissionTier, resolvePolicyProfile } from './policies/profiles.mjs';
@@ -45,7 +46,7 @@ import {
   targetCovers,
   targetSegments,
 } from './path-targets.mjs';
-import { inspectDirectory, inspectProjectDir, memoizeInspector } from './project.mjs';
+import { hasBeadsHooks, inspectDirectory, inspectProjectDir, memoizeInspector } from './project.mjs';
 import { isExcludedCommandGraph, isReadOnlyGraph } from './write-class.mjs';
 
 /** @param {string} value @param {number} [length] */
@@ -909,6 +910,17 @@ function hardPolicy(graph, enabled, ctx) {
   for (const command of graph.commands) {
     const cwds = ctx.cwdsFor(command);
     const dialect = command.dialect;
+    const bd = parseBdCommand(command);
+    if (bd?.profileWrite && enabled('bd-profile-write')) return {
+      ruleId: 'bd-profile-write', evaluation: 'matched', detail: 'bd profiling 写文件',
+      why: 'bd 在沙盒外执行，profiling 可写任意文件；请交给用户在普通终端运行。',
+    };
+    if (bd && enabled('bd-forbidden-subcommand') && (bd.subcommand === null || BD_FORBIDDEN.has(bd.subcommand ?? ''))) return {
+      ruleId: 'bd-forbidden-subcommand', evaluation: bd.subcommand === null ? 'unknown' : 'matched',
+      detail: 'bd 禁止的子命令或子命令无法静态确定',
+      why: '这些子命令会重建本地库、写 ~/.claude、装会在沙盒外执行的 git hook、改 server 连接；请交给用户在普通终端运行。未知 flag 或动态子命令也必须拒绝。',
+    };
+
     const orgWrite = orgRulesetWrite(command);
     if (orgWrite && enabled('org-ruleset-write')) {
       return {
@@ -1252,6 +1264,16 @@ const GIT_RULE_TEXT = {
 function confirmationPolicy(graph, enabled, ctx) {
   for (const command of graph.commands) {
     const tool = commandName(command);
+    const bd = parseBdCommand(command);
+    if (bd && !bd.readOnly && enabled('bd-repo-hooks') && ctx.cwdsFor(command).some((cwd) => {
+      const directory = bd.directory === undefined ? cwd : bd.directory === null ? null
+        : isAbsolute(bd.directory) ? bd.directory : cwd ? resolve(cwd, bd.directory) : null;
+      return hasBeadsHooks(directory);
+    })) return {
+      ruleId: 'bd-repo-hooks', evaluation: 'matched', detail: 'bd 执行项目 .beads/hooks 脚本',
+      why: 'bd 在沙盒外运行，项目 hooks 等同沙盒外任意代码，请确认这些脚本可信。',
+    };
+
     if (enabled('remote-exec') && ['ssh', 'scp', 'rsync'].includes(tool) && (tool === 'rsync' || !hasFlag(command.argv, '-G'))) {
       if (tool === 'ssh') {
         const { host, rest } = parseSsh(command);
