@@ -10,7 +10,8 @@
 // resolving `HEAD` / `@{u}` in push and reset rules.
 
 import { homedir } from 'node:os';
-import { basename } from 'node:path';
+import { basename, isAbsolute, resolve } from 'node:path';
+import { parseBdCommand, BD_FORBIDDEN, graphExportsBeadsProfile } from './bd-command.mjs';
 
 import { analyzeShellInput, cdArgvOperand, selectShellDialect, shellEvaluator, unwrapCommand } from './shell-analyzer.mjs';
 import { isPolicyEnabled, permissionTier, resolvePolicyProfile } from './policies/profiles.mjs';
@@ -45,7 +46,7 @@ import {
   targetCovers,
   targetSegments,
 } from './path-targets.mjs';
-import { inspectDirectory, inspectProjectDir, memoizeInspector } from './project.mjs';
+import { beadsDirHasHooks, hasBeadsHooks, inspectDirectory, inspectProjectDir, memoizeInspector } from './project.mjs';
 import { isExcludedCommandGraph, isReadOnlyGraph } from './write-class.mjs';
 
 /** @param {string} value @param {number} [length] */
@@ -909,6 +910,17 @@ function hardPolicy(graph, enabled, ctx) {
   for (const command of graph.commands) {
     const cwds = ctx.cwdsFor(command);
     const dialect = command.dialect;
+    const bd = parseBdCommand(command);
+    if (bd && (bd.profileWrite || graphExportsBeadsProfile(graph)) && enabled('bd-profile-write')) return {
+      ruleId: 'bd-profile-write', evaluation: 'matched', detail: 'bd profiling 写文件',
+      why: 'bd 在沙盒外执行，profiling 可写任意文件；请交给用户在普通终端运行。',
+    };
+    if (bd && enabled('bd-forbidden-subcommand') && (bd.subcommand === null || BD_FORBIDDEN.has(bd.subcommand ?? ''))) return {
+      ruleId: 'bd-forbidden-subcommand', evaluation: bd.subcommand === null ? 'unknown' : 'matched',
+      detail: 'bd 禁止的子命令或子命令无法静态确定',
+      why: '这些子命令会重建本地库、写 ~/.claude、装会在沙盒外执行的 git hook、改 server 连接；请交给用户在普通终端运行。未知 flag 或动态子命令也必须拒绝。',
+    };
+
     const orgWrite = orgRulesetWrite(command);
     if (orgWrite && enabled('org-ruleset-write')) {
       return {
@@ -1252,6 +1264,54 @@ const GIT_RULE_TEXT = {
 function confirmationPolicy(graph, enabled, ctx) {
   for (const command of graph.commands) {
     const tool = commandName(command);
+    const bd = parseBdCommand(command);
+    // A null subcommand never reaches here: hardPolicy denies it first via bd-forbidden-subcommand.
+    // A dynamic option word may be --mem-profile/--fix/--directory: confirm even for
+    // read-only verbs. This is ask-level rather than deny so `bd create "$TITLE"` keeps working.
+    if (bd?.dynamicOption && enabled('bd-repo-hooks')) return {
+      ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 参数里有无法静态确定的选项',
+      why: 'bd 在沙盒外运行，动态参数可能展开成 --mem-profile、--fix 或 --directory 等选项，无法静态确定，请确认。',
+    };
+    if (bd && !bd.readOnly && enabled('bd-repo-hooks')) {
+      // A dynamic -C/--directory target cannot be inspected; it may point at a hooked
+      // repository, so it needs the same confirmation as a literal hooked path.
+      if (bd.directory === null) return {
+        ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd -C 目标无法静态确定',
+        why: 'bd 在沙盒外运行，-C 指向的目录可能有 .beads/hooks（沙盒外任意代码），目录无法静态确定，请确认。',
+      };
+      const target = bd.directory;
+      const cwds = ctx.cwdsFor(command);
+      // `BEADS_DIR=… bd create` selects that workspace regardless of cwd/-C. Only the
+      // command's own assignment is modelled; an inherited process BEADS_DIR is not.
+      if (bd.beadsDir !== undefined) {
+        const dir = bd.beadsDir;
+        const resolved = dir === null ? [null]
+          : isAbsolute(dir) ? [dir] : cwds.map((cwd) => cwd ? resolve(cwd, dir) : null);
+        if (resolved.some((item) => item === null)) return {
+          ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 的 BEADS_DIR 无法静态确定',
+          why: 'bd 在沙盒外运行，BEADS_DIR 指向的库可能有 hooks（沙盒外任意代码），无法静态确定，请确认。',
+        };
+        if (resolved.some((item) => beadsDirHasHooks(/** @type {string} */ (item)))) return {
+          ruleId: 'bd-repo-hooks', evaluation: 'matched', detail: 'bd 执行 BEADS_DIR 库里的 hooks 脚本',
+          why: 'bd 在沙盒外运行，BEADS_DIR 库里的 hooks 等同沙盒外任意代码，请确认这些脚本可信。',
+        };
+      }
+      // Unknown cwd (`cd "$DIR" && bd create`) with no absolute -C: the effective directory
+      // cannot be inspected, so confirm rather than assume no hooks.
+      else if ((target === undefined || !isAbsolute(target)) && cwds.some((cwd) => !cwd)) return {
+        ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 的工作目录无法静态确定',
+        why: 'bd 在沙盒外运行，工作目录无法静态确定，可能落在有 .beads/hooks 的仓库，请确认。',
+      };
+      else if (cwds.some((cwd) => {
+        const directory = target === undefined ? cwd
+          : isAbsolute(target) ? target : cwd ? resolve(cwd, target) : null;
+        return hasBeadsHooks(directory);
+      })) return {
+        ruleId: 'bd-repo-hooks', evaluation: 'matched', detail: 'bd 执行项目 .beads/hooks 脚本',
+        why: 'bd 在沙盒外运行，项目 hooks 等同沙盒外任意代码，请确认这些脚本可信。',
+      };
+    }
+
     if (enabled('remote-exec') && ['ssh', 'scp', 'rsync'].includes(tool) && (tool === 'rsync' || !hasFlag(command.argv, '-G'))) {
       if (tool === 'ssh') {
         const { host, rest } = parseSsh(command);

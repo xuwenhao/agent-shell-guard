@@ -35,6 +35,9 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   pipelineGroup: number|null,
  *   rootOffset?: number,
  *   graphEnv?: string[],
+ *   assignmentNames?: string[],
+ *   commandAssignments?: AnalyzedAssignment[],
+ *   markedArgv?: Array<string|null>,
  * }} AnalyzedCommand
  */
 /**
@@ -452,6 +455,8 @@ export function analyzeShellInput(input, options) {
       hasCompound: false, nativePromptArgv: wrappers.length ? null : rawArgv,
       redirections: [], assignments: envOperandAssignments(rawArgv, argv),
     };
+    graph.commands[0].commandAssignments = [...(graph.assignments ?? [])];
+    graph.commands[0].assignmentNames = graph.commands[0].commandAssignments.map((item) => item.name);
     const evaluator = shellEvaluator(argv);
     if (!evaluator) return finishGraph(graph);
     graph.nativePromptArgv = null;
@@ -611,15 +616,27 @@ export function analyzeShellInput(input, options) {
         if (++commandCount > maxCommands) { unknown('command-limit', `command graph exceeds ${maxCommands} nodes`); return; }
         const rawArgv = words.map(staticWord);
         const displayArgv = words.map((word) => isObject(word) ? sliceBytes(offsetOf(word, 'Pos'), offsetOf(word, 'End')) : '<?>');
-        const { argv, wrappers } = unwrapCommand(rawArgv);
+        // Only wrapper assignment operands may use marked values; retain null
+        // in the effective argv so dynamic command/data words stay unknown.
+        const wrapperArgv = words.map((word, index) => {
+          const marked = rawArgv[index] === null ? markedWord(word) : rawArgv[index];
+          return rawArgv[index] ?? (marked && /^[A-Za-z_][A-Za-z0-9_]*=/.test(marked) ? marked : null);
+        });
+        const unwrapped = unwrapCommand(wrapperArgv);
+        const wrappers = unwrapped.wrappers;
+        const argv = rawArgv.slice(rawArgv.length - unwrapped.argv.length);
         const span = { start: offsetOf(node, 'Pos'), end: offsetOf(node, 'End') };
+        /** @type {AnalyzedCommand} */
         const command = {
-          argv, rawArgv, displayArgv, dialect: currentDialect, source: nodeSource,
+          argv, rawArgv, displayArgv, markedArgv: words.map(markedWord).slice(rawArgv.length - argv.length), dialect: currentDialect, source: nodeSource,
           span, wrappers, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
           pipelineGroup, rootOffset: rootOffset ?? span.start,
         };
+        const assignmentStart = graph.assignments?.length ?? 0;
         recordAssignments(node.Assigns, false);
-        graph.assignments?.push(...envOperandAssignments(rawArgv, argv));
+        graph.assignments?.push(...envOperandAssignments(wrapperArgv, argv, rawArgv));
+        command.commandAssignments = (graph.assignments ?? []).slice(assignmentStart);
+        command.assignmentNames = command.commandAssignments.map((item) => item.name);
         graph.commands.push(command);
         if (argv[0] === null || argv.length === 0) unknown('dynamic-command', 'command name cannot be reconstructed statically');
 
@@ -716,13 +733,19 @@ export function analyzeShellInput(input, options) {
  * @param {Array<string|null>} rawArgv @param {Array<string|null>} argv
  * @returns {AnalyzedAssignment[]}
  */
-function envOperandAssignments(rawArgv, argv) {
+/**
+ * @param {Array<string|null>} rawArgv words as recorded (marked dynamic words allowed)
+ * @param {Array<string|null>} argv the unwrapped command
+ * @param {Array<string|null>} [staticArgv] static view of the same words; a null
+ *   there means the word is dynamic, so the recorded value must be null (unknown)
+ */
+function envOperandAssignments(rawArgv, argv, staticArgv = rawArgv) {
   /** @type {AnalyzedAssignment[]} */
   const result = [];
-  for (const word of rawArgv.slice(0, rawArgv.length - argv.length)) {
+  rawArgv.slice(0, rawArgv.length - argv.length).forEach((word, index) => {
     const match = typeof word === 'string' ? /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word) : null;
-    if (match) result.push({ name: match[1], value: match[2], exported: false });
-  }
+    if (match) result.push({ name: match[1], value: staticArgv[index] === null ? null : match[2], exported: false });
+  });
   return result;
 }
 

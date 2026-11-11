@@ -218,6 +218,9 @@ argv), and denied otherwise. The adapter, not the event, decides the host.
 
 | Rule | Decision | Matches |
 |---|---|---|
+| `bd-forbidden-subcommand` | deny | `bd init/setup/hooks/dolt`, including global options before the verb; unknown options or dynamic verbs fail closed |
+| `bd-profile-write` | deny | `bd --mem-profile`, `--cpu-profile`, or a command-local `BEADS_MEM_PROFILE` assignment |
+| `bd-repo-hooks` | ask (bypass/native) | Non-read-only bd verbs with nonempty hooks in the nearest `.beads`; honors `-C`/`--directory`. `doctor --fix` is a write; missing/unreadable hooks are silent |
 | `org-ruleset-write` | deny | `gh api` writes to `orgs/<org>/rulesets` (path or URL; dynamic endpoint with a write method also denies) |
 | `rm-protected-root` | deny | recursive `rm` of a protected root **or any ancestor of one**; relative targets, globs and brace expansions resolved against the hook `cwd` (below). Also `find <ancestor> … -delete` / `-exec rm -r…` whose name tests can select the root, `find … \| xargs rm -r…` and `echo <path> \| xargs rm -r…`, `rsync --delete` into a root, `git worktree remove` of a root, and the same inside a double-quoted `bash -c` / `sh -c` / `eval` script whose expansions are treated as unknown words. `find -exec` sees through `command`/`env`/`sudo` and counts `-exec sh -c …` as deleting |
 | `rm-git-dir` | deny | recursive `rm` with a `.git` segment anywhere in the target (`rm -rf .git`, `sub/.git/`, `.git/objects`, `.g*`); `find` that deletes `.git` (`-name .git -exec rm -rf`, `-path '*/.git/*' -delete`; a negated `-not -path` test does not select). Recovery paths stay allowed: `.git/modules/<name>…`, `.git/worktrees/<name>…`, `.git/rebase-merge`, `.git/rebase-apply`, `*.lock` |
