@@ -37,6 +37,7 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   graphEnv?: string[],
  *   assignmentNames?: string[],
  *   commandAssignments?: AnalyzedAssignment[],
+ *   wrapperCwds?: Array<string|null>, // outer-to-inner env directory overrides
  *   markedArgv?: Array<string|null>,
  * }} AnalyzedCommand
  */
@@ -288,11 +289,157 @@ function staticWord(word) {
   return expandHome ? `${homedir()}${result.slice(1)}` : result;
 }
 
+/**
+ * Decode GNU env -S syntax, not shell syntax. Runtime variable references,
+ * unknown escapes (including backslash-newline/trailing backslash), unclosed
+ * quotes and double-quoted \\c are dynamic (fail closed).
+ * @param {string} text @returns {string[]|null}
+ */
+function splitEnvString(text) {
+  /** @type {string[]} */
+  const words = [];
+  let word = '', quote = '', started = false;
+  const flush = () => { if (started) words.push(word); word = ''; started = false; };
+  /** @type {Record<string, string>} */
+  const escapes = { t: '\t', n: '\n', r: '\r', f: '\f', v: '\v' };
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === "'" || char === '"') {
+      if (!quote) { quote = char; started = true; continue; }
+      if (quote === char) { quote = ''; continue; }
+    }
+    if (char === '\\') {
+      const next = text[++i];
+      if (quote === "'" && next !== '\\' && next !== "'") {
+        word += '\\'; started = true; i--; continue;
+      }
+      if (next === undefined) return null;
+      if (next === 'c') {
+        if (quote) return null;
+        flush(); return words;
+      }
+      if (next === '_') {
+        if (!quote) flush();
+        else { word += ' '; started = true; }
+        continue;
+      }
+      if ('\\"\'#$'.includes(next)) word += next;
+      else if (Object.hasOwn(escapes, next)) word += escapes[next];
+      else return null;
+      started = true; continue;
+    }
+    if (quote !== "'" && char === '$' && /[A-Za-z_{]/.test(text[i + 1] ?? '')) return null;
+    if (!quote && /[ \t\n\r\f\v]/.test(char)) { flush(); continue; }
+    if (!quote && char === '#' && !started) break;
+    word += char; started = true;
+  }
+  if (quote) return null;
+  flush();
+  return words;
+}
+
+/** @typedef {'none'|'required'|'optional'} OptionValue */
+/** @typedef {{short: Record<string, string>, long: Record<string, OptionValue>, loneDash?: string}} OptionTable */
+/** @type {OptionTable} */
+const ENV_OPTIONS = {
+  loneDash: 'ignore-environment',
+  // `-P` differs between implementations: BSD env (macOS /usr/bin/env) takes
+  // `-P altpath`, GNU coreutils 9.x has no short -P value. The guard runs on the
+  // machine that executes the command, so pick by platform; mistaking the value
+  // for the command would let the real command escape every rule.
+  // `-a ARG` (GNU --argv0) takes a value; BSD env rejects it, which is harmless.
+  short: { i: 'ignore-environment', 0: 'null', v: 'debug', u: 'unset', C: 'chdir', S: 'split-string',
+    a: 'argv0', P: process.platform === 'darwin' ? 'bsd-altpath' : 'default-signal' },
+  long: {
+    'ignore-environment': 'none', null: 'none', debug: 'none', 'list-signal-handling': 'none',
+    help: 'none', version: 'none', unset: 'required', chdir: 'required',
+    'split-string': 'required', argv0: 'required', 'default-signal': 'optional',
+    'ignore-signal': 'optional', 'block-signal': 'optional',
+    // Internal name for BSD `-P altpath`; BSD env has no long options.
+    'bsd-altpath': 'required',
+  },
+};
+/** @type {OptionTable} */
+const SUDO_OPTIONS = {
+  short: {
+    a: 'auth-type', u: 'user', g: 'group', h: 'host', p: 'prompt', C: 'close-from', T: 'command-timeout',
+    R: 'chroot', D: 'chdir', r: 'role', t: 'type', c: 'login-class', U: 'other-user',
+    A: 'askpass', b: 'background', B: 'bell', E: 'preserve-env', e: 'edit', H: 'set-home',
+    i: 'login', K: 'remove-timestamp', k: 'reset-timestamp', l: 'list', n: 'non-interactive',
+    N: 'no-update', P: 'preserve-groups', S: 'stdin', s: 'shell', V: 'version', v: 'validate',
+  },
+  long: {
+    'auth-type': 'required', user: 'required', group: 'required', host: 'required', prompt: 'required',
+    'close-from': 'required', 'command-timeout': 'required', chroot: 'required', chdir: 'required',
+    role: 'required', type: 'required', 'login-class': 'required', 'other-user': 'required',
+    askpass: 'none', background: 'none', bell: 'none', 'preserve-env': 'optional', edit: 'none',
+    'set-home': 'none', login: 'none', 'remove-timestamp': 'none', 'reset-timestamp': 'none',
+    list: 'none', 'non-interactive': 'none', 'preserve-groups': 'none', stdin: 'none',
+    shell: 'none', version: 'none', validate: 'none', help: 'none',
+  },
+};
+
+/**
+ * Parse one getopt word (possibly a short cluster). Optional values are attached
+ * with '=' on long options only. Invalid/ambiguous words consume just themselves:
+ * the actual utility exits before executing a command in those cases.
+ * @param {Array<string|null>} argv @param {number} index @param {OptionTable} table
+ * @returns {{kind: 'operand'|'unknown'|'options', consumed: number,
+ *   options: Array<{name: string, value: string|null|undefined, prefix: string}>}}
+ */
+function parseWrapperOption(argv, index, table) {
+  const arg = argv[index];
+  const unknown = { kind: /** @type {const} */ ('unknown'), consumed: 1, options: [] };
+  // GNU env: "A mere - implies -i"; for other wrappers a lone dash is an operand.
+  if (arg === '-' && table.loneDash) {
+    return { kind: 'options', consumed: 1, options: [{ name: table.loneDash, value: undefined, prefix: '' }] };
+  }
+  if (typeof arg !== 'string' || arg === '-' || !arg.startsWith('-')) {
+    return { kind: 'operand', consumed: 0, options: [] };
+  }
+  if (arg.startsWith('--')) {
+    const equal = arg.indexOf('=');
+    const key = arg.slice(2, equal < 0 ? undefined : equal);
+    const matches = Object.hasOwn(table.long, key) ? [key] : Object.keys(table.long).filter(name => name.startsWith(key));
+    if (!key || matches.length !== 1) return unknown;
+    const name = matches[0], mode = table.long[name];
+    if (equal >= 0 && mode === 'none') return unknown;
+    const separate = equal < 0 && mode === 'required';
+    return { kind: 'options', consumed: separate ? 2 : 1,
+      options: [{ name, value: equal >= 0 ? arg.slice(equal + 1) : separate ? argv[index + 1] : undefined, prefix: '' }] };
+  }
+  /** @type {Array<{name: string, value: string|null|undefined, prefix: string}>} */
+  const options = [];
+  for (let i = 1; i < arg.length; i++) {
+    const letter = /** @type {string} */ (arg[i]);
+    if (!Object.hasOwn(table.short, letter)) return unknown;
+    const name = table.short[letter];
+    if (table.long[name] === 'required') {
+      const attached = arg.slice(i + 1);
+      options.push({ name, value: attached || argv[index + 1], prefix: arg.slice(1, i) });
+      return { kind: 'options', consumed: attached ? 1 : 2, options };
+    }
+    options.push({ name, value: undefined, prefix: '' });
+  }
+  return { kind: 'options', consumed: 1, options };
+}
+
+/** Keep dynamic attached cwd/split values using the very same option grammar.
+ * @param {string} word */
+function markedWrapperOption(word) {
+  return [ENV_OPTIONS, SUDO_OPTIONS].some(table => {
+    const parsed = parseWrapperOption([word], 0, table);
+    return parsed.options.some(option => ['chdir', 'split-string'].includes(option.name) && option.value !== undefined);
+  });
+}
+
 /** @param {Array<string|null>} rawArgv */
 export function unwrapCommand(rawArgv) {
   let argv = rawArgv;
   /** @type {string[]} */
   const wrappers = [];
+  /** @type {Array<string|null>} */
+  const wrapperCwds = [];
   for (let depth = 0; depth < 8 && typeof argv[0] === 'string'; depth++) {
     const name = basename(/** @type {string} */ (argv[0])).toLowerCase();
     let index = 1;
@@ -301,13 +448,31 @@ export function unwrapCommand(rawArgv) {
         /^-[^-]*[vV]/.test(/** @type {string} */ (argv[index]))) break;
       while (typeof argv[index] === 'string' && argv[index]?.startsWith('-')) index++;
     } else if (name === 'env') {
+      let envCwd;
       while (index < argv.length) {
         const arg = argv[index];
         if (arg === '--') { index++; break; }
-        if (arg === '-u' || arg === '--unset' || arg === '-C' || arg === '--chdir') { index += 2; continue; }
-        if (typeof arg === 'string' && (arg.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg))) { index++; continue; }
-        break;
+        if (typeof arg === 'string' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) { index++; continue; }
+        const parsed = parseWrapperOption(argv, index, ENV_OPTIONS);
+        if (parsed.kind === 'operand') break;
+        for (const { name: option, value, prefix: clusterPrefix } of parsed.options) {
+          if (option === 'chdir') {
+            envCwd = typeof value === 'string' && !value.includes(DYNAMIC_MARKER) ? value : null;
+          } else if (option === 'split-string') {
+            const tail = argv.slice(index + parsed.consumed);
+            const prefix = [...argv.slice(1, index), ...(clusterPrefix ? ['-' + clusterPrefix] : [])];
+            const words = typeof value === 'string' && !value.includes(DYNAMIC_MARKER) ? splitEnvString(value) : null;
+            const text = words === null ? null
+              : ['env', ...prefix.map(quoteShellWord), ...words.map(quoteShellWord), ...tail.map(quoteShellWord)].join(' ');
+            // -C stays in prefix for nested parsing; do not also record this
+            // env's directory in the outer command's wrapperCwds.
+            return { argv, wrappers: [...wrappers, name], wrapperCwds,
+              evaluator: { script: text, scriptIndex: -1 } };
+          }
+        }
+        index += parsed.consumed;
       }
+      if (envCwd !== undefined) wrapperCwds.push(envCwd);
     } else if (name === 'exec') {
       while (index < argv.length) {
         const arg = argv[index];
@@ -317,13 +482,26 @@ export function unwrapCommand(rawArgv) {
         break;
       }
     } else if (name === 'sudo') {
-      const valueOptions = new Set(['-u', '-g', '-h', '-p', '-C', '-T', '-R', '-D']);
+      let sudoCwd;
+      // Options and assignments can alternate until the command or '--'.
       while (index < argv.length) {
         const arg = argv[index];
         if (arg === '--') { index++; break; }
-        if (typeof arg !== 'string' || !arg.startsWith('-')) break;
-        index += valueOptions.has(arg) ? 2 : 1;
+        if (typeof arg === 'string' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) { index++; continue; }
+        const parsed = parseWrapperOption(argv, index, SUDO_OPTIONS);
+        if (parsed.kind === 'operand') break;
+        for (const option of parsed.options) {
+          if (option.name === 'edit') {
+            // sudoedit operands are files, not commands. The editor is unknown.
+            return { argv: [null], wrappers: [...wrappers, name], wrapperCwds, evaluator: null };
+          }
+          if (option.name === 'chdir') {
+            sudoCwd = typeof option.value === 'string' && !option.value.includes(DYNAMIC_MARKER) ? option.value : null;
+          }
+        }
+        index += parsed.consumed;
       }
+      if (sudoCwd !== undefined) wrapperCwds.push(sudoCwd);
     } else if (name === 'nohup' || name === 'setsid') {
       while (typeof argv[index] === 'string' && argv[index]?.startsWith('-')) {
         if (argv[index] === '--') { index++; break; }
@@ -382,7 +560,12 @@ export function unwrapCommand(rawArgv) {
     wrappers.push(name);
     argv = argv.slice(index);
   }
-  return { argv, wrappers };
+  return { argv, wrappers, wrapperCwds, evaluator: null };
+}
+
+/** @param {string|null} word */
+function quoteShellWord(word) {
+  return "'" + (word ?? DYNAMIC_MARKER).replaceAll("'", "'\\''") + "'";
 }
 
 /** @param {Array<string|null>} argv */
@@ -446,18 +629,18 @@ export function analyzeShellInput(input, options) {
   const maxCommands = options.maxCommands ?? MAX_COMMANDS;
   if (input.kind === 'argv') {
     const rawArgv = input.argv.map(String);
-    const { argv, wrappers } = unwrapCommand(rawArgv);
+    const { argv, wrappers, wrapperCwds, evaluator: split } = unwrapCommand(rawArgv);
     /** @type {ShellGraph} */
     const graph = {
       status: 'safe', dialect,
-      commands: [{ argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 }, wrappers, hasRedirection: false, pipelineGroup: null, rootOffset: 0 }],
+      commands: [{ argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 }, wrappers, wrapperCwds, hasRedirection: false, pipelineGroup: null, rootOffset: 0 }],
       unknowns: [], hasPipeline: false, hasRedirection: false, hasSubstitution: false,
       hasCompound: false, nativePromptArgv: wrappers.length ? null : rawArgv,
       redirections: [], assignments: envOperandAssignments(rawArgv, argv),
     };
     graph.commands[0].commandAssignments = [...(graph.assignments ?? [])];
     graph.commands[0].assignmentNames = graph.commands[0].commandAssignments.map((item) => item.name);
-    const evaluator = shellEvaluator(argv);
+    const evaluator = split ? { ...split, dialect } : shellEvaluator(argv);
     if (!evaluator) return finishGraph(graph);
     graph.nativePromptArgv = null;
     if (evaluator.script === null) {
@@ -484,6 +667,8 @@ export function analyzeShellInput(input, options) {
       ...command,
       source: command.source === 'top-level' ? /** @type {CommandSource} */ ('shell-c') : command.source,
       rootOffset: 0,
+      wrapperCwds: [...wrapperCwds, ...(command.wrapperCwds ?? [])],
+      commandAssignments: [...(graph.commands[0].commandAssignments ?? []), ...(command.commandAssignments ?? [])],
     })));
     graph.assignments?.push(...(nested.assignments ?? []));
     graph.unknowns.push(...nested.unknowns);
@@ -616,20 +801,20 @@ export function analyzeShellInput(input, options) {
         if (++commandCount > maxCommands) { unknown('command-limit', `command graph exceeds ${maxCommands} nodes`); return; }
         const rawArgv = words.map(staticWord);
         const displayArgv = words.map((word) => isObject(word) ? sliceBytes(offsetOf(word, 'Pos'), offsetOf(word, 'End')) : '<?>');
-        // Only wrapper assignment operands may use marked values; retain null
+        // Wrapper assignments and attached env/sudo options may use marked values; retain null
         // in the effective argv so dynamic command/data words stay unknown.
         const wrapperArgv = words.map((word, index) => {
           const marked = rawArgv[index] === null ? markedWord(word) : rawArgv[index];
-          return rawArgv[index] ?? (marked && /^[A-Za-z_][A-Za-z0-9_]*=/.test(marked) ? marked : null);
+          return rawArgv[index] ?? (marked && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(marked) || markedWrapperOption(marked)) ? marked : null);
         });
         const unwrapped = unwrapCommand(wrapperArgv);
         const wrappers = unwrapped.wrappers;
-        const argv = rawArgv.slice(rawArgv.length - unwrapped.argv.length);
+        const argv = unwrapped.argv.map((arg, index) => arg === null ? null : rawArgv[rawArgv.length - unwrapped.argv.length + index]);
         const span = { start: offsetOf(node, 'Pos'), end: offsetOf(node, 'End') };
         /** @type {AnalyzedCommand} */
         const command = {
           argv, rawArgv, displayArgv, markedArgv: words.map(markedWord).slice(rawArgv.length - argv.length), dialect: currentDialect, source: nodeSource,
-          span, wrappers, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
+          span, wrappers, wrapperCwds: unwrapped.wrapperCwds, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
           pipelineGroup, rootOffset: rootOffset ?? span.start,
         };
         const assignmentStart = graph.assignments?.length ?? 0;
@@ -641,7 +826,8 @@ export function analyzeShellInput(input, options) {
         if (argv[0] === null || argv.length === 0) unknown('dynamic-command', 'command name cannot be reconstructed statically');
 
         const offset = rawArgv.length - argv.length;
-        const evaluator = shellEvaluator(argv);
+        const nestedStart = graph.commands.length;
+        const evaluator = unwrapped.evaluator ? { ...unwrapped.evaluator, dialect: currentDialect } : shellEvaluator(argv);
         if (evaluator) {
           if (evaluator.script === null) {
             unknown('dynamic-evaluator', `${String(argv[0])} -c script is dynamic or missing`);
@@ -663,6 +849,11 @@ export function analyzeShellInput(input, options) {
           } else parseScript(/** @type {string[]} */ (parts).join(' '), currentDialect, depth + 1, 'eval', command.rootOffset);
         }
 
+        for (const nested of graph.commands.slice(nestedStart)) {
+          nested.wrapperCwds = [...(command.wrapperCwds ?? []), ...(nested.wrapperCwds ?? [])];
+          nested.commandAssignments = [...(command.commandAssignments ?? []), ...(nested.commandAssignments ?? [])];
+          nested.assignmentNames = nested.commandAssignments.map((item) => item.name);
+        }
         walk(node.Assigns, nodeSource, pipelineGroup);
         walk(node.Args, nodeSource, pipelineGroup);
         if (Array.isArray(node.Redirs) && node.Redirs.length) {
@@ -728,7 +919,7 @@ export function analyzeShellInput(input, options) {
 }
 
 /**
- * `env NAME=value cmd` assignments, which unwrapCommand strips with the
+ * `env NAME=value cmd` and `sudo NAME=value cmd` assignments, which unwrapCommand strips with the
  * wrapper.
  * @param {Array<string|null>} rawArgv @param {Array<string|null>} argv
  * @returns {AnalyzedAssignment[]}
@@ -756,7 +947,10 @@ function envOperandAssignments(rawArgv, argv, staticArgv = rawArgv) {
  */
 function finishGraph(graph) {
   const names = [...new Set((graph.assignments ?? []).map((item) => item.name))];
-  for (const command of graph.commands) command.graphEnv = names;
+  for (const command of graph.commands) {
+    command.graphEnv = names;
+    if (command.commandAssignments) command.assignmentNames = command.commandAssignments.map((item) => item.name);
+  }
   return graph;
 }
 
