@@ -123,6 +123,11 @@ for (const tier of /** @type {const} */ (['bypass', 'native'])) {
     assert.equal('evaluation' in result ? result.evaluation : null, 'unknown');
   });
 }
+test('env BEADS_DIR="$D" keeps the value unknown and confirms', () => {
+  const result = evaluate('env BEADS_DIR="$D" bd create --title=x', 'native', root);
+  assert.equal(result.kind, 'confirm');
+  assert.equal('evaluation' in result ? result.evaluation : null, 'unknown');
+});
 test('BEADS_DIR overrides a hooked cwd', () => {
   assert.equal(evaluate(`BEADS_DIR=${join(empty, '.beads')} bd create --title=x`, 'native', hooked).kind, 'allow');
 });

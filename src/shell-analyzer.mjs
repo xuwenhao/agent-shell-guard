@@ -634,7 +634,7 @@ export function analyzeShellInput(input, options) {
         };
         const assignmentStart = graph.assignments?.length ?? 0;
         recordAssignments(node.Assigns, false);
-        graph.assignments?.push(...envOperandAssignments(wrapperArgv, argv));
+        graph.assignments?.push(...envOperandAssignments(wrapperArgv, argv, rawArgv));
         command.commandAssignments = (graph.assignments ?? []).slice(assignmentStart);
         command.assignmentNames = command.commandAssignments.map((item) => item.name);
         graph.commands.push(command);
@@ -733,13 +733,19 @@ export function analyzeShellInput(input, options) {
  * @param {Array<string|null>} rawArgv @param {Array<string|null>} argv
  * @returns {AnalyzedAssignment[]}
  */
-function envOperandAssignments(rawArgv, argv) {
+/**
+ * @param {Array<string|null>} rawArgv words as recorded (marked dynamic words allowed)
+ * @param {Array<string|null>} argv the unwrapped command
+ * @param {Array<string|null>} [staticArgv] static view of the same words; a null
+ *   there means the word is dynamic, so the recorded value must be null (unknown)
+ */
+function envOperandAssignments(rawArgv, argv, staticArgv = rawArgv) {
   /** @type {AnalyzedAssignment[]} */
   const result = [];
-  for (const word of rawArgv.slice(0, rawArgv.length - argv.length)) {
+  rawArgv.slice(0, rawArgv.length - argv.length).forEach((word, index) => {
     const match = typeof word === 'string' ? /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word) : null;
-    if (match) result.push({ name: match[1], value: match[2], exported: false });
-  }
+    if (match) result.push({ name: match[1], value: staticArgv[index] === null ? null : match[2], exported: false });
+  });
   return result;
 }
 
