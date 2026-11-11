@@ -21,9 +21,17 @@ export function graphExportsBeadsProfile(graph) {
     command.argv.slice(1).some((arg) => typeof arg === 'string' && /^BEADS_MEM_PROFILE(=|$)/.test(arg)));
 }
 
+// Upstream `make install` also installs `beads` as a symlink to `bd`; `bd.exe` on Windows.
+const BD_NAMES = ['bd', 'beads', 'bd.exe', 'beads.exe'];
+
 /** @param {import('./shell-analyzer.mjs').AnalyzedCommand} command */
 export function parseBdCommand(command) {
-  if (!isCommand(command, 'bd')) return null;
+  if (!BD_NAMES.some((name) => isCommand(command, name))) return null;
+  // BEADS_DIR selects the workspace (its .beads dir) independently of cwd.
+  // undefined = not set on this command, null = dynamic value.
+  /** @type {string|null|undefined} */
+  let beadsDir;
+  for (const item of command.commandAssignments ?? []) if (item.name === 'BEADS_DIR') beadsDir = item.value;
   /** @type {string|null|undefined} undefined = no verb, null = unknown */
   let subcommand;
   /** @type {string|null|undefined} */
@@ -58,7 +66,7 @@ export function parseBdCommand(command) {
     if (subcommand === undefined) subcommand = options && arg.startsWith('-') ? null : arg;
   }
   return {
-    subcommand, directory, dynamicOption,
+    subcommand, directory, dynamicOption, beadsDir,
     profileWrite: hasFlag(command.markedArgv ?? command.argv, '--mem-profile') || hasFlag(command.markedArgv ?? command.argv, '--cpu-profile') ||
       (command.assignmentNames ?? []).includes('BEADS_MEM_PROFILE'),
     readOnly: subcommand === undefined || (subcommand !== null && READ_ONLY.has(subcommand) &&

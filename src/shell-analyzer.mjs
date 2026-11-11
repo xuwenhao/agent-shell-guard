@@ -36,6 +36,7 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   rootOffset?: number,
  *   graphEnv?: string[],
  *   assignmentNames?: string[],
+ *   commandAssignments?: AnalyzedAssignment[],
  *   markedArgv?: Array<string|null>,
  * }} AnalyzedCommand
  */
@@ -454,7 +455,8 @@ export function analyzeShellInput(input, options) {
       hasCompound: false, nativePromptArgv: wrappers.length ? null : rawArgv,
       redirections: [], assignments: envOperandAssignments(rawArgv, argv),
     };
-    graph.commands[0].assignmentNames = (graph.assignments ?? []).map((item) => item.name);
+    graph.commands[0].commandAssignments = [...(graph.assignments ?? [])];
+    graph.commands[0].assignmentNames = graph.commands[0].commandAssignments.map((item) => item.name);
     const evaluator = shellEvaluator(argv);
     if (!evaluator) return finishGraph(graph);
     graph.nativePromptArgv = null;
@@ -633,7 +635,8 @@ export function analyzeShellInput(input, options) {
         const assignmentStart = graph.assignments?.length ?? 0;
         recordAssignments(node.Assigns, false);
         graph.assignments?.push(...envOperandAssignments(wrapperArgv, argv));
-        command.assignmentNames = (graph.assignments ?? []).slice(assignmentStart).map((item) => item.name);
+        command.commandAssignments = (graph.assignments ?? []).slice(assignmentStart);
+        command.assignmentNames = command.commandAssignments.map((item) => item.name);
         graph.commands.push(command);
         if (argv[0] === null || argv.length === 0) unknown('dynamic-command', 'command name cannot be reconstructed statically');
 

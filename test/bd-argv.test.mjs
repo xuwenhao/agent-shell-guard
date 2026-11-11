@@ -105,6 +105,37 @@ for (const command of ['export BEADS_MEM_PROFILE=/tmp/out; bd list', 'BEADS_MEM_
     assert.equal('ruleId' in result ? result.ruleId : null, 'bd-profile-write');
   });
 }
+for (const command of ['beads init', '/usr/local/bin/beads --json setup', 'bd.exe init', 'beads --mem-profile=/tmp/x list']) {
+  test(`beads alias is guarded: ${command}`, () => assert.equal(evaluate(command).kind, 'deny'));
+}
+test('beads alias triggers hooks confirmation', () => {
+  assert.equal(evaluate('beads create --title=x', 'native', hooked).kind, 'confirm');
+});
+for (const tier of /** @type {const} */ (['bypass', 'native'])) {
+  test(`${tier} BEADS_DIR pointing at a hooked workspace confirms`, () => {
+    const result = evaluate(`BEADS_DIR=${join(hooked, '.beads')} bd create --title=x`, tier, root);
+    assert.equal(result.kind, 'confirm');
+    assert.equal('evaluation' in result ? result.evaluation : null, 'matched');
+  });
+  test(`${tier} dynamic BEADS_DIR confirms as unknown`, () => {
+    const result = evaluate('BEADS_DIR="$D" bd create --title=x', tier, root);
+    assert.equal(result.kind, 'confirm');
+    assert.equal('evaluation' in result ? result.evaluation : null, 'unknown');
+  });
+}
+test('BEADS_DIR overrides a hooked cwd', () => {
+  assert.equal(evaluate(`BEADS_DIR=${join(empty, '.beads')} bd create --title=x`, 'native', hooked).kind, 'allow');
+});
+test('BEADS_DIR with a read-only verb stays silent', () => {
+  assert.equal(evaluate('BEADS_DIR="$D" bd list', 'native', root).kind, 'allow');
+});
+// bd 1.3.4 walks past a non-directory .beads (verified with `bd where`); pin that parity.
+test('.beads plain file keeps walking to ancestor hooks', () => {
+  const sub = join(hooked, 'filesub');
+  mkdirSync(sub, { recursive: true });
+  writeFileSync(join(sub, '.beads'), '');
+  assert.equal(evaluate('bd create', 'native', sub).kind, 'confirm');
+});
 test('dynamic directory with a read-only subcommand stays silent', () => {
   assert.equal(evaluate('bd -C "$DIR" list', 'native', root).kind, 'allow');
 });

@@ -46,7 +46,7 @@ import {
   targetCovers,
   targetSegments,
 } from './path-targets.mjs';
-import { hasBeadsHooks, inspectDirectory, inspectProjectDir, memoizeInspector } from './project.mjs';
+import { beadsDirHasHooks, hasBeadsHooks, inspectDirectory, inspectProjectDir, memoizeInspector } from './project.mjs';
 import { isExcludedCommandGraph, isReadOnlyGraph } from './write-class.mjs';
 
 /** @param {string} value @param {number} [length] */
@@ -1280,14 +1280,29 @@ function confirmationPolicy(graph, enabled, ctx) {
         why: 'bd 在沙盒外运行，-C 指向的目录可能有 .beads/hooks（沙盒外任意代码），目录无法静态确定，请确认。',
       };
       const target = bd.directory;
+      const cwds = ctx.cwdsFor(command);
+      // `BEADS_DIR=… bd create` selects that workspace regardless of cwd/-C. Only the
+      // command's own assignment is modelled; an inherited process BEADS_DIR is not.
+      if (bd.beadsDir !== undefined) {
+        const dir = bd.beadsDir;
+        const resolved = dir === null ? [null]
+          : isAbsolute(dir) ? [dir] : cwds.map((cwd) => cwd ? resolve(cwd, dir) : null);
+        if (resolved.some((item) => item === null)) return {
+          ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 的 BEADS_DIR 无法静态确定',
+          why: 'bd 在沙盒外运行，BEADS_DIR 指向的库可能有 hooks（沙盒外任意代码），无法静态确定，请确认。',
+        };
+        if (resolved.some((item) => beadsDirHasHooks(/** @type {string} */ (item)))) return {
+          ruleId: 'bd-repo-hooks', evaluation: 'matched', detail: 'bd 执行 BEADS_DIR 库里的 hooks 脚本',
+          why: 'bd 在沙盒外运行，BEADS_DIR 库里的 hooks 等同沙盒外任意代码，请确认这些脚本可信。',
+        };
+      }
       // Unknown cwd (`cd "$DIR" && bd create`) with no absolute -C: the effective directory
       // cannot be inspected, so confirm rather than assume no hooks.
-      const cwds = ctx.cwdsFor(command);
-      if ((target === undefined || !isAbsolute(target)) && cwds.some((cwd) => !cwd)) return {
+      else if ((target === undefined || !isAbsolute(target)) && cwds.some((cwd) => !cwd)) return {
         ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 的工作目录无法静态确定',
         why: 'bd 在沙盒外运行，工作目录无法静态确定，可能落在有 .beads/hooks 的仓库，请确认。',
       };
-      if (cwds.some((cwd) => {
+      else if (cwds.some((cwd) => {
         const directory = target === undefined ? cwd
           : isAbsolute(target) ? target : cwd ? resolve(cwd, target) : null;
         return hasBeadsHooks(directory);

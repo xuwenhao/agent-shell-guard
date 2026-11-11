@@ -322,6 +322,17 @@ export function memoizeInspector(inspect) {
   };
 }
 
+/** A BEADS_DIR-selected workspace (the .beads dir itself) with a non-empty hooks/.
+ * @param {string} beadsDir
+ */
+export function beadsDirHasHooks(beadsDir) {
+  try {
+    return readdirSync(join(resolve(beadsDir), 'hooks')).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Nearest .beads directory wins; unreadable paths are deliberately silent.
  * @param {string|null} directory
  */
