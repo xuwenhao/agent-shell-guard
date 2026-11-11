@@ -97,7 +97,10 @@ test('argv input recursively evaluates split string', () => {
 });
 test('split recursion remains bounded', () => {
   let command = init;
-  for (let i = 0; i < 9; i++) command = 'env -S ' + quote(command);
+  // Inner layers use GNU quoting; only the outer layer is shell input.
+  const gnuQuote = (/** @type {string} */ text) => "'" + text.replaceAll('\\', '\\\\').replaceAll("'", "\\'") + "'";
+  for (let i = 0; i < 8; i++) command = 'env -S ' + gnuQuote(command);
+  command = 'env -S ' + quote(command);
   assert.ok(evaluate(command, 'native').analysis.unknowns.some((item) => item.reason === 'recursion-limit'));
 });
 test('relative rm uses env directory', () => {
@@ -133,3 +136,81 @@ test('git branch lookup uses wrapper cwd without leaking to the next command', (
   const untouched = evaluate(`env -C ${quote(root)} true; ${command}`, 'native', plain);
   assert.notEqual(untouched.kind, 'deny');
 });
+
+// GNU split strings are data for evaluateHookEvent, never shell execution.
+for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
+  for (const body of ['bd\\_' + 'init', 'bd "' + 'init"', "bd '" + "init'", init + ' #x']) {
+    test(`${tier} GNU split denies ${JSON.stringify(body)}`, () => {
+      assert.equal(evaluate('env -S ' + quote(body), tier).kind, 'deny');
+    });
+  }
+  test(`${tier} GNU split double-quoted shell operand`, () => {
+    assert.equal(evaluate('env -S "bd \'init\'"', tier).kind, 'deny');
+  });
+  for (const body of ['bd\\_list', 'bd list # ignored']) {
+    test(`${tier} GNU split allows ${JSON.stringify(body)}`, () => {
+      assert.equal(evaluate('env -S ' + quote(body), tier).kind, 'allow');
+    });
+  }
+  test(`${tier} GNU split truncates at backslash c`, () => {
+    assert.equal(evaluate('env -S ' + quote('bd\\c' + 'init'), tier).kind, evaluate('bd', tier).kind);
+    assert.deepEqual(evaluate('env -S ' + quote('bd\\c' + 'init'), tier).analysis.commands.at(-1)?.argv, ['bd']);
+  });
+  for (const body of ['bd ${X}', 'bd $X', 'bd\\q' + 'init', 'bd "init', "bd 'init", 'bd\\', 'bd li\\\nst', 'bd "a\\cb"']) {
+    test(`${tier} GNU split fails closed ${JSON.stringify(body)}`, () => {
+      const result = evaluate('env -S ' + quote(body), tier);
+      assert.equal(result.kind, evaluate('env -S "$X"', tier).kind);
+      assert.ok(result.analysis.unknowns.some((item) => item.reason === 'dynamic-evaluator'));
+    });
+  }
+  for (const option of ['-iC' + quote(hooked), '-iC ' + quote(hooked)]) {
+    test(`${tier} clustered chdir ${option}`, () => {
+      assert.equal(evaluate('env ' + option + ' bd create', tier).kind, tier === 'relaxed' ? 'allow' : 'confirm');
+    });
+  }
+  test(`${tier} clustered unset consumes next word`, () => {
+    assert.equal(evaluate('env -iu FOO ' + init, tier).kind, 'deny');
+  });
+}
+for (const [body, argv] of /** @type {Array<[string, string[]]>} */ ([
+  ['bd "a\\_b"', ['bd', 'a b']],
+  ["bd 'a\\_b'", ['bd', 'a\\_b']],
+  ['bd \\#x \\$X', ['bd', '#x', '$X']],
+  ['bd ""', ['bd', '']],
+  ['bd x#y', ['bd', 'x#y']],
+  ['bd "a\\"b"', ['bd', 'a"b']],
+  ["bd 'a\\'b'", ['bd', "a'b"]],
+  ['bd a\\\\b', ['bd', 'a\\b']],
+])) {
+  test(`GNU split argv ${JSON.stringify(body)}`, () => {
+    assert.deepEqual(evaluate('env -S ' + quote(body), 'native').analysis.commands.at(-1)?.argv, argv);
+  });
+}
+test('wrapper cwd followed by nested cd cannot hide main branch', () => {
+  const safe = join(root, 'safe');
+  const main = join(safe, 'main-repo');
+  for (const [directory, branch] of [[safe, 'feature'], [main, 'main']]) {
+    mkdirSync(join(directory, '.git'), { recursive: true });
+    writeFileSync(join(directory, '.git/HEAD'), 'ref: refs/heads/' + branch + '\n');
+    writeFileSync(join(directory, '.git/config'), '[core]\n');
+  }
+  const force = 'git push --' + 'force origin HEAD';
+  assert.notEqual(evaluate(force, 'native', safe).kind, 'deny');
+  const result = evaluate('env -C ' + quote(safe) + ' sh -c ' + quote('cd main-repo && ' + force), 'native', safe);
+  assert.equal(result.kind, 'deny');
+  assert.equal(result.ruleId, 'force-push-main');
+});
+
+for (const [escape, character] of Object.entries({ t: '\t', n: '\n', r: '\r', f: '\f', v: '\v' })) {
+  test(`GNU split preserves escaped whitespace ${escape} inside argument`, () => {
+    const result = evaluate('env -S ' + quote('bd a\\' + escape + 'b'), 'native');
+    assert.deepEqual(result.analysis.commands.at(-1)?.argv, ['bd', 'a' + character + 'b']);
+  });
+}
+for (const option of ['-iC"$D"']) {
+  test(`cluster marker respects first value-taking option ${option}`, () => {
+    const result = evaluate('env ' + option + ' bd create', 'native');
+    assert.equal(result.kind, 'confirm');
+    assert.ok(!result.analysis.unknowns.some((item) => item.reason === 'dynamic-evaluator'));
+  });
+}

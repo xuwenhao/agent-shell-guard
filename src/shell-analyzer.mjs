@@ -289,6 +289,55 @@ function staticWord(word) {
   return expandHome ? `${homedir()}${result.slice(1)}` : result;
 }
 
+/**
+ * Decode GNU env -S syntax, not shell syntax. Runtime variable references,
+ * unknown escapes (including backslash-newline/trailing backslash), unclosed
+ * quotes and double-quoted \\c are dynamic (fail closed).
+ * @param {string} text @returns {string[]|null}
+ */
+function splitEnvString(text) {
+  /** @type {string[]} */
+  const words = [];
+  let word = '', quote = '', started = false;
+  const flush = () => { if (started) words.push(word); word = ''; started = false; };
+  /** @type {Record<string, string>} */
+  const escapes = { t: '\t', n: '\n', r: '\r', f: '\f', v: '\v' };
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === "'" || char === '"') {
+      if (!quote) { quote = char; started = true; continue; }
+      if (quote === char) { quote = ''; continue; }
+    }
+    if (char === '\\') {
+      const next = text[++i];
+      if (quote === "'" && next !== '\\' && next !== "'") {
+        word += '\\'; started = true; i--; continue;
+      }
+      if (next === undefined) return null;
+      if (next === 'c') {
+        if (quote) return null;
+        flush(); return words;
+      }
+      if (next === '_') {
+        if (!quote) flush();
+        else { word += ' '; started = true; }
+        continue;
+      }
+      if ('\\"\'#$'.includes(next)) word += next;
+      else if (Object.hasOwn(escapes, next)) word += escapes[next];
+      else return null;
+      started = true; continue;
+    }
+    if (quote !== "'" && char === '$' && /[A-Za-z_{]/.test(text[i + 1] ?? '')) return null;
+    if (!quote && /[ \t\n\r\f\v]/.test(char)) { flush(); continue; }
+    if (!quote && char === '#' && !started) break;
+    word += char; started = true;
+  }
+  if (quote) return null;
+  flush();
+  return words;
+}
+
 /** @param {Array<string|null>} rawArgv */
 export function unwrapCommand(rawArgv) {
   let argv = rawArgv;
@@ -308,33 +357,29 @@ export function unwrapCommand(rawArgv) {
       while (index < argv.length) {
         const arg = argv[index];
         if (arg === '--') { index++; break; }
-        if (arg === '-C' || arg === '--chdir') {
-          envCwd = argv[index + 1] ?? null;
-          if (envCwd?.includes(DYNAMIC_MARKER)) envCwd = null;
-          index += 2; continue;
-        }
-        if (typeof arg === 'string' && (arg.startsWith('-C') || arg.startsWith('--chdir='))) {
-          envCwd = arg.startsWith('-C') ? arg.slice(2) : arg.slice('--chdir='.length);
-          if (envCwd.includes(DYNAMIC_MARKER)) envCwd = null;
-          index++; continue;
-        }
-        if (arg === '-u' || arg === '--unset') { index += 2; continue; }
-        if (typeof arg === 'string' && arg.startsWith('-u')) { index++; continue; }
-        const split = typeof arg === 'string' ? /^(?:--split-string(?:=(.*))?|-([^-]*?)S(.*))$/s.exec(arg) : null;
-        if (split) {
-          const attached = split[1] ?? split[3];
-          const hasAttached = arg?.startsWith('--') ? arg.includes('=') : Boolean(attached);
-          const script = hasAttached ? attached : argv[index + 1];
-          const tail = argv.slice(index + (hasAttached ? 1 : 2));
-          // GNU env -S has its own escapes, not a full shell grammar. Parsing
-          // it as shell input is a conservative approximation. Preserve the
-          // remaining argv as quoted words, not new shell syntax.
-          const prefix = [...argv.slice(1, index), ...(split[2] ? ['-' + split[2]] : [])];
-          const text = typeof script === 'string' && !script.includes(DYNAMIC_MARKER)
-            ? ['env', ...prefix.map(quoteShellWord), script, ...tail.map(quoteShellWord)].join(' ')
-            : null;
-          return { argv, wrappers: [...wrappers, name], wrapperCwds,
-            evaluator: { script: text, scriptIndex: -1 } };
+        // A value-taking short option consumes the rest of its cluster.
+        const short = typeof arg === 'string' ? /^-([^-CuS]*)([CuS])(.*)$/s.exec(arg) : null;
+        const long = typeof arg === 'string' ? /^--(chdir|unset|split-string)(?:=(.*))?$/s.exec(arg) : null;
+        if (short || long) {
+          const option = short?.[2] ?? ({ chdir: 'C', unset: 'u', 'split-string': 'S' }[long?.[1] ?? '']);
+          const attached = short?.[3] ?? long?.[2];
+          const hasAttached = short ? Boolean(attached) : attached !== undefined;
+          const value = hasAttached ? attached : argv[index + 1];
+          const consumed = hasAttached ? 1 : 2;
+          if (option === 'C') {
+            envCwd = typeof value === 'string' && !value.includes(DYNAMIC_MARKER) ? value : null;
+          } else if (option === 'S') {
+            const tail = argv.slice(index + consumed);
+            const prefix = [...argv.slice(1, index), ...(short?.[1] ? ['-' + short[1]] : [])];
+            const words = typeof value === 'string' && !value.includes(DYNAMIC_MARKER) ? splitEnvString(value) : null;
+            const text = words === null ? null
+              : ['env', ...prefix.map(quoteShellWord), ...words.map(quoteShellWord), ...tail.map(quoteShellWord)].join(' ');
+            // -C stays in prefix for nested parsing; do not also record this
+            // env's directory in the outer command's wrapperCwds.
+            return { argv, wrappers: [...wrappers, name], wrapperCwds,
+              evaluator: { script: text, scriptIndex: -1 } };
+          }
+          index += consumed; continue;
         }
         if (typeof arg === 'string' && (arg.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg))) { index++; continue; }
         break;
@@ -660,7 +705,7 @@ export function analyzeShellInput(input, options) {
         // in the effective argv so dynamic command/data words stay unknown.
         const wrapperArgv = words.map((word, index) => {
           const marked = rawArgv[index] === null ? markedWord(word) : rawArgv[index];
-          return rawArgv[index] ?? (marked && /^(?:[A-Za-z_][A-Za-z0-9_]*=|--(?:chdir|split-string)=|-[^-]*[CS])/.test(marked) ? marked : null);
+          return rawArgv[index] ?? (marked && /^(?:[A-Za-z_][A-Za-z0-9_]*=|--(?:chdir|split-string)=|-[^-CuS]*[CS])/.test(marked) ? marked : null);
         });
         const unwrapped = unwrapCommand(wrapperArgv);
         const wrappers = unwrapped.wrappers;

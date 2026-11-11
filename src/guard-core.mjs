@@ -1584,6 +1584,11 @@ function cwdModel(analysis, cwd) {
   // parent shell candidate set, which is shared with subsequent commands.
   return { trusted: base.trusted, forCommand: (/** @type {AnalyzedCommand} */ command) => {
     let candidates = base.forCommand(command);
+    // Shell cd transitions were computed from hook cwd, before wrapper cwd.
+    // Until those scopes are modeled together, never overwrite such a result
+    // with a deceptively precise wrapper directory.
+    if (command.wrapperCwds?.length &&
+      (candidates.length !== 1 || candidates[0] !== cwd)) return [null];
     for (const operand of command.wrapperCwds ?? []) {
       candidates = operand === null ? [null] : candidates.map((directory) => resolveDirectory(operand, directory));
     }
