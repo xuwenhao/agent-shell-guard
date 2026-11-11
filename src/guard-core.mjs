@@ -1266,6 +1266,12 @@ function confirmationPolicy(graph, enabled, ctx) {
     const tool = commandName(command);
     const bd = parseBdCommand(command);
     // A null subcommand never reaches here: hardPolicy denies it first via bd-forbidden-subcommand.
+    // A dynamic option word may be --mem-profile/--fix/--directory: confirm even for
+    // read-only verbs. This is ask-level rather than deny so `bd create "$TITLE"` keeps working.
+    if (bd?.dynamicOption && enabled('bd-repo-hooks')) return {
+      ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 参数里有无法静态确定的选项',
+      why: 'bd 在沙盒外运行，动态参数可能展开成 --mem-profile、--fix 或 --directory 等选项，无法静态确定，请确认。',
+    };
     if (bd && !bd.readOnly && enabled('bd-repo-hooks')) {
       // A dynamic -C/--directory target cannot be inspected; it may point at a hooked
       // repository, so it needs the same confirmation as a literal hooked path.
@@ -1274,7 +1280,14 @@ function confirmationPolicy(graph, enabled, ctx) {
         why: 'bd 在沙盒外运行，-C 指向的目录可能有 .beads/hooks（沙盒外任意代码），目录无法静态确定，请确认。',
       };
       const target = bd.directory;
-      if (ctx.cwdsFor(command).some((cwd) => {
+      // Unknown cwd (`cd "$DIR" && bd create`) with no absolute -C: the effective directory
+      // cannot be inspected, so confirm rather than assume no hooks.
+      const cwds = ctx.cwdsFor(command);
+      if ((target === undefined || !isAbsolute(target)) && cwds.some((cwd) => !cwd)) return {
+        ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 的工作目录无法静态确定',
+        why: 'bd 在沙盒外运行，工作目录无法静态确定，可能落在有 .beads/hooks 的仓库，请确认。',
+      };
+      if (cwds.some((cwd) => {
         const directory = target === undefined ? cwd
           : isAbsolute(target) ? target : cwd ? resolve(cwd, target) : null;
         return hasBeadsHooks(directory);

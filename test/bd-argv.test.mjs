@@ -84,6 +84,18 @@ for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
     });
   }
 }
+for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
+  for (const command of ['bd list "$FLAG"', 'bd doctor "$FLAG"', 'bd create --title=x "$OPT"', 'cd "$DIR" && bd create --title=x']) {
+    test(`${tier} unknown option or cwd ${command} confirms as unknown`, () => {
+      const result = evaluate(command, tier, root);
+      assert.equal(result.kind, tier === 'relaxed' ? 'allow' : 'confirm');
+      if (result.kind !== 'allow') { assert.equal(result.ruleId, 'bd-repo-hooks'); assert.equal(result.evaluation, 'unknown'); }
+    });
+  }
+}
+for (const command of ['bd update x --notes "$N"', 'bd create --title "$T"', 'bd list -- "$X"', 'cd "$DIR" && bd list', `cd "$DIR" && bd -C ${root} create --title=x`]) {
+  test(`dynamic value or read-only verb stays quiet: ${command}`, () => assert.equal(evaluate(command, 'native', root).kind, 'allow'));
+}
 test('dynamic directory with a read-only subcommand stays silent', () => {
   assert.equal(evaluate('bd -C "$DIR" list', 'native', root).kind, 'allow');
 });

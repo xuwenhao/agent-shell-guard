@@ -15,10 +15,21 @@ export function parseBdCommand(command) {
   /** @type {string|null|undefined} */
   let directory;
   let options = true;
+  // A fully dynamic word after the verb may expand to any option (--mem-profile=…,
+  // --fix, --directory=…). Words right after a literal `--flag` are taken as that
+  // flag's value (`--notes "$N"`), so ordinary dynamic values stay quiet.
+  let dynamicOption = false;
   for (let i = 1; i < command.argv.length; i++) {
     const arg = command.argv[i];
     if (options && arg === '--') { options = false; continue; }
-    if (arg === null) { if (subcommand === undefined) subcommand = null; continue; }
+    if (arg === null) {
+      if (subcommand === undefined) subcommand = null;
+      else if (options) {
+        const prev = command.argv[i - 1];
+        if (!(typeof prev === 'string' && prev.startsWith('-') && !prev.includes('='))) dynamicOption = true;
+      }
+      continue;
+    }
     const flag = arg.split('=')[0];
     if (options && VALUE_FLAGS.has(flag)) {
       const value = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : command.argv[++i] ?? null;
@@ -30,7 +41,7 @@ export function parseBdCommand(command) {
     if (subcommand === undefined) subcommand = options && arg.startsWith('-') ? null : arg;
   }
   return {
-    subcommand, directory,
+    subcommand, directory, dynamicOption,
     profileWrite: hasFlag(command.markedArgv ?? command.argv, '--mem-profile') || hasFlag(command.markedArgv ?? command.argv, '--cpu-profile') ||
       (command.assignmentNames ?? []).includes('BEADS_MEM_PROFILE'),
     readOnly: subcommand === undefined || (subcommand !== null && READ_ONLY.has(subcommand) &&
