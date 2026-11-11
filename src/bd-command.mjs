@@ -7,6 +7,20 @@ const BOOL_FLAGS = new Set(['--cpu-profile', '--global', '-h', '--help', '--igno
 export const BD_FORBIDDEN = new Set(['init', 'setup', 'hooks', 'dolt']);
 const READ_ONLY = new Set(['list', 'show', 'ready', 'search', 'blocked', 'stats', 'prime', 'where', 'version', 'help', 'info', 'status', 'count', 'graph', 'doctor']);
 
+const EXPORTERS = new Set(['export', 'declare', 'typeset', 'readonly']);
+/**
+ * Whether the graph exports BEADS_MEM_PROFILE to later commands: an exported
+ * assignment (`export X=…`, `declare -x`), or an export-like command word seen as
+ * plain argv (nested `sh -c` scripts are tokenized, so `export` arrives as argv).
+ * A prefix assignment scoped to another command (`X=… echo hi; bd list`) does not count.
+ * @param {import('./shell-analyzer.mjs').ShellGraph} graph
+ */
+export function graphExportsBeadsProfile(graph) {
+  if ((graph.assignments ?? []).some((item) => item.exported && item.name === 'BEADS_MEM_PROFILE')) return true;
+  return graph.commands.some((command) => EXPORTERS.has(String(command.argv[0])) &&
+    command.argv.slice(1).some((arg) => typeof arg === 'string' && /^BEADS_MEM_PROFILE(=|$)/.test(arg)));
+}
+
 /** @param {import('./shell-analyzer.mjs').AnalyzedCommand} command */
 export function parseBdCommand(command) {
   if (!isCommand(command, 'bd')) return null;
@@ -26,7 +40,10 @@ export function parseBdCommand(command) {
       if (subcommand === undefined) subcommand = null;
       else if (options) {
         const prev = command.argv[i - 1];
-        if (!(typeof prev === 'string' && prev.startsWith('-') && !prev.includes('='))) dynamicOption = true;
+        // Known boolean globals (--json, -q…) never take a value, so a dynamic word after
+        // them is a fresh option. Verb-specific booleans are not modelled: residual gap.
+        const prevTakesValue = typeof prev === 'string' && prev.startsWith('-') && !prev.includes('=') && !BOOL_FLAGS.has(prev);
+        if (!prevTakesValue) dynamicOption = true;
       }
       continue;
     }

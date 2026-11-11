@@ -85,7 +85,8 @@ for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
   }
 }
 for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
-  for (const command of ['bd list "$FLAG"', 'bd doctor "$FLAG"', 'bd create --title=x "$OPT"', 'cd "$DIR" && bd create --title=x']) {
+  for (const command of ['bd list "$FLAG"', 'bd doctor "$FLAG"', 'bd create --title=x "$OPT"', 'cd "$DIR" && bd create --title=x',
+    'bd list --json "$FLAG"', 'bd -q list "$FLAG"']) {
     test(`${tier} unknown option or cwd ${command} confirms as unknown`, () => {
       const result = evaluate(command, tier, root);
       assert.equal(result.kind, tier === 'relaxed' ? 'allow' : 'confirm');
@@ -95,6 +96,14 @@ for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
 }
 for (const command of ['bd update x --notes "$N"', 'bd create --title "$T"', 'bd list -- "$X"', 'cd "$DIR" && bd list', `cd "$DIR" && bd -C ${root} create --title=x`]) {
   test(`dynamic value or read-only verb stays quiet: ${command}`, () => assert.equal(evaluate(command, 'native', root).kind, 'allow'));
+}
+for (const command of ['export BEADS_MEM_PROFILE=/tmp/out; bd list', 'BEADS_MEM_PROFILE=/tmp/out; export BEADS_MEM_PROFILE; bd list',
+  "sh -c 'export BEADS_MEM_PROFILE=/tmp/out; bd list'"]) {
+  test(`graph-wide BEADS_MEM_PROFILE is denied: ${command}`, () => {
+    const result = evaluate(command, 'relaxed', root);
+    assert.equal(result.kind, 'deny');
+    assert.equal('ruleId' in result ? result.ruleId : null, 'bd-profile-write');
+  });
 }
 test('dynamic directory with a read-only subcommand stays silent', () => {
   assert.equal(evaluate('bd -C "$DIR" list', 'native', root).kind, 'allow');

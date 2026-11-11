@@ -11,7 +11,7 @@
 
 import { homedir } from 'node:os';
 import { basename, isAbsolute, resolve } from 'node:path';
-import { parseBdCommand, BD_FORBIDDEN } from './bd-command.mjs';
+import { parseBdCommand, BD_FORBIDDEN, graphExportsBeadsProfile } from './bd-command.mjs';
 
 import { analyzeShellInput, cdArgvOperand, selectShellDialect, shellEvaluator, unwrapCommand } from './shell-analyzer.mjs';
 import { isPolicyEnabled, permissionTier, resolvePolicyProfile } from './policies/profiles.mjs';
@@ -911,7 +911,7 @@ function hardPolicy(graph, enabled, ctx) {
     const cwds = ctx.cwdsFor(command);
     const dialect = command.dialect;
     const bd = parseBdCommand(command);
-    if (bd?.profileWrite && enabled('bd-profile-write')) return {
+    if (bd && (bd.profileWrite || graphExportsBeadsProfile(graph)) && enabled('bd-profile-write')) return {
       ruleId: 'bd-profile-write', evaluation: 'matched', detail: 'bd profiling 写文件',
       why: 'bd 在沙盒外执行，profiling 可写任意文件；请交给用户在普通终端运行。',
     };
