@@ -505,6 +505,18 @@ closed (deny) with a `[guard-diagnostic]` marker, as in 0.4.
   fails closed (deny), like other uncovered confirmations.
 - `env VAR="$X"` operands now keep a dynamic value as unknown instead of the
   literal marker text.
+- Wrapper unwrapping follows getopt semantics for `env` and `sudo` (#14), so a
+  wrapped command is no longer hidden from every rule:
+  - `env -S` / `--split-string` is decoded with GNU rules and parsed as a
+    nested command; dynamic or undecodable strings are unknown.
+  - `env -C` / `--chdir` and `sudo -D` / `--chdir` set the wrapped command's
+    cwd for path, Git and bd checks; a wrapper cwd combined with a nested
+    `cd` is treated as unknown.
+  - `sudo VAR=value` operands are skipped and recorded, interleaved with
+    options; long options accept unique prefixes; short options may be
+    clustered; value-taking options (`env -a`, `sudo -a/-u/-r/-t/-c/-U`…)
+    consume their value; `env -` implies `-i`; BSD `env -P altpath` on macOS.
+  - `sudo -e` / `--edit` makes the wrapped command unknown.
 
 ### Changes in 0.5.0
 
