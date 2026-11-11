@@ -616,7 +616,7 @@ function resetRefIsTrunk(ref, command, ctx) {
   const upstream = UPSTREAM_REF.exec(ref);
   if (!upstream) return false;
   const git = parseGitCommand(command);
-  const directory = git ? gitWorkDir(git, ctx.trustedCwd) : null;
+  const directory = git ? gitWorkDir(git, commandTrustedCwd(command, ctx)) : null;
   if (directory === null) return false;
   const info = ctx.inspect(directory);
   const named = upstream[1] === '' || upstream[1] === 'HEAD' || upstream[1] === '@' ? info.branch : upstream[1];
@@ -724,7 +724,7 @@ function forcePushTarget(command, ctx) {
   // Without a refspec, `-c push.default=…` / `-c remote.<name>.push=…` decide
   // what is pushed.
   if (refs.length === 0 && gitGlobalConfigs(command, git).some((entry) => /^(?:push|remote)\./i.test(entry))) return 'unknown';
-  const directory = gitWorkDir(git, ctx.trustedCwd);
+  const directory = gitWorkDir(git, commandTrustedCwd(command, ctx));
   if (directory === null) return 'unknown';
   const info = ctx.inspect(directory);
   if (typeof info.branch !== 'string') return 'unknown';
@@ -770,7 +770,7 @@ function pushDeletesTrunk(command, ctx) {
   if (refs.some((ref) => typeof ref.value === 'string' && TRUNK_REF.test(ref.value.replace(/^\+/, '')))) return 'matched';
   if (refs.some((ref) => ref.value === null)) return 'unknown';
   if (!refs.some((ref) => isHeadRef(ref.value))) return null;
-  const directory = gitWorkDir(git, ctx.trustedCwd);
+  const directory = gitWorkDir(git, commandTrustedCwd(command, ctx));
   const branch = directory === null ? undefined : ctx.inspect(directory).branch;
   if (typeof branch !== 'string') return 'unknown';
   return TRUNK_REF.test(branch) ? 'matched' : null;
@@ -894,7 +894,7 @@ function gitCleanRoot(command, ctx) {
   // A dynamic word can carry a second -f.
   if (dynamic) return { evaluation: 'unknown', reason: 'dynamic' };
   if (!ignored) return null;
-  const directory = gitWorkDir(git, ctx.trustedCwd);
+  const directory = gitWorkDir(git, commandTrustedCwd(command, ctx));
   if (directory === null) return { evaluation: 'unknown', reason: 'unknown-cwd' };
   const info = ctx.inspect(directory);
   if (info.gitRoot !== null && info.nestedRepos && (info.gitRoot === directory || wide)) {
@@ -1174,7 +1174,7 @@ function unsandboxedOutsideProject(graph, ctx) {
   /** @param {string} path */
   const inside = (path) => root !== null && path !== root && isAncestorOrSelf(root, path);
   for (const command of graph.commands) {
-    for (const target of relocatingTargets(command, ctx.trustedCwd)) {
+    for (const target of relocatingTargets(command, commandTrustedCwd(command, ctx))) {
       /** @type {'matched'|'unknown'|null} */
       let evaluation = null;
       if (target.value === null) evaluation = 'unknown';
@@ -1201,7 +1201,7 @@ function unsandboxedOutsideProject(graph, ctx) {
     const git = parseGitCommand(command);
     const rule = git ? gitRule(command) : null;
     if (git && (rule === 'git-discard' || rule === 'git-ref-change')) {
-      const directory = gitWorkDir(git, ctx.trustedCwd);
+      const directory = gitWorkDir(git, commandTrustedCwd(command, ctx));
       if (directory !== null && (inside(directory) || directory === root)) continue;
       return {
         ruleId: 'unsandboxed-outside-project', evaluation: directory === null ? 'unknown' : 'matched',
@@ -1579,6 +1579,32 @@ const MAX_CWD_CANDIDATES = 32;
  * @returns {{trusted: string|null, forCommand: (command: AnalyzedCommand) => Array<string|null>}}
  */
 function cwdModel(analysis, cwd) {
+  const base = shellCwdModel(analysis, cwd);
+  // env changes only its child process: never add these directories to the
+  // parent shell candidate set, which is shared with subsequent commands.
+  return { trusted: base.trusted, forCommand: (/** @type {AnalyzedCommand} */ command) => {
+    let candidates = base.forCommand(command);
+    // Shell cd transitions were computed from hook cwd, before wrapper cwd.
+    // Until those scopes are modeled together, never overwrite such a result
+    // with a deceptively precise wrapper directory.
+    if (command.wrapperCwds?.length &&
+      (candidates.length !== 1 || candidates[0] !== cwd)) return [null];
+    for (const operand of command.wrapperCwds ?? []) {
+      candidates = operand === null ? [null] : candidates.map((directory) => resolveDirectory(operand, directory));
+    }
+    return [...new Set(candidates)];
+  } };
+}
+
+/** @param {AnalyzedCommand} command @param {RuleContext} ctx */
+function commandTrustedCwd(command, ctx) {
+  if (!command.wrapperCwds?.length) return ctx.trustedCwd;
+  const candidates = ctx.cwdsFor(command);
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+/** @param {ShellGraph} analysis @param {string|null} cwd */
+function shellCwdModel(analysis, cwd) {
   const fixed = { trusted: cwd, forCommand: () => [cwd] };
   const changes = analysis.commands.filter((item) => CWD_CHANGING.has(commandName(item)));
   if (changes.length === 0) return fixed;
@@ -1616,7 +1642,7 @@ function cwdModel(analysis, cwd) {
   const allAfterEveryCd = exact.every((entry) => entry.depth === operands.length);
   return {
     trusted: covers && prefix?.complete && allAfterEveryCd ? exactDirectory : null,
-    forCommand: (command) => {
+    forCommand: (/** @type {AnalyzedCommand} */ command) => {
       const offset = command.rootOffset;
       const entry = typeof offset === 'number'
         ? exact.find(({ range: [start, end] }) => offset >= start && offset < end)

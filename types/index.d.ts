@@ -20,6 +20,8 @@ export interface AnalyzedCommand {
   source: CommandSource;
   span: { start: number; end: number };
   wrappers: string[];
+  /** Outer-to-inner env directory overrides; null means a dynamic directory. */
+  wrapperCwds?: Array<string | null>;
   hasRedirection: boolean;
   pipelineGroup: number | null;
   /** Byte offset of the top-level command this one belongs to (nested `sh -c` / `eval` commands share their parent's). */
