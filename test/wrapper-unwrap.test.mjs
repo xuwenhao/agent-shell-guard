@@ -294,3 +294,16 @@ for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
     }
   }
 }
+
+// GNU env: "A mere - implies -i".
+for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
+  for (const [body, rule] of [[init, 'bd-forbidden-subcommand'], [push, 'force-push-main']]) {
+    for (const command of [`env - ${body}`, `env - FOO=1 ${body}`, `env -u X - ${body}`]) {
+      test(`${tier} lone env dash keeps the command visible: ${command}`, () => {
+        const result = evaluate(command, tier);
+        assert.equal(result.kind, 'deny');
+        assert.equal('ruleId' in result ? result.ruleId : null, rule);
+      });
+    }
+  }
+}

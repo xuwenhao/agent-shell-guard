@@ -339,9 +339,10 @@ function splitEnvString(text) {
 }
 
 /** @typedef {'none'|'required'|'optional'} OptionValue */
-/** @typedef {{short: Record<string, string>, long: Record<string, OptionValue>}} OptionTable */
+/** @typedef {{short: Record<string, string>, long: Record<string, OptionValue>, loneDash?: string}} OptionTable */
 /** @type {OptionTable} */
 const ENV_OPTIONS = {
+  loneDash: 'ignore-environment',
   // `-P` differs between implementations: BSD env (macOS /usr/bin/env) takes
   // `-P altpath`, GNU coreutils 9.x has no short -P value. The guard runs on the
   // machine that executes the command, so pick by platform; mistaking the value
@@ -389,6 +390,10 @@ const SUDO_OPTIONS = {
 function parseWrapperOption(argv, index, table) {
   const arg = argv[index];
   const unknown = { kind: /** @type {const} */ ('unknown'), consumed: 1, options: [] };
+  // GNU env: "A mere - implies -i"; for other wrappers a lone dash is an operand.
+  if (arg === '-' && table.loneDash) {
+    return { kind: 'options', consumed: 1, options: [{ name: table.loneDash, value: undefined, prefix: '' }] };
+  }
   if (typeof arg !== 'string' || arg === '-' || !arg.startsWith('-')) {
     return { kind: 'operand', consumed: 0, options: [] };
   }
