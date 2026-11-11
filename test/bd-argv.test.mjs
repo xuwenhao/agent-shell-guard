@@ -75,6 +75,30 @@ for (const [command, cwd] of [['bd list', hooked], ['bd doctor', hooked], ['bd',
   test(`no hooks confirmation ${command} in ${cwd}`, () => assert.equal(evaluate(command, 'native', cwd).kind, 'allow'));
 }
 
+for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
+  for (const command of ['bd -C "$DIR" create --title=x', 'bd --directory "$DIR" update x', 'bd -C $(pwd) close x']) {
+    test(`${tier} dynamic directory ${command} confirms as unknown`, () => {
+      const result = evaluate(command, tier, root);
+      assert.equal(result.kind, tier === 'relaxed' ? 'allow' : 'confirm');
+      if (result.kind !== 'allow') { assert.equal(result.ruleId, 'bd-repo-hooks'); assert.equal(result.evaluation, 'unknown'); }
+    });
+  }
+}
+test('dynamic directory with a read-only subcommand stays silent', () => {
+  assert.equal(evaluate('bd -C "$DIR" list', 'native', root).kind, 'allow');
+});
+// --dolt-auto-commit takes a value in bd 1.3.4 (`bd help`: "--dolt-auto-commit string"), so
+// `bd --dolt-auto-commit init` passes init as the policy value; bd itself runs no subcommand.
+test('a value flag consumes the next word exactly like bd does', () => {
+  assert.equal(evaluate('bd --dolt-auto-commit init').kind, 'allow');
+});
+// A fully dynamic word cannot even be recognised as a flag, so the verb is unknown: fail closed.
+test('fully dynamic --directory=$DIR word is denied as unknown', () => {
+  const result = evaluate('bd --directory=$DIR update x', 'native', root);
+  assert.equal(result.kind, 'deny');
+  assert.equal('ruleId' in result ? result.ruleId : null, 'bd-forbidden-subcommand');
+});
+
 test('every documented global flag is skipped before the subcommand', () => {
   for (const flag of ['--actor', '--database', '--db', '-C', '--directory', '--dolt-auto-commit']) {
     for (const option of [`${flag} value`, `${flag}=value`]) {

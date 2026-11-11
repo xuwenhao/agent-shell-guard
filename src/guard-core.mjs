@@ -1265,14 +1265,24 @@ function confirmationPolicy(graph, enabled, ctx) {
   for (const command of graph.commands) {
     const tool = commandName(command);
     const bd = parseBdCommand(command);
-    if (bd && !bd.readOnly && enabled('bd-repo-hooks') && ctx.cwdsFor(command).some((cwd) => {
-      const directory = bd.directory === undefined ? cwd : bd.directory === null ? null
-        : isAbsolute(bd.directory) ? bd.directory : cwd ? resolve(cwd, bd.directory) : null;
-      return hasBeadsHooks(directory);
-    })) return {
-      ruleId: 'bd-repo-hooks', evaluation: 'matched', detail: 'bd 执行项目 .beads/hooks 脚本',
-      why: 'bd 在沙盒外运行，项目 hooks 等同沙盒外任意代码，请确认这些脚本可信。',
-    };
+    // A null subcommand never reaches here: hardPolicy denies it first via bd-forbidden-subcommand.
+    if (bd && !bd.readOnly && enabled('bd-repo-hooks')) {
+      // A dynamic -C/--directory target cannot be inspected; it may point at a hooked
+      // repository, so it needs the same confirmation as a literal hooked path.
+      if (bd.directory === null) return {
+        ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd -C 目标无法静态确定',
+        why: 'bd 在沙盒外运行，-C 指向的目录可能有 .beads/hooks（沙盒外任意代码），目录无法静态确定，请确认。',
+      };
+      const target = bd.directory;
+      if (ctx.cwdsFor(command).some((cwd) => {
+        const directory = target === undefined ? cwd
+          : isAbsolute(target) ? target : cwd ? resolve(cwd, target) : null;
+        return hasBeadsHooks(directory);
+      })) return {
+        ruleId: 'bd-repo-hooks', evaluation: 'matched', detail: 'bd 执行项目 .beads/hooks 脚本',
+        why: 'bd 在沙盒外运行，项目 hooks 等同沙盒外任意代码，请确认这些脚本可信。',
+      };
+    }
 
     if (enabled('remote-exec') && ['ssh', 'scp', 'rsync'].includes(tool) && (tool === 'rsync' || !hasFlag(command.argv, '-G'))) {
       if (tool === 'ssh') {
