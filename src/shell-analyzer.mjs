@@ -342,26 +342,33 @@ function splitEnvString(text) {
 /** @typedef {{short: Record<string, string>, long: Record<string, OptionValue>}} OptionTable */
 /** @type {OptionTable} */
 const ENV_OPTIONS = {
-  // GNU 9.x -P has an optional value; conservatively treat the short form as valueless.
-  short: { i: 'ignore-environment', 0: 'null', v: 'debug', u: 'unset', C: 'chdir', S: 'split-string', P: 'default-signal' },
+  // `-P` differs between implementations: BSD env (macOS /usr/bin/env) takes
+  // `-P altpath`, GNU coreutils 9.x has no short -P value. The guard runs on the
+  // machine that executes the command, so pick by platform; mistaking the value
+  // for the command would let the real command escape every rule.
+  // `-a ARG` (GNU --argv0) takes a value; BSD env rejects it, which is harmless.
+  short: { i: 'ignore-environment', 0: 'null', v: 'debug', u: 'unset', C: 'chdir', S: 'split-string',
+    a: 'argv0', P: process.platform === 'darwin' ? 'bsd-altpath' : 'default-signal' },
   long: {
     'ignore-environment': 'none', null: 'none', debug: 'none', 'list-signal-handling': 'none',
     help: 'none', version: 'none', unset: 'required', chdir: 'required',
     'split-string': 'required', argv0: 'required', 'default-signal': 'optional',
     'ignore-signal': 'optional', 'block-signal': 'optional',
+    // Internal name for BSD `-P altpath`; BSD env has no long options.
+    'bsd-altpath': 'required',
   },
 };
 /** @type {OptionTable} */
 const SUDO_OPTIONS = {
   short: {
-    u: 'user', g: 'group', h: 'host', p: 'prompt', C: 'close-from', T: 'command-timeout',
+    a: 'auth-type', u: 'user', g: 'group', h: 'host', p: 'prompt', C: 'close-from', T: 'command-timeout',
     R: 'chroot', D: 'chdir', r: 'role', t: 'type', c: 'login-class', U: 'other-user',
     A: 'askpass', b: 'background', B: 'bell', E: 'preserve-env', e: 'edit', H: 'set-home',
     i: 'login', K: 'remove-timestamp', k: 'reset-timestamp', l: 'list', n: 'non-interactive',
     N: 'no-update', P: 'preserve-groups', S: 'stdin', s: 'shell', V: 'version', v: 'validate',
   },
   long: {
-    user: 'required', group: 'required', host: 'required', prompt: 'required',
+    'auth-type': 'required', user: 'required', group: 'required', host: 'required', prompt: 'required',
     'close-from': 'required', 'command-timeout': 'required', chroot: 'required', chdir: 'required',
     role: 'required', type: 'required', 'login-class': 'required', 'other-user': 'required',
     askpass: 'none', background: 'none', bell: 'none', 'preserve-env': 'optional', edit: 'none',

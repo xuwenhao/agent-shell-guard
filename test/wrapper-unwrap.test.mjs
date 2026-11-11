@@ -277,3 +277,20 @@ for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
 test('argv sudoedit keeps unknown editor', () => {
   assert.equal(evaluate(['sudo', '--edit', '/etc/x'], 'native').analysis.commands.at(-1)?.argv[0], null);
 });
+
+// Value-taking options missing from the r3 tables (found against `genv --help` 9.11 and `man sudo`).
+for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
+  for (const [body, rule] of [[init, 'bd-forbidden-subcommand'], [push, 'force-push-main']]) {
+    const forms = [`env -a X ${body}`, `env -aX ${body}`, `env --argv0=X ${body}`,
+      `sudo -a X ${body}`, `sudo -aX ${body}`, `sudo --auth-type=X ${body}`, `sudo --auth X ${body}`,
+      // BSD env (macOS) takes `-P altpath`; GNU 9.x has no short -P value.
+      process.platform === 'darwin' ? `env -P /usr/bin ${body}` : `env -P ${body}`];
+    for (const command of forms) {
+      test(`${tier} value option keeps the command visible: ${command}`, () => {
+        const result = evaluate(command, tier);
+        assert.equal(result.kind, 'deny');
+        assert.equal('ruleId' in result ? result.ruleId : null, rule);
+      });
+    }
+  }
+}
