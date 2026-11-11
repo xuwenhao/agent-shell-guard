@@ -37,6 +37,7 @@ for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
     for (const command of [`env -S ${quote(body)}`, `sudo FOO=1 ${body}`,
       `env -S${quote(body)}`, `env --split-string=${quote(body)}`, `env --split-string ${quote(body)}`,
       `env -iS ${quote(body)}`, `env -vS${quote(body)}`, `sudo -u root FOO=1 ${body}`,
+      `sudo FOO=1 -i ${body}`, `sudo FOO=1 -u root BAR=2 ${body}`, `sudo FOO=1 -- ${body}`,
       `env --unset=NAME ${body}`, `env -u NAME ${body}`]) {
       test(`${tier} rejects wrapper ${command}`, () => {
         const result = evaluate(command, tier);
@@ -199,6 +200,12 @@ test('wrapper cwd followed by nested cd cannot hide main branch', () => {
   const result = evaluate('env -C ' + quote(safe) + ' sh -c ' + quote('cd main-repo && ' + force), 'native', safe);
   assert.equal(result.kind, 'deny');
   assert.equal(result.ruleId, 'force-push-main');
+  // Codex's exact case: hook cwd elsewhere, absolute wrapper cwd, relative nested cd.
+  for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
+    const elsewhere = evaluate('env -C ' + quote(safe) + ' sh -c ' + quote('cd main-repo && ' + force), tier, root);
+    assert.equal(elsewhere.kind, 'deny');
+    assert.equal(elsewhere.ruleId, 'force-push-main');
+  }
 });
 
 for (const [escape, character] of Object.entries({ t: '\t', n: '\n', r: '\r', f: '\f', v: '\v' })) {

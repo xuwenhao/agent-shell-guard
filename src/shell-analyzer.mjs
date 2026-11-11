@@ -395,13 +395,15 @@ export function unwrapCommand(rawArgv) {
       }
     } else if (name === 'sudo') {
       const valueOptions = new Set(['-u', '-g', '-h', '-p', '-C', '-T', '-R', '-D']);
+      // sudo [options] [VAR=value...] [-i | -s] [command]: options may follow the
+      // assignments, so keep consuming both until the first command word.
       while (index < argv.length) {
         const arg = argv[index];
         if (arg === '--') { index++; break; }
+        if (typeof arg === 'string' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) { index++; continue; }
         if (typeof arg !== 'string' || !arg.startsWith('-')) break;
         index += valueOptions.has(arg) ? 2 : 1;
       }
-      while (typeof argv[index] === 'string' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(/** @type {string} */ (argv[index]))) index++;
     } else if (name === 'nohup' || name === 'setsid') {
       while (typeof argv[index] === 'string' && argv[index]?.startsWith('-')) {
         if (argv[index] === '--') { index++; break; }
