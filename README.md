@@ -489,6 +489,23 @@ With nativePrompt disabled, or for commands no prefix covers (compound
 chains, `git -C`, variables, attached option values), the confirmation fails
 closed (deny) with a `[guard-diagnostic]` marker, as in 0.4.
 
+### Changes in 0.6.0
+
+- bd (beads) rules parsed from argv, not text prefixes, so global flags before
+  the verb no longer hide it (`bd --json setup`, `bd -C x init`). Also covers
+  the `beads`, `bd.exe` and `beads.exe` aliases.
+  - `bd-forbidden-subcommand` (deny): `init`, `setup`, `hooks`, `dolt`, or a
+    verb that cannot be determined statically.
+  - `bd-profile-write` (deny): `--mem-profile`, `--cpu-profile`, or
+    `BEADS_MEM_PROFILE` set on the command or exported in the graph.
+  - `bd-repo-hooks` (ask level): a non-read-only verb whose workspace (cwd,
+    `-C`, or `BEADS_DIR`) has a non-empty `.beads/hooks`, or whose directory,
+    workspace or options are dynamic.
+- On Codex, Grok and Kimi `bd-repo-hooks` has no native prompt prefix, so it
+  fails closed (deny), like other uncovered confirmations.
+- `env VAR="$X"` operands now keep a dynamic value as unknown instead of the
+  literal marker text.
+
 ### Changes in 0.5.0
 
 - Relaxed `dangerous-only` for Claude Code: working-tree discards, non-trunk
