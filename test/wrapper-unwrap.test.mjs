@@ -221,3 +221,59 @@ for (const option of ['-iC"$D"']) {
     assert.ok(!result.analysis.unknowns.some((item) => item.reason === 'dynamic-evaluator'));
   });
 }
+
+// getopt words remain parser input only, including every dangerous command body.
+for (const tier of /** @type {const} */ (['relaxed', 'bypass', 'native'])) {
+  for (const command of [
+    `env --spl=${quote(init)}`, `env --spl ${quote(init)}`, `env --split=${quote(push)}`,
+    `env --un=X ${init}`, `env --i ${init}`, `env --unknown ${init}`, `env -Z ${init}`,
+    `env --argv0 custom ${init}`, `env --argv0=custom ${init}`,
+    `env --default-signal ${init}`, `env --ignore-signal=PIPE ${init}`, `env --block-signal ${init}`,
+    `env -Piv ${init}`, `env -iuX ${init}`, `env -ivS${quote(init)}`,
+    `sudo --user root ${init}`, `sudo --user=root ${init}`, `sudo --us root ${init}`,
+    `sudo -Eu root ${init}`, `sudo -Euroot ${init}`, `sudo -r role -t type ${init}`,
+    `sudo --preserve-env=PATH ${init}`, `sudo --preserve-env ${init}`,
+    `sudo --preserve ${init}`, `sudo --unknown ${init}`, `sudo -N ${init}`,
+    `sudo FOO=1 --us root BAR=2 -E ${init}`, `sudo -- ${init}`,
+  ]) {
+    test(`${tier} getopt deny ${command}`, () => assert.equal(evaluate(command, tier).kind, 'deny'));
+  }
+  for (const command of [
+    `env --ch=${quote(hooked)} bd create`, `env --chd ${quote(hooked)} bd create`,
+    `sudo -D ${quote(hooked)} bd create`, `sudo --chdir=${quote(hooked)} bd create`,
+    `sudo --chd ${quote(hooked)} bd create`, `sudo -ED${quote(hooked)} bd create`,
+    `sudo -D ${quote(root)} env -C hooked bd create`,
+    `sudo -D ${quote(plain)} -D ${quote(hooked)} bd create`,
+  ]) {
+    test(`${tier} getopt cwd ${command}`, () => {
+      const result = evaluate(command, tier);
+      assert.equal(result.kind, tier === 'relaxed' ? 'allow' : 'confirm');
+      if (result.kind !== 'allow') assert.equal(result.ruleId, 'bd-repo-hooks');
+    });
+  }
+  for (const command of ['env --ch="$D" bd create', 'env --chd="$D" bd create',
+    'env -ivC"$D" bd create', 'sudo --chd="$D" bd create', 'sudo -ED"$D" bd create',
+    'sudo -D "$D" bd create']) {
+    test(`${tier} getopt dynamic cwd ${command}`, () => {
+      const result = evaluate(command, tier);
+      assert.equal(result.kind, tier === 'relaxed' ? 'allow' : 'confirm');
+      if (result.kind !== 'allow') assert.equal(result.evaluation, 'unknown');
+      assert.ok(!result.analysis.unknowns.some(item => item.reason === 'dynamic-evaluator'));
+    });
+  }
+  for (const option of ['--spl="$X"', '--split="$X"', '-ivS"$X"']) {
+    test(`${tier} getopt dynamic split ${option}`, () => {
+      assert.ok(evaluate('env ' + option, tier).analysis.unknowns.some(item => item.reason === 'dynamic-evaluator'));
+    });
+  }
+  for (const option of ['-e', '--edit', '--ed', '-Ee']) {
+    test(`${tier} sudoedit files are not commands ${option}`, () => {
+      const result = evaluate('sudo ' + option + ' /etc/x', tier);
+      assert.equal(result.analysis.commands.at(-1)?.argv[0], null);
+      assert.ok(result.analysis.unknowns.some(item => item.reason === 'dynamic-command'));
+    });
+  }
+}
+test('argv sudoedit keeps unknown editor', () => {
+  assert.equal(evaluate(['sudo', '--edit', '/etc/x'], 'native').analysis.commands.at(-1)?.argv[0], null);
+});
