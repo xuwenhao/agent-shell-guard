@@ -37,6 +37,7 @@ const DEFAULT_TIMEOUT_MS = 2_000;
  *   graphEnv?: string[],
  *   assignmentNames?: string[],
  *   commandAssignments?: AnalyzedAssignment[],
+ *   wrapperCwds?: Array<string|null>, // outer-to-inner env directory overrides
  *   markedArgv?: Array<string|null>,
  * }} AnalyzedCommand
  */
@@ -293,6 +294,8 @@ export function unwrapCommand(rawArgv) {
   let argv = rawArgv;
   /** @type {string[]} */
   const wrappers = [];
+  /** @type {Array<string|null>} */
+  const wrapperCwds = [];
   for (let depth = 0; depth < 8 && typeof argv[0] === 'string'; depth++) {
     const name = basename(/** @type {string} */ (argv[0])).toLowerCase();
     let index = 1;
@@ -301,13 +304,42 @@ export function unwrapCommand(rawArgv) {
         /^-[^-]*[vV]/.test(/** @type {string} */ (argv[index]))) break;
       while (typeof argv[index] === 'string' && argv[index]?.startsWith('-')) index++;
     } else if (name === 'env') {
+      let envCwd;
       while (index < argv.length) {
         const arg = argv[index];
         if (arg === '--') { index++; break; }
-        if (arg === '-u' || arg === '--unset' || arg === '-C' || arg === '--chdir') { index += 2; continue; }
+        if (arg === '-C' || arg === '--chdir') {
+          envCwd = argv[index + 1] ?? null;
+          if (envCwd?.includes(DYNAMIC_MARKER)) envCwd = null;
+          index += 2; continue;
+        }
+        if (typeof arg === 'string' && (arg.startsWith('-C') || arg.startsWith('--chdir='))) {
+          envCwd = arg.startsWith('-C') ? arg.slice(2) : arg.slice('--chdir='.length);
+          if (envCwd.includes(DYNAMIC_MARKER)) envCwd = null;
+          index++; continue;
+        }
+        if (arg === '-u' || arg === '--unset') { index += 2; continue; }
+        if (typeof arg === 'string' && arg.startsWith('-u')) { index++; continue; }
+        const split = typeof arg === 'string' ? /^(?:--split-string(?:=(.*))?|-([^-]*?)S(.*))$/s.exec(arg) : null;
+        if (split) {
+          const attached = split[1] ?? split[3];
+          const hasAttached = arg?.startsWith('--') ? arg.includes('=') : Boolean(attached);
+          const script = hasAttached ? attached : argv[index + 1];
+          const tail = argv.slice(index + (hasAttached ? 1 : 2));
+          // GNU env -S has its own escapes, not a full shell grammar. Parsing
+          // it as shell input is a conservative approximation. Preserve the
+          // remaining argv as quoted words, not new shell syntax.
+          const prefix = [...argv.slice(1, index), ...(split[2] ? ['-' + split[2]] : [])];
+          const text = typeof script === 'string' && !script.includes(DYNAMIC_MARKER)
+            ? ['env', ...prefix.map(quoteShellWord), script, ...tail.map(quoteShellWord)].join(' ')
+            : null;
+          return { argv, wrappers: [...wrappers, name], wrapperCwds,
+            evaluator: { script: text, scriptIndex: -1 } };
+        }
         if (typeof arg === 'string' && (arg.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg))) { index++; continue; }
         break;
       }
+      if (envCwd !== undefined) wrapperCwds.push(envCwd);
     } else if (name === 'exec') {
       while (index < argv.length) {
         const arg = argv[index];
@@ -324,6 +356,7 @@ export function unwrapCommand(rawArgv) {
         if (typeof arg !== 'string' || !arg.startsWith('-')) break;
         index += valueOptions.has(arg) ? 2 : 1;
       }
+      while (typeof argv[index] === 'string' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(/** @type {string} */ (argv[index]))) index++;
     } else if (name === 'nohup' || name === 'setsid') {
       while (typeof argv[index] === 'string' && argv[index]?.startsWith('-')) {
         if (argv[index] === '--') { index++; break; }
@@ -382,7 +415,12 @@ export function unwrapCommand(rawArgv) {
     wrappers.push(name);
     argv = argv.slice(index);
   }
-  return { argv, wrappers };
+  return { argv, wrappers, wrapperCwds, evaluator: null };
+}
+
+/** @param {string|null} word */
+function quoteShellWord(word) {
+  return "'" + (word ?? DYNAMIC_MARKER).replaceAll("'", "'\\''") + "'";
 }
 
 /** @param {Array<string|null>} argv */
@@ -446,18 +484,18 @@ export function analyzeShellInput(input, options) {
   const maxCommands = options.maxCommands ?? MAX_COMMANDS;
   if (input.kind === 'argv') {
     const rawArgv = input.argv.map(String);
-    const { argv, wrappers } = unwrapCommand(rawArgv);
+    const { argv, wrappers, wrapperCwds, evaluator: split } = unwrapCommand(rawArgv);
     /** @type {ShellGraph} */
     const graph = {
       status: 'safe', dialect,
-      commands: [{ argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 }, wrappers, hasRedirection: false, pipelineGroup: null, rootOffset: 0 }],
+      commands: [{ argv, rawArgv, displayArgv: rawArgv, dialect, source: 'top-level', span: { start: 0, end: 0 }, wrappers, wrapperCwds, hasRedirection: false, pipelineGroup: null, rootOffset: 0 }],
       unknowns: [], hasPipeline: false, hasRedirection: false, hasSubstitution: false,
       hasCompound: false, nativePromptArgv: wrappers.length ? null : rawArgv,
       redirections: [], assignments: envOperandAssignments(rawArgv, argv),
     };
     graph.commands[0].commandAssignments = [...(graph.assignments ?? [])];
     graph.commands[0].assignmentNames = graph.commands[0].commandAssignments.map((item) => item.name);
-    const evaluator = shellEvaluator(argv);
+    const evaluator = split ? { ...split, dialect } : shellEvaluator(argv);
     if (!evaluator) return finishGraph(graph);
     graph.nativePromptArgv = null;
     if (evaluator.script === null) {
@@ -484,6 +522,8 @@ export function analyzeShellInput(input, options) {
       ...command,
       source: command.source === 'top-level' ? /** @type {CommandSource} */ ('shell-c') : command.source,
       rootOffset: 0,
+      wrapperCwds: [...wrapperCwds, ...(command.wrapperCwds ?? [])],
+      commandAssignments: [...(graph.commands[0].commandAssignments ?? []), ...(command.commandAssignments ?? [])],
     })));
     graph.assignments?.push(...(nested.assignments ?? []));
     graph.unknowns.push(...nested.unknowns);
@@ -616,11 +656,11 @@ export function analyzeShellInput(input, options) {
         if (++commandCount > maxCommands) { unknown('command-limit', `command graph exceeds ${maxCommands} nodes`); return; }
         const rawArgv = words.map(staticWord);
         const displayArgv = words.map((word) => isObject(word) ? sliceBytes(offsetOf(word, 'Pos'), offsetOf(word, 'End')) : '<?>');
-        // Only wrapper assignment operands may use marked values; retain null
+        // Wrapper assignments and attached env options may use marked values; retain null
         // in the effective argv so dynamic command/data words stay unknown.
         const wrapperArgv = words.map((word, index) => {
           const marked = rawArgv[index] === null ? markedWord(word) : rawArgv[index];
-          return rawArgv[index] ?? (marked && /^[A-Za-z_][A-Za-z0-9_]*=/.test(marked) ? marked : null);
+          return rawArgv[index] ?? (marked && /^(?:[A-Za-z_][A-Za-z0-9_]*=|--(?:chdir|split-string)=|-[^-]*[CS])/.test(marked) ? marked : null);
         });
         const unwrapped = unwrapCommand(wrapperArgv);
         const wrappers = unwrapped.wrappers;
@@ -629,7 +669,7 @@ export function analyzeShellInput(input, options) {
         /** @type {AnalyzedCommand} */
         const command = {
           argv, rawArgv, displayArgv, markedArgv: words.map(markedWord).slice(rawArgv.length - argv.length), dialect: currentDialect, source: nodeSource,
-          span, wrappers, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
+          span, wrappers, wrapperCwds: unwrapped.wrapperCwds, hasRedirection: Array.isArray(node.Redirs) && node.Redirs.length > 0,
           pipelineGroup, rootOffset: rootOffset ?? span.start,
         };
         const assignmentStart = graph.assignments?.length ?? 0;
@@ -641,7 +681,8 @@ export function analyzeShellInput(input, options) {
         if (argv[0] === null || argv.length === 0) unknown('dynamic-command', 'command name cannot be reconstructed statically');
 
         const offset = rawArgv.length - argv.length;
-        const evaluator = shellEvaluator(argv);
+        const nestedStart = graph.commands.length;
+        const evaluator = unwrapped.evaluator ? { ...unwrapped.evaluator, dialect: currentDialect } : shellEvaluator(argv);
         if (evaluator) {
           if (evaluator.script === null) {
             unknown('dynamic-evaluator', `${String(argv[0])} -c script is dynamic or missing`);
@@ -663,6 +704,11 @@ export function analyzeShellInput(input, options) {
           } else parseScript(/** @type {string[]} */ (parts).join(' '), currentDialect, depth + 1, 'eval', command.rootOffset);
         }
 
+        for (const nested of graph.commands.slice(nestedStart)) {
+          nested.wrapperCwds = [...(command.wrapperCwds ?? []), ...(nested.wrapperCwds ?? [])];
+          nested.commandAssignments = [...(command.commandAssignments ?? []), ...(nested.commandAssignments ?? [])];
+          nested.assignmentNames = nested.commandAssignments.map((item) => item.name);
+        }
         walk(node.Assigns, nodeSource, pipelineGroup);
         walk(node.Args, nodeSource, pipelineGroup);
         if (Array.isArray(node.Redirs) && node.Redirs.length) {
@@ -728,7 +774,7 @@ export function analyzeShellInput(input, options) {
 }
 
 /**
- * `env NAME=value cmd` assignments, which unwrapCommand strips with the
+ * `env NAME=value cmd` and `sudo NAME=value cmd` assignments, which unwrapCommand strips with the
  * wrapper.
  * @param {Array<string|null>} rawArgv @param {Array<string|null>} argv
  * @returns {AnalyzedAssignment[]}
@@ -756,7 +802,10 @@ function envOperandAssignments(rawArgv, argv, staticArgv = rawArgv) {
  */
 function finishGraph(graph) {
   const names = [...new Set((graph.assignments ?? []).map((item) => item.name))];
-  for (const command of graph.commands) command.graphEnv = names;
+  for (const command of graph.commands) {
+    command.graphEnv = names;
+    if (command.commandAssignments) command.assignmentNames = command.commandAssignments.map((item) => item.name);
+  }
   return graph;
 }
 
