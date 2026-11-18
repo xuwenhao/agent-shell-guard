@@ -922,7 +922,7 @@ function gitCleanRoot(command, ctx) {
  * }} CommandEvalState
  */
 /** @typedef {{ruleId: string, match: (command: AnalyzedCommand, state: CommandEvalState, ctx: RuleContext, graph: ShellGraph) => PolicyMatch|null}} CommandPolicyRule */
-/** @typedef {{ruleId: string, match: (graph: ShellGraph, ctx: RuleContext, rawCommand: string) => (PolicyMatch & {kind: 'deny'|'confirm'})|null}} StagePolicyRule */
+/** @typedef {{ruleId: string, match: (graph: ShellGraph, ctx: RuleContext, rawCommand: string, stateFor: (command: AnalyzedCommand) => CommandEvalState) => (PolicyMatch & {kind: 'deny'|'confirm'})|null}} StagePolicyRule */
 /** @typedef {{ruleId: string, match: (graph: ShellGraph) => PolicyMatch|null}} PipelinePolicyRule */
 
 /** @param {string} ref */
@@ -1337,9 +1337,11 @@ function relocatingTargets(command, cwd) {
  * confined to the project, so recursive deletes and moves that land outside
  * the project root (the outermost repository enclosing cwd, so a thin root's
  * members and `.worktrees/` count as inside) need a human.
- * @param {ShellGraph} graph @param {RuleContext} ctx @returns {PolicyMatch|null}
+ * @param {ShellGraph} graph @param {RuleContext} ctx
+ * @param {(command: AnalyzedCommand) => CommandEvalState} stateFor
+ * @returns {PolicyMatch|null}
  */
-function unsandboxedOutsideProject(graph, ctx) {
+function unsandboxedOutsideProject(graph, ctx, stateFor) {
   if (ctx.tier !== 'bypass') return null;
   if (!ctx.unsandboxed && !isExcludedCommandGraph(graph)) return null;
   const root = projectInfo(ctx)?.projectRoot ?? null;
@@ -1370,8 +1372,9 @@ function unsandboxedOutsideProject(graph, ctx) {
     }
     // Discarding git operations act on the repository they run in; outside
     // the project nothing else stands between them and that repository.
-    const git = parseGitCommand(command);
-    const rule = git ? gitRule(command) : null;
+    const state = stateFor(command);
+    const git = state.git();
+    const rule = git ? state.gitFine() : null;
     if (git && (rule === 'git-discard' || rule === 'git-ref-change')) {
       const directory = gitWorkDir(git, commandTrustedCwd(command, ctx));
       if (directory !== null && (inside(directory) || directory === root)) continue;
@@ -1506,8 +1509,8 @@ export const STAGE_RULES = Object.freeze([
   },
   {
     ruleId: 'unsandboxed-outside-project',
-    match(analysis, ctx) {
-      const outside = unsandboxedOutsideProject(analysis, ctx);
+    match(analysis, ctx, _rawCommand, stateFor) {
+      const outside = unsandboxedOutsideProject(analysis, ctx, stateFor);
       return outside ? { kind: 'confirm', ...outside } : null;
     },
   },
@@ -2038,7 +2041,7 @@ function evaluate(event, options) {
 
   for (const stageRule of STAGE_RULES) {
     if (!enabled(stageRule.ruleId)) continue;
-    const matched = stageRule.match(analysis, ctx, command);
+    const matched = stageRule.match(analysis, ctx, command, stateFor);
     if (matched) return { command, description, analysis, ...matched };
   }
 
