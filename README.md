@@ -489,6 +489,19 @@ With nativePrompt disabled, or for commands no prefix covers (compound
 chains, `git -C`, variables, attached option values), the confirmation fails
 closed (deny) with a `[guard-diagnostic]` marker, as in 0.4.
 
+### Changes in 0.6.1
+
+- Pre-filter disabled policy rules before running matchers or filesystem
+  inspectors (#15):
+  - All 35 rules in `POLICY_PROFILES.full` are organized into declarative rule
+    tables (`HARD_COMMAND_RULES`, `STAGE_RULES`, `CONFIRMATION_COMMAND_RULES`,
+    `CONFIRMATION_PIPELINE_RULES`) filtered by `enabled(ruleId)` up front.
+  - Per-command parsing (`parseBdCommand`, `ghApiDelete`, `parseFind`,
+    `parseGitCommand`, `gitRule`, `pushDeletesTrunk`, `hardResetRef`,
+    `resetRefIsTrunk`) and `cwdModel` run lazily and share cached results
+    across enabled rules, while preserving rule precedence and
+    `reset-hard-remote` fallback shielding.
+
 ### Changes in 0.6.0
 
 - bd (beads) rules parsed from argv, not text prefixes, so global flags before
