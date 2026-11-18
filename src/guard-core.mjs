@@ -517,10 +517,11 @@ function shortOperand(args, letter) {
 /**
  * Fine-grained git classification. Returns the rule id or null.
  * @param {AnalyzedCommand} command
+ * @param {ReturnType<typeof parseGitCommand>} [parsedGit]
  * @returns {'git-discard'|'git-trunk-ref'|'git-ref-change'|'git-config-global'|'git-lfs'|'git-exec'|'git-push-bulk'|'git-low-risk'|null}
  */
-function gitRule(command) {
-  const git = parseGitCommand(command);
+function gitRule(command, parsedGit) {
+  const git = parsedGit === undefined ? parseGitCommand(command) : parsedGit;
   if (!git) return null;
   const { subcommand, args } = git;
 
@@ -595,9 +596,12 @@ function gitRule(command) {
   return null;
 }
 
-/** @param {AnalyzedCommand} command */
-function hardResetRef(command) {
-  const git = parseGitCommand(command);
+/**
+ * @param {AnalyzedCommand} command
+ * @param {ReturnType<typeof parseGitCommand>} [parsedGit]
+ */
+function hardResetRef(command, parsedGit) {
+  const git = parsedGit === undefined ? parseGitCommand(command) : parsedGit;
   if (git?.subcommand !== 'reset' || !hasFlag(git.args, '--hard')) return null;
   return git.args.find((arg) => typeof arg === 'string' && !arg.startsWith('-')) ?? null;
 }
@@ -610,12 +614,13 @@ const UPSTREAM_REF = /^(.*)@\{(?:u|upstream|push)\}$/i;
  * `origin/main`, `refs/remotes/<remote>/main`, `refs/heads/main`, and an
  * `@{u}` / `<branch>@{upstream}` whose configured upstream is the trunk.
  * @param {string} ref @param {AnalyzedCommand} command @param {RuleContext} ctx
+ * @param {ReturnType<typeof parseGitCommand>} [parsedGit]
  */
-function resetRefIsTrunk(ref, command, ctx) {
+function resetRefIsTrunk(ref, command, ctx, parsedGit) {
   if (TRUNK_SPELLINGS.test(ref)) return true;
   const upstream = UPSTREAM_REF.exec(ref);
   if (!upstream) return false;
-  const git = parseGitCommand(command);
+  const git = parsedGit === undefined ? parseGitCommand(command) : parsedGit;
   const directory = git ? gitWorkDir(git, commandTrustedCwd(command, ctx)) : null;
   if (directory === null) return false;
   const info = ctx.inspect(directory);
@@ -757,9 +762,13 @@ function gitGlobalConfigs(command, git) {
   return entries;
 }
 
-/** @param {AnalyzedCommand} command @param {RuleContext} ctx @returns {'matched'|'unknown'|null} */
-function pushDeletesTrunk(command, ctx) {
-  const git = parseGitCommand(command);
+/**
+ * @param {AnalyzedCommand} command @param {RuleContext} ctx
+ * @param {ReturnType<typeof parseGitCommand>} [parsedGit]
+ * @returns {'matched'|'unknown'|null}
+ */
+function pushDeletesTrunk(command, ctx, parsedGit) {
+  const git = parsedGit === undefined ? parseGitCommand(command) : parsedGit;
   if (git?.subcommand !== 'push') return null;
   const options = pushOptions(git.args);
   if (options.dryRun) return null;
@@ -967,6 +976,11 @@ function createCommandStateFactory(graph, ctx) {
     let resetRefParsed = false;
     /** @type {Map<string, boolean>} */ const resetTrunkByRef = new Map();
 
+    const getGit = () => {
+      if (!gitParsed) { git = parseGitCommand(command); gitParsed = true; }
+      return git;
+    };
+
     existing = {
       exportsBeadsProfile: checkExportsBeadsProfile,
       cwds: () => (cwds ??= ctx.cwdsFor(command)),
@@ -984,26 +998,23 @@ function createCommandStateFactory(graph, ctx) {
       },
       rmRecursive: () => (rmRecursive ??= isCommand(command, 'rm') && hasRecursiveFlag(command.argv)),
       targets: () => (targets ??= commandTargets(command)),
-      git: () => {
-        if (!gitParsed) { git = parseGitCommand(command); gitParsed = true; }
-        return git;
-      },
+      git: getGit,
       gitFine: () => {
-        if (!fineGitParsed) { fineGit = gitRule(command); fineGitParsed = true; }
+        if (!fineGitParsed) { fineGit = gitRule(command, getGit()); fineGitParsed = true; }
         return fineGit;
       },
       pushDeletesTrunk: () => {
-        if (!pushTrunkParsed) { pushTrunk = pushDeletesTrunk(command, ctx); pushTrunkParsed = true; }
+        if (!pushTrunkParsed) { pushTrunk = pushDeletesTrunk(command, ctx, getGit()); pushTrunkParsed = true; }
         return pushTrunk;
       },
       hardResetRef: () => {
-        if (!resetRefParsed) { resetRef = hardResetRef(command); resetRefParsed = true; }
+        if (!resetRefParsed) { resetRef = hardResetRef(command, getGit()); resetRefParsed = true; }
         return resetRef;
       },
       resetIsTrunk: (ref) => {
         let cached = resetTrunkByRef.get(ref);
         if (cached === undefined) {
-          cached = resetRefIsTrunk(ref, command, ctx);
+          cached = resetRefIsTrunk(ref, command, ctx, getGit());
           resetTrunkByRef.set(ref, cached);
         }
         return cached;
@@ -1460,8 +1471,11 @@ function createGitFineRule(ruleId) {
       if (!git || !subcommands.has(git.subcommand ?? '')) return null;
       if (ruleId === 'git-discard' && git.subcommand === 'reset') {
         const resetRef = state.hardResetRef();
-        // An explicit non-trunk remote/upstream reset belongs to reset-hard-remote
-        // and must stay shielded from generic git-discard when reset-hard-remote is disabled.
+        // Exact equivalent of the pre-refactor `if (!trunk) continue;` before gitRule():
+        // in 0.4/0.5 (including dangerous-only native tier and legacy-dangerous), an
+        // explicit non-trunk origin/remote/upstream reset is owned by reset-hard-remote
+        // (enabled only in `full`) and deferred to the host approval layer otherwise,
+        // rather than falling through into generic git-discard (Issue #8).
         if (typeof resetRef === 'string' && isRemoteResetRef(resetRef) && !state.resetIsTrunk(resetRef)) {
           return null;
         }
