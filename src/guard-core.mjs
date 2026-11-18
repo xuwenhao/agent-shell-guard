@@ -905,24 +905,147 @@ function gitCleanRoot(command, ctx) {
 
 // --- policies ------------------------------------------------------------------
 
-/** @param {ShellGraph} graph @param {PolicyEnabled} enabled @param {RuleContext} ctx @returns {PolicyMatch|null} */
-function hardPolicy(graph, enabled, ctx) {
-  for (const command of graph.commands) {
-    const cwds = ctx.cwdsFor(command);
-    const dialect = command.dialect;
-    const bd = parseBdCommand(command);
-    if (bd && (bd.profileWrite || graphExportsBeadsProfile(graph)) && enabled('bd-profile-write')) return {
-      ruleId: 'bd-profile-write', evaluation: 'matched', detail: 'bd profiling 写文件',
-      why: 'bd 在沙盒外执行，profiling 可写任意文件；请交给用户在普通终端运行。',
-    };
-    if (bd && enabled('bd-forbidden-subcommand') && (bd.subcommand === null || BD_FORBIDDEN.has(bd.subcommand ?? ''))) return {
-      ruleId: 'bd-forbidden-subcommand', evaluation: bd.subcommand === null ? 'unknown' : 'matched',
-      detail: 'bd 禁止的子命令或子命令无法静态确定',
-      why: '这些子命令会重建本地库、写 ~/.claude、装会在沙盒外执行的 git hook、改 server 连接；请交给用户在普通终端运行。未知 flag 或动态子命令也必须拒绝。',
-    };
+/**
+ * @typedef {{
+ *   exportsBeadsProfile: () => boolean,
+ *   cwds: () => Array<string|null>,
+ *   bd: () => ReturnType<typeof parseBdCommand>,
+ *   apiDelete: () => ReturnType<typeof ghApiDelete>,
+ *   find: () => ReturnType<typeof parseFind>,
+ *   rmRecursive: () => boolean,
+ *   targets: () => TargetWord[],
+ *   git: () => ReturnType<typeof parseGitCommand>,
+ *   gitFine: () => ReturnType<typeof gitRule>,
+ *   pushDeletesTrunk: () => ReturnType<typeof pushDeletesTrunk>,
+ *   hardResetRef: () => string|null,
+ *   resetIsTrunk: (ref: string) => boolean,
+ * }} CommandEvalState
+ */
+/** @typedef {{ruleId: string, match: (command: AnalyzedCommand, state: CommandEvalState, ctx: RuleContext, graph: ShellGraph) => PolicyMatch|null}} CommandPolicyRule */
+/** @typedef {{ruleId: string, match: (graph: ShellGraph, ctx: RuleContext, rawCommand: string) => (PolicyMatch & {kind: 'deny'|'confirm'})|null}} StagePolicyRule */
+/** @typedef {{ruleId: string, match: (graph: ShellGraph) => PolicyMatch|null}} PipelinePolicyRule */
 
-    const orgWrite = orgRulesetWrite(command);
-    if (orgWrite && enabled('org-ruleset-write')) {
+/** @param {string} ref */
+const isRemoteResetRef = (ref) => /^(?:origin\/|refs\/remotes\/|remotes\/)/.test(ref) || UPSTREAM_REF.test(ref);
+
+/** @param {AnalyzedCommand} command */
+const isSqlCommand = (command) => ['psql', 'mysql', 'mysqlsh', 'sqlite3'].includes(commandName(command));
+
+/**
+ * Lazy per-graph / per-command state shared only across enabled matchers.
+ * Nothing is parsed or inspected until an enabled rule requests it.
+ * @param {ShellGraph} graph @param {RuleContext} ctx
+ * @returns {(command: AnalyzedCommand) => CommandEvalState}
+ */
+function createCommandStateFactory(graph, ctx) {
+  /** @type {boolean|undefined} */
+  let exportsBeadsProfile;
+  const checkExportsBeadsProfile = () => (exportsBeadsProfile ??= graphExportsBeadsProfile(graph));
+  /** @type {Map<AnalyzedCommand, CommandEvalState>} */
+  const byCommand = new Map();
+
+  return (command) => {
+    let existing = byCommand.get(command);
+    if (existing) return existing;
+
+    /** @type {Array<string|null>|undefined} */ let cwds;
+    /** @type {ReturnType<typeof parseBdCommand>} */ let bd = null;
+    let bdParsed = false;
+    /** @type {ReturnType<typeof ghApiDelete>} */ let apiDelete = null;
+    let apiDeleteParsed = false;
+    /** @type {ReturnType<typeof parseFind>} */ let find = null;
+    let findParsed = false;
+    /** @type {boolean|undefined} */ let rmRecursive;
+    /** @type {TargetWord[]|undefined} */ let targets;
+    /** @type {ReturnType<typeof parseGitCommand>} */ let git = null;
+    let gitParsed = false;
+    /** @type {ReturnType<typeof gitRule>} */ let fineGit = null;
+    let fineGitParsed = false;
+    /** @type {ReturnType<typeof pushDeletesTrunk>} */ let pushTrunk = null;
+    let pushTrunkParsed = false;
+    /** @type {string|null} */ let resetRef = null;
+    let resetRefParsed = false;
+    /** @type {Map<string, boolean>} */ const resetTrunkByRef = new Map();
+
+    existing = {
+      exportsBeadsProfile: checkExportsBeadsProfile,
+      cwds: () => (cwds ??= ctx.cwdsFor(command)),
+      bd: () => {
+        if (!bdParsed) { bd = parseBdCommand(command); bdParsed = true; }
+        return bd;
+      },
+      apiDelete: () => {
+        if (!apiDeleteParsed) { apiDelete = ghApiDelete(command); apiDeleteParsed = true; }
+        return apiDelete;
+      },
+      find: () => {
+        if (!findParsed) { find = parseFind(command); findParsed = true; }
+        return find;
+      },
+      rmRecursive: () => (rmRecursive ??= isCommand(command, 'rm') && hasRecursiveFlag(command.argv)),
+      targets: () => (targets ??= commandTargets(command)),
+      git: () => {
+        if (!gitParsed) { git = parseGitCommand(command); gitParsed = true; }
+        return git;
+      },
+      gitFine: () => {
+        if (!fineGitParsed) { fineGit = gitRule(command); fineGitParsed = true; }
+        return fineGit;
+      },
+      pushDeletesTrunk: () => {
+        if (!pushTrunkParsed) { pushTrunk = pushDeletesTrunk(command, ctx); pushTrunkParsed = true; }
+        return pushTrunk;
+      },
+      hardResetRef: () => {
+        if (!resetRefParsed) { resetRef = hardResetRef(command); resetRefParsed = true; }
+        return resetRef;
+      },
+      resetIsTrunk: (ref) => {
+        let cached = resetTrunkByRef.get(ref);
+        if (cached === undefined) {
+          cached = resetRefIsTrunk(ref, command, ctx);
+          resetTrunkByRef.set(ref, cached);
+        }
+        return cached;
+      },
+    };
+    byCommand.set(command, existing);
+    return existing;
+  };
+}
+
+// Rule arrays are frozen; individual descriptors keep a configurable .match
+// method so node:test mocks can assert disabled matchers never execute.
+/** @type {readonly CommandPolicyRule[]} */
+export const HARD_COMMAND_RULES = Object.freeze([
+  {
+    ruleId: 'bd-profile-write',
+    match(_command, state) {
+      const bd = state.bd();
+      if (!bd || (!bd.profileWrite && !state.exportsBeadsProfile())) return null;
+      return {
+        ruleId: 'bd-profile-write', evaluation: 'matched', detail: 'bd profiling 写文件',
+        why: 'bd 在沙盒外执行，profiling 可写任意文件；请交给用户在普通终端运行。',
+      };
+    },
+  },
+  {
+    ruleId: 'bd-forbidden-subcommand',
+    match(_command, state) {
+      const bd = state.bd();
+      if (!bd || (bd.subcommand !== null && !BD_FORBIDDEN.has(bd.subcommand ?? ''))) return null;
+      return {
+        ruleId: 'bd-forbidden-subcommand', evaluation: bd.subcommand === null ? 'unknown' : 'matched',
+        detail: 'bd 禁止的子命令或子命令无法静态确定',
+        why: '这些子命令会重建本地库、写 ~/.claude、装会在沙盒外执行的 git hook、改 server 连接；请交给用户在普通终端运行。未知 flag 或动态子命令也必须拒绝。',
+      };
+    },
+  },
+  {
+    ruleId: 'org-ruleset-write',
+    match(command) {
+      const orgWrite = orgRulesetWrite(command);
+      if (!orgWrite) return null;
       return {
         ruleId: 'org-ruleset-write', evaluation: orgWrite.kind,
         detail: `修改 org-level ruleset（${trunc(orgWrite.endpoint)}）`,
@@ -930,128 +1053,152 @@ function hardPolicy(graph, enabled, ctx) {
           ? 'endpoint 或写入方法无法静态还原，可能隐藏组织级 ruleset 写入；按全局约定必须拒绝。改法：endpoint 写成字面量（如 repos/<owner>/<repo>/pulls/1/comments），不要整段放在变量里。'
           : '按全局约定，组织级分支保护规则只能由人在 GitHub UI 修改，AI/CLI 一律不得写入。需要变更时把改动内容写清楚交给用户手动操作。',
       };
-    }
-
-    if (enabled('gh-repo-delete') && ghRepoDelete(command)) {
+    },
+  },
+  {
+    ruleId: 'gh-repo-delete',
+    match(command) {
+      if (!ghRepoDelete(command)) return null;
       return {
         ruleId: 'gh-repo-delete', evaluation: 'matched',
         detail: `删除 GitHub 仓库：${trunc(displayCommand(command))}`,
         why: '仓库删除不可恢复（issue、PR、release 一并消失）。需要删除时把仓库名交给用户在 GitHub UI 操作。',
       };
-    }
-
-    const apiDelete = ghApiDelete(command);
-    if (apiDelete?.level === 'protected' && enabled('gh-api-delete-protected')) {
+    },
+  },
+  {
+    ruleId: 'gh-api-delete-protected',
+    match(_command, state) {
+      const apiDelete = state.apiDelete();
+      if (apiDelete?.level !== 'protected') return null;
       return {
         ruleId: 'gh-api-delete-protected', evaluation: apiDelete.evaluation,
         detail: `GitHub API 删除仓库、ruleset、分支保护或主干 ref（${trunc(apiDelete.endpoint)}）`,
         why: '这些对象删除后无法从 API 恢复，且会解除仓库的保护边界。需要变更时交给用户在 GitHub UI 操作。',
       };
-    }
-
-    const rmRecursive = isCommand(command, 'rm') && hasRecursiveFlag(command.argv);
-    const find = parseFind(command);
-    if (findDeletesGitDir(find) && enabled('rm-git-dir')) {
-      return {
-        ruleId: 'rm-git-dir', evaluation: 'matched',
-        detail: `find 删除 git 元数据目录：${trunc(displayCommand(command))}`,
-        why: '删除 .git 会丢掉全部本地提交、分支、stash 和 reflog，无法从工作区恢复。确需重建仓库请交给用户。',
-      };
-    }
-    const findSource = find?.deletes ? find : xargsRmSource(command, graph);
-    if (findSource && enabled('rm-protected-root')) {
-      /** @type {{target: TargetWord, evaluation: 'matched'|'unknown'}|null} */
-      let hit = null;
-      const evaluation = acrossCwds(cwds, (directory) => {
-        const found = findHitsProtected(findSource, ctx.protectedRoots, directory);
-        if (found) hit ??= found;
-        return found?.evaluation ?? null;
-      });
-      if (hit && evaluation) {
-        hit = { target: /** @type {{target: TargetWord}} */ (hit).target, evaluation };
-        return {
-          ruleId: 'rm-protected-root', evaluation: hit.evaluation,
-          detail: `${find ? 'find 删除' : 'find | xargs rm 删除'}范围覆盖受保护根目录：${trunc(displayCommand(command))}`,
-          why: '起点是受保护根目录或其上级，且名字条件可能选中受保护目录本身，执行后整棵树不可恢复。改法：起点写到具体子目录，或用 -name 精确限定。',
-        };
-      }
-    }
-    if (rmRecursive) {
-      const targets = commandTargets(command);
-      const gitDir = targets.find(targetIsGitDir);
-      if (gitDir && enabled('rm-git-dir')) {
+    },
+  },
+  {
+    ruleId: 'rm-git-dir',
+    match(command, state) {
+      if (findDeletesGitDir(state.find())) {
         return {
           ruleId: 'rm-git-dir', evaluation: 'matched',
-          detail: `递归删除 git 元数据目录 ${gitDir.display}`,
-          why: '删除 .git（或其中的 objects/refs 等）会丢掉本地提交、分支、stash 和 reflog，无法从工作区恢复。确需重建仓库请交给用户。',
+          detail: `find 删除 git 元数据目录：${trunc(displayCommand(command))}`,
+          why: '删除 .git 会丢掉全部本地提交、分支、stash 和 reflog，无法从工作区恢复。确需重建仓库请交给用户。',
         };
       }
-      /** @type {{target: {display: string}, evaluation: 'matched'|'unknown'}|null} */
-      let hit = null;
-      for (const target of targets) {
-        const evaluation = acrossCwds(cwds, (directory) =>
-          targetHitsProtected(target, ctx.protectedRoots, directory, { ancestors: true, dynamicMatches: true, dialect }));
-        if (evaluation) { hit = { target, evaluation }; if (evaluation === 'matched') break; }
-      }
-      if (hit && enabled('rm-protected-root')) {
-        return {
-          ruleId: 'rm-protected-root', evaluation: hit.evaluation,
-          detail: `递归删除 ${hit.target.display}（受保护根目录或其上级）`,
-          why: hit.evaluation === 'matched'
-            ? '一旦执行整个目录树不可恢复、影响面过大。若确需清理，请改用指向具体子目录的精确路径。'
-            : '递归删除目标无法静态确定（变量、通配符，或相对路径而 cwd 不可信——例如前面有 cd），可能落在受保护根目录上，必须拒绝。改法：把目标写成字面绝对路径，不要在同一条命令里 cd。',
-        };
-      }
-    }
-
-    // `git worktree remove` deletes the worktree directory, ignored files
-    // included; on a protected root that is a recursive delete.
-    const worktreeGit = parseGitCommand(command);
-    if (worktreeGit?.subcommand === 'worktree' && worktreeGit.args[0] === 'remove' && enabled('rm-protected-root')) {
-      /** @type {TargetWord|null} */
-      let removed = null;
-      const evaluation = acrossCwds(cwds, (directory) => {
-        let result = /** @type {'matched'|'unknown'|null} */ (null);
-        for (const target of relocatingTargets(command, directory)) {
-          // A dynamic target is not judged: worktree remove refuses the main
-          // worktree and only deletes registered linked worktrees.
-          const hit = targetHitsProtected(target, ctx.protectedRoots, target.base, { ancestors: true, dynamicMatches: false, dialect });
-          if (hit) { removed ??= target; result = result === 'matched' ? result : hit; }
+      if (!state.rmRecursive()) return null;
+      const gitDir = state.targets().find(targetIsGitDir);
+      if (!gitDir) return null;
+      return {
+        ruleId: 'rm-git-dir', evaluation: 'matched',
+        detail: `递归删除 git 元数据目录 ${gitDir.display}`,
+        why: '删除 .git（或其中的 objects/refs 等）会丢掉本地提交、分支、stash 和 reflog，无法从工作区恢复。确需重建仓库请交给用户。',
+      };
+    },
+  },
+  {
+    ruleId: 'rm-protected-root',
+    match(command, state, ctx, graph) {
+      const dialect = command.dialect;
+      const find = state.find();
+      const findSource = find?.deletes ? find : xargsRmSource(command, graph);
+      if (findSource) {
+        /** @type {{target: TargetWord, evaluation: 'matched'|'unknown'}|null} */
+        let hit = null;
+        const evaluation = acrossCwds(state.cwds(), (directory) => {
+          const found = findHitsProtected(findSource, ctx.protectedRoots, directory);
+          if (found) hit ??= found;
+          return found?.evaluation ?? null;
+        });
+        if (hit && evaluation) {
+          hit = { target: /** @type {{target: TargetWord}} */ (hit).target, evaluation };
+          return {
+            ruleId: 'rm-protected-root', evaluation: hit.evaluation,
+            detail: `${find ? 'find 删除' : 'find | xargs rm 删除'}范围覆盖受保护根目录：${trunc(displayCommand(command))}`,
+            why: '起点是受保护根目录或其上级，且名字条件可能选中受保护目录本身，执行后整棵树不可恢复。改法：起点写到具体子目录，或用 -name 精确限定。',
+          };
         }
-        return result;
-      });
-      if (evaluation && removed) {
-        return {
-          ruleId: 'rm-protected-root', evaluation,
-          detail: `git worktree remove 删除受保护根目录 ${/** @type {TargetWord} */ (removed).display}`,
-          why: 'worktree remove 会连同未跟踪和被忽略的文件删除整个 worktree 目录；目标是受保护根目录（或无法确定）时等同递归删除它。确需移除请交给用户。',
-        };
       }
-    }
 
-    const rsyncDelete = isCommand(command, 'rsync') && command.argv.some((arg) => typeof arg === 'string' && arg.startsWith('--delete'));
-    if (rsyncDelete && enabled('rm-protected-root')) {
-      const destination = commandTargets(command).at(-1);
-      const remote = typeof destination?.value === 'string' && /^[^/]*:/.test(destination.value);
-      const evaluation = destination && !remote
-        ? acrossCwds(cwds, (directory) =>
-          targetHitsProtected(destination, ctx.protectedRoots, directory, { ancestors: true, dynamicMatches: true, dialect }))
-        : null;
-      if (destination && evaluation) {
-        return {
-          ruleId: 'rm-protected-root', evaluation,
-          detail: `rsync --delete 的目标覆盖受保护根目录 ${destination.display}`,
-          why: 'rsync --delete 会删除目标里源端没有的一切，目标是受保护根目录或其上级时等于清空整棵树。改法：目标写到具体子目录。',
-        };
+      if (state.rmRecursive()) {
+        const cwds = state.cwds();
+        /** @type {{target: {display: string}, evaluation: 'matched'|'unknown'}|null} */
+        let hit = null;
+        for (const target of state.targets()) {
+          const evaluation = acrossCwds(cwds, (directory) =>
+            targetHitsProtected(target, ctx.protectedRoots, directory, { ancestors: true, dynamicMatches: true, dialect }));
+          if (evaluation) { hit = { target, evaluation }; if (evaluation === 'matched') break; }
+        }
+        if (hit) {
+          return {
+            ruleId: 'rm-protected-root', evaluation: hit.evaluation,
+            detail: `递归删除 ${hit.target.display}（受保护根目录或其上级）`,
+            why: hit.evaluation === 'matched'
+              ? '一旦执行整个目录树不可恢复、影响面过大。若确需清理，请改用指向具体子目录的精确路径。'
+              : '递归删除目标无法静态确定（变量、通配符，或相对路径而 cwd 不可信——例如前面有 cd），可能落在受保护根目录上，必须拒绝。改法：把目标写成字面绝对路径，不要在同一条命令里 cd。',
+          };
+        }
       }
-    }
 
-    const lnForce = isCommand(command, 'ln') && command.argv.some((arg) => typeof arg === 'string' &&
-      (isLongOption(arg, '--force') || shortOptionHas(arg, /f/)));
-    if (ctx.protectedPaths.length && enabled('rm-protected-path') &&
-        (isCommand(command, 'rm') || isCommand(command, 'unlink') || isCommand(command, 'mv') || lnForce)) {
-      const ancestors = rmRecursive || isCommand(command, 'mv');
-      const targets = lnForce ? commandTargets(command).slice(-1) : commandTargets(command);
+      // `git worktree remove` deletes the worktree directory, ignored files
+      // included; on a protected root that is a recursive delete.
+      const worktreeGit = state.git();
+      if (worktreeGit?.subcommand === 'worktree' && worktreeGit.args[0] === 'remove') {
+        /** @type {TargetWord|null} */
+        let removed = null;
+        const evaluation = acrossCwds(state.cwds(), (directory) => {
+          let result = /** @type {'matched'|'unknown'|null} */ (null);
+          for (const target of relocatingTargets(command, directory)) {
+            // A dynamic target is not judged: worktree remove refuses the main
+            // worktree and only deletes registered linked worktrees.
+            const hit = targetHitsProtected(target, ctx.protectedRoots, target.base, { ancestors: true, dynamicMatches: false, dialect });
+            if (hit) { removed ??= target; result = result === 'matched' ? result : hit; }
+          }
+          return result;
+        });
+        if (evaluation && removed) {
+          return {
+            ruleId: 'rm-protected-root', evaluation,
+            detail: `git worktree remove 删除受保护根目录 ${/** @type {TargetWord} */ (removed).display}`,
+            why: 'worktree remove 会连同未跟踪和被忽略的文件删除整个 worktree 目录；目标是受保护根目录（或无法确定）时等同递归删除它。确需移除请交给用户。',
+          };
+        }
+      }
+
+      const rsyncDelete = isCommand(command, 'rsync') && command.argv.some((arg) => typeof arg === 'string' && arg.startsWith('--delete'));
+      if (rsyncDelete) {
+        const destination = state.targets().at(-1);
+        const remote = typeof destination?.value === 'string' && /^[^/]*:/.test(destination.value);
+        const evaluation = destination && !remote
+          ? acrossCwds(state.cwds(), (directory) =>
+            targetHitsProtected(destination, ctx.protectedRoots, directory, { ancestors: true, dynamicMatches: true, dialect }))
+          : null;
+        if (destination && evaluation) {
+          return {
+            ruleId: 'rm-protected-root', evaluation,
+            detail: `rsync --delete 的目标覆盖受保护根目录 ${destination.display}`,
+            why: 'rsync --delete 会删除目标里源端没有的一切，目标是受保护根目录或其上级时等于清空整棵树。改法：目标写到具体子目录。',
+          };
+        }
+      }
+      return null;
+    },
+  },
+  {
+    ruleId: 'rm-protected-path',
+    match(command, state, ctx) {
+      if (!ctx.protectedPaths.length) return null;
+      const lnForce = isCommand(command, 'ln') && command.argv.some((arg) => typeof arg === 'string' &&
+        (isLongOption(arg, '--force') || shortOptionHas(arg, /f/)));
+      if (!isCommand(command, 'rm') && !isCommand(command, 'unlink') && !isCommand(command, 'mv') && !lnForce) {
+        return null;
+      }
+      const ancestors = state.rmRecursive() || isCommand(command, 'mv');
+      const targets = lnForce ? state.targets().slice(-1) : state.targets();
+      const cwds = state.cwds();
+      const dialect = command.dialect;
       for (const target of targets) {
         const evaluation = acrossCwds(cwds, (directory) =>
           targetHitsProtected(target, ctx.protectedPaths, directory, { ancestors, dynamicMatches: false, dialect }));
@@ -1062,10 +1209,14 @@ function hardPolicy(graph, enabled, ctx) {
           why: '该路径在 protectedPaths 中（通常是兼容链接或共享数据入口），删除或移动会让依赖它的脚本和会话失效。确需调整请交给用户。',
         };
       }
-    }
-
-    const clean = gitCleanRoot(command, ctx);
-    if (clean && enabled('git-clean-root')) {
+      return null;
+    },
+  },
+  {
+    ruleId: 'git-clean-root',
+    match(command, _state, ctx) {
+      const clean = gitCleanRoot(command, ctx);
+      if (!clean) return null;
       const reasons = {
         'double-force': '`git clean -ff` 会连嵌套仓库（成员仓、.worktrees、data 防清理盾）一起删除。',
         dynamic: 'git clean 参数里有无法静态还原的值，可能带第二个 -f。',
@@ -1077,35 +1228,56 @@ function hardPolicy(graph, enabled, ctx) {
         detail: `git clean 可能清掉项目根或嵌套仓库：${trunc(displayCommand(command))}`,
         why: `${reasons[clean.reason]}改法：到具体成员仓里执行单个 -f 的 git clean，或手动删除明确路径。`,
       };
-    }
-
-    if (pushMirror(command) && enabled('force-push-main')) {
-      return {
-        ruleId: 'force-push-main', evaluation: 'matched',
-        detail: `push --mirror 强制同步全部 refs（${trunc(displayCommand(command))}）`,
-        why: '--mirror 会强制覆盖远端所有分支（含 main/master）并删除远端独有的 refs，等同于对主干 force push；主干改动请走 PR 流程。',
-      };
-    }
-
-    if (forcePush(command)) {
-      const target = forcePushTarget(command, ctx);
-      if (target && enabled('force-push-main')) {
+    },
+  },
+  {
+    ruleId: 'force-push-main',
+    match(command, _state, ctx) {
+      if (pushMirror(command)) {
         return {
-          ruleId: 'force-push-main', evaluation: target,
-          detail: `force push 到 main/master（${trunc(displayCommand(command))}，含 --force-with-lease / +refspec / HEAD 形式）`,
-          why: target === 'matched'
-            ? '会重写 main/master 的提交历史，其他人基于旧历史的工作会被破坏；主干改动请走 PR 流程。'
-            : 'force push 的目标 ref 无法静态确定（refspec 是变量、HEAD 处于 detached 或读不到、或当前分支的上游是主干），可能是 main/master，必须拒绝。改法：写显式 refspec（如 git push --force-with-lease origin feat/x），即可交给宿主审批。',
+          ruleId: 'force-push-main', evaluation: 'matched',
+          detail: `push --mirror 强制同步全部 refs（${trunc(displayCommand(command))}）`,
+          why: '--mirror 会强制覆盖远端所有分支（含 main/master）并删除远端独有的 refs，等同于对主干 force push；主干改动请走 PR 流程。',
         };
       }
-    }
-
-    if (pushDeletesTrunk(command, ctx) === 'matched' && enabled('push-delete-trunk')) {
+      if (!forcePush(command)) return null;
+      const target = forcePushTarget(command, ctx);
+      if (!target) return null;
+      return {
+        ruleId: 'force-push-main', evaluation: target,
+        detail: `force push 到 main/master（${trunc(displayCommand(command))}，含 --force-with-lease / +refspec / HEAD 形式）`,
+        why: target === 'matched'
+          ? '会重写 main/master 的提交历史，其他人基于旧历史的工作会被破坏；主干改动请走 PR 流程。'
+          : 'force push 的目标 ref 无法静态确定（refspec 是变量、HEAD 处于 detached 或读不到、或当前分支的上游是主干），可能是 main/master，必须拒绝。改法：写显式 refspec（如 git push --force-with-lease origin feat/x），即可交给宿主审批。',
+      };
+    },
+  },
+  {
+    ruleId: 'push-delete-trunk',
+    match(command, state) {
+      if (state.pushDeletesTrunk() !== 'matched') return null;
       return {
         ruleId: 'push-delete-trunk', evaluation: 'matched',
         detail: `删除远端主干分支：${trunc(displayCommand(command))}`,
         why: '删除远端 main/master 会让所有协作者和 CI 失去主干；主干只能由人处理。',
       };
+    },
+  },
+]);
+
+/**
+ * @param {ShellGraph} graph @param {PolicyEnabled} enabled
+ * @param {(command: AnalyzedCommand) => CommandEvalState} stateFor
+ * @param {RuleContext} ctx @returns {PolicyMatch|null}
+ */
+function hardPolicy(graph, enabled, stateFor, ctx) {
+  const active = HARD_COMMAND_RULES.filter((rule) => enabled(rule.ruleId));
+  if (active.length === 0) return null;
+  for (const command of graph.commands) {
+    const state = stateFor(command);
+    for (const rule of active) {
+      const matched = rule.match(command, state, ctx, graph);
+      if (matched) return matched;
     }
   }
   return null;
@@ -1260,19 +1432,102 @@ const GIT_RULE_TEXT = {
   },
 };
 
-/** @param {ShellGraph} graph @param {PolicyEnabled} enabled @param {RuleContext} ctx @returns {PolicyMatch|null} */
-function confirmationPolicy(graph, enabled, ctx) {
-  for (const command of graph.commands) {
-    const tool = commandName(command);
-    const bd = parseBdCommand(command);
-    // A null subcommand never reaches here: hardPolicy denies it first via bd-forbidden-subcommand.
-    // A dynamic option word may be --mem-profile/--fix/--directory: confirm even for
-    // read-only verbs. This is ask-level rather than deny so `bd create "$TITLE"` keeps working.
-    if (bd?.dynamicOption && enabled('bd-repo-hooks')) return {
-      ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 参数里有无法静态确定的选项',
-      why: 'bd 在沙盒外运行，动态参数可能展开成 --mem-profile、--fix 或 --directory 等选项，无法静态确定，请确认。',
-    };
-    if (bd && !bd.readOnly && enabled('bd-repo-hooks')) {
+/** @typedef {keyof typeof GIT_RULE_TEXT} GitFineRuleId */
+
+/** @type {Record<GitFineRuleId, ReadonlySet<string>>} */
+const GIT_RULE_SUBCOMMANDS = {
+  'git-discard': new Set(['clean', 'reset', 'restore', 'rm', 'checkout', 'worktree', 'stash', 'tag', 'switch']),
+  'git-trunk-ref': new Set(['checkout', 'worktree', 'branch', 'switch']),
+  'git-ref-change': new Set(['checkout', 'worktree', 'branch', 'switch', 'lfs', 'push']),
+  'git-config-global': new Set(['config']),
+  'git-lfs': new Set(['lfs']),
+  'git-exec': new Set(['submodule', 'rebase']),
+  'git-push-bulk': new Set(['push']),
+  'git-low-risk': new Set(['checkout', 'branch', 'tag', 'switch', 'submodule']),
+};
+
+/** @param {GitFineRuleId} ruleId @returns {CommandPolicyRule} */
+function createGitFineRule(ruleId) {
+  const subcommands = GIT_RULE_SUBCOMMANDS[ruleId];
+  const text = GIT_RULE_TEXT[ruleId];
+  return {
+    ruleId,
+    match(command, state) {
+      const git = state.git();
+      if (!git || !subcommands.has(git.subcommand ?? '')) return null;
+      if (ruleId === 'git-discard' && git.subcommand === 'reset') {
+        const resetRef = state.hardResetRef();
+        // An explicit non-trunk remote/upstream reset belongs to reset-hard-remote
+        // and must stay shielded from generic git-discard when reset-hard-remote is disabled.
+        if (typeof resetRef === 'string' && isRemoteResetRef(resetRef) && !state.resetIsTrunk(resetRef)) {
+          return null;
+        }
+      }
+      if (state.gitFine() !== ruleId) return null;
+      return {
+        ruleId, evaluation: 'matched',
+        detail: `${text.detail}：${trunc(displayCommand(command))}`,
+        why: text.why,
+      };
+    },
+  };
+}
+
+/** @type {readonly StagePolicyRule[]} */
+export const STAGE_RULES = Object.freeze([
+  {
+    ruleId: 'bypass-no-project-sandbox',
+    match(analysis, ctx, rawCommand) {
+      const project = projectInfo(ctx);
+      if (project?.sandboxConfigured || isReadOnlyGraph(analysis)) return null;
+      const where = ctx.projectDir ?? project?.gitRoot ?? ctx.cwd ?? '(hook 未提供 cwd)';
+      return {
+        kind: 'deny', evaluation: 'matched', ruleId: 'bypass-no-project-sandbox',
+        detail: `bypass 会话所在项目（${where}）没有项目沙盒配置，拒绝写类命令：${trunc(rawCommand)}`,
+        why: 'bypass 只能在配好项目沙盒的项目里用；先配 .claude/settings.json 或切 auto。（判定：会话启动目录 CLAUDE_PROJECT_DIR——没有时用 cwd 所在 git 根——的 .claude/settings.json + settings.local.json 需未禁用沙盒且 sandbox.filesystem.allowWrite 非空，linked worktree 还会读主 worktree；只写 sandbox.enabled: true 不算；/tmp、scratchpad 不算项目。只读命令不受影响。）',
+      };
+    },
+  },
+  {
+    ruleId: 'shell-analysis-unknown',
+    match(analysis, _ctx, rawCommand) {
+      if (analysis.status !== 'unknown') return null;
+      const reasons = analysis.unknowns.map((item) => item.reason).join(', ') || 'unknown';
+      const hardUnknownReasons = new Set(['dynamic-command', 'dynamic-evaluator', 'input-too-large', 'recursion-limit', 'command-limit']);
+      const kind = analysis.unknowns.some((item) => hardUnknownReasons.has(item.reason)) ? 'deny' : 'confirm';
+      return {
+        kind, evaluation: 'unknown', ruleId: 'shell-analysis-unknown',
+        detail: `shell 结构无法静态确认（${reasons}）：${trunc(rawCommand)}`,
+        why: kind === 'deny'
+          ? '无法证明动态执行内容没有隐藏硬禁区，guard 按 fail-closed 拒绝。'
+          : 'parser 无法确认执行结构，需要外部确认后再继续。',
+      };
+    },
+  },
+  {
+    ruleId: 'unsandboxed-outside-project',
+    match(analysis, ctx) {
+      const outside = unsandboxedOutsideProject(analysis, ctx);
+      return outside ? { kind: 'confirm', ...outside } : null;
+    },
+  },
+]);
+
+/** @type {readonly CommandPolicyRule[]} */
+export const CONFIRMATION_COMMAND_RULES = Object.freeze([
+  {
+    ruleId: 'bd-repo-hooks',
+    match(_command, state) {
+      const bd = state.bd();
+      if (!bd) return null;
+      // A null subcommand never reaches here: hardPolicy denies it first via bd-forbidden-subcommand.
+      // A dynamic option word may be --mem-profile/--fix/--directory: confirm even for
+      // read-only verbs. This is ask-level rather than deny so `bd create "$TITLE"` keeps working.
+      if (bd.dynamicOption) return {
+        ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 参数里有无法静态确定的选项',
+        why: 'bd 在沙盒外运行，动态参数可能展开成 --mem-profile、--fix 或 --directory 等选项，无法静态确定，请确认。',
+      };
+      if (bd.readOnly) return null;
       // A dynamic -C/--directory target cannot be inspected; it may point at a hooked
       // repository, so it needs the same confirmation as a literal hooked path.
       if (bd.directory === null) return {
@@ -1280,7 +1535,7 @@ function confirmationPolicy(graph, enabled, ctx) {
         why: 'bd 在沙盒外运行，-C 指向的目录可能有 .beads/hooks（沙盒外任意代码），目录无法静态确定，请确认。',
       };
       const target = bd.directory;
-      const cwds = ctx.cwdsFor(command);
+      const cwds = state.cwds();
       // `BEADS_DIR=… bd create` selects that workspace regardless of cwd/-C. Only the
       // command's own assignment is modelled; an inherited process BEADS_DIR is not.
       if (bd.beadsDir !== undefined) {
@@ -1295,14 +1550,15 @@ function confirmationPolicy(graph, enabled, ctx) {
           ruleId: 'bd-repo-hooks', evaluation: 'matched', detail: 'bd 执行 BEADS_DIR 库里的 hooks 脚本',
           why: 'bd 在沙盒外运行，BEADS_DIR 库里的 hooks 等同沙盒外任意代码，请确认这些脚本可信。',
         };
+        return null;
       }
       // Unknown cwd (`cd "$DIR" && bd create`) with no absolute -C: the effective directory
       // cannot be inspected, so confirm rather than assume no hooks.
-      else if ((target === undefined || !isAbsolute(target)) && cwds.some((cwd) => !cwd)) return {
+      if ((target === undefined || !isAbsolute(target)) && cwds.some((cwd) => !cwd)) return {
         ruleId: 'bd-repo-hooks', evaluation: 'unknown', detail: 'bd 的工作目录无法静态确定',
         why: 'bd 在沙盒外运行，工作目录无法静态确定，可能落在有 .beads/hooks 的仓库，请确认。',
       };
-      else if (cwds.some((cwd) => {
+      if (cwds.some((cwd) => {
         const directory = target === undefined ? cwd
           : isAbsolute(target) ? target : cwd ? resolve(cwd, target) : null;
         return hasBeadsHooks(directory);
@@ -1310,9 +1566,16 @@ function confirmationPolicy(graph, enabled, ctx) {
         ruleId: 'bd-repo-hooks', evaluation: 'matched', detail: 'bd 执行项目 .beads/hooks 脚本',
         why: 'bd 在沙盒外运行，项目 hooks 等同沙盒外任意代码，请确认这些脚本可信。',
       };
-    }
-
-    if (enabled('remote-exec') && ['ssh', 'scp', 'rsync'].includes(tool) && (tool === 'rsync' || !hasFlag(command.argv, '-G'))) {
+      return null;
+    },
+  },
+  {
+    ruleId: 'remote-exec',
+    match(command) {
+      const tool = commandName(command);
+      if (!['ssh', 'scp', 'rsync'].includes(tool) || (tool !== 'rsync' && hasFlag(command.argv, '-G'))) {
+        return null;
+      }
       if (tool === 'ssh') {
         const { host, rest } = parseSsh(command);
         return {
@@ -1326,128 +1589,193 @@ function confirmationPolicy(graph, enabled, ctx) {
         detail: `用 ${tool} 在本机与远程之间传输/同步文件：${trunc(effectiveDisplayArgv(command).slice(1).join(' '))}`,
         why: '传输会覆盖目标路径的同名文件，请确认方向（谁覆盖谁）和路径。',
       };
-    }
-
-    if (enabled('recursive-delete') && isCommand(command, 'rm') && hasRecursiveFlag(command.argv)) {
-      const targets = commandTargets(command).map((target) => target.display).join(' ');
+    },
+  },
+  {
+    ruleId: 'recursive-delete',
+    match(_command, state) {
+      if (!state.rmRecursive()) return null;
+      const targets = state.targets().map((target) => target.display).join(' ');
       return {
         ruleId: 'recursive-delete', evaluation: 'matched',
         detail: `递归删除：${trunc(targets) || '(未解析出目标)'}`,
         why: '删除不可逆，请确认路径正确、通配符不会扩大到预期之外。',
       };
-    }
-
-    if (enabled('force-push') && forcePush(command)) {
+    },
+  },
+  {
+    ruleId: 'force-push',
+    match(command) {
+      if (!forcePush(command)) return null;
       return {
         ruleId: 'force-push', evaluation: 'matched',
         detail: `force push：${trunc(displayCommand(command))}`,
         why: '会覆盖远端分支历史，协作者基于旧历史的提交会被破坏，请确认分支正确且无人依赖旧历史。',
       };
-    }
-
-    const sqlCommand = ['psql', 'mysql', 'mysqlsh', 'sqlite3'].includes(commandName(command));
-    const sql = sqlCommand && command.argv.find((arg) => typeof arg === 'string' &&
-      /(?:DROP\s+(?:TABLE|DATABASE|SCHEMA)|TRUNCATE\s+(?:TABLE\s+)?\w+)/i.test(arg));
-    if (typeof sql === 'string' && enabled('destructive-sql')) {
+    },
+  },
+  {
+    ruleId: 'destructive-sql',
+    match(command) {
+      if (!isSqlCommand(command)) return null;
+      const sql = command.argv.find((arg) => typeof arg === 'string' &&
+        /(?:DROP\s+(?:TABLE|DATABASE|SCHEMA)|TRUNCATE\s+(?:TABLE\s+)?\w+)/i.test(arg));
+      if (typeof sql !== 'string') return null;
       const match = sql.match(/(?:DROP\s+(?:TABLE|DATABASE|SCHEMA)|TRUNCATE\s+(?:TABLE\s+)?\w+)[^;]*/i);
       return {
         ruleId: 'destructive-sql', evaluation: 'matched',
         detail: `执行破坏性 SQL：${trunc(match?.[0] ?? sql)}`,
         why: '表结构或数据会被删除且通常没有回收站，请确认目标库和表名。',
       };
-    }
-    const dynamicSql = sqlCommand &&
-      command.argv.some((arg, index) => (arg === '-c' || arg === '-e') && command.argv[index + 1] === null);
-    const dynamicSqlitePositional = isCommand(command, 'sqlite3') &&
-      commandTargets(command).slice(1).some((target) => target.value === null);
-    if ((dynamicSql || dynamicSqlitePositional) && enabled('dynamic-sql')) {
+    },
+  },
+  {
+    ruleId: 'dynamic-sql',
+    match(command, state) {
+      const dynamicSql = isSqlCommand(command) &&
+        command.argv.some((arg, index) => (arg === '-c' || arg === '-e') && command.argv[index + 1] === null);
+      const dynamicSqlitePositional = isCommand(command, 'sqlite3') &&
+        state.targets().slice(1).some((target) => target.value === null);
+      if (!dynamicSql && !dynamicSqlitePositional) return null;
       return {
         ruleId: 'dynamic-sql', evaluation: 'unknown',
         detail: '执行内容无法静态还原的 SQL',
         why: 'SQL 执行参数是动态值，无法确认是否包含 DROP/TRUNCATE，需要人工确认。',
       };
-    }
-
-    if (enabled('chmod-777') && isCommand(command, 'chmod') && command.argv.some((arg) => arg === '777' || arg === '0777')) {
+    },
+  },
+  {
+    ruleId: 'chmod-777',
+    match(command, state) {
+      if (!isCommand(command, 'chmod') || !command.argv.some((arg) => arg === '777' || arg === '0777')) {
+        return null;
+      }
       return {
         ruleId: 'chmod-777', evaluation: 'matched',
-        detail: `把 ${trunc(commandTargets(command).map((target) => target.display).join(' ')) || '目标文件'} 的权限改为 777（所有用户可读写执行）`,
+        detail: `把 ${trunc(state.targets().map((target) => target.display).join(' ')) || '目标文件'} 的权限改为 777（所有用户可读写执行）`,
         why: '会移除文件的访问保护，请确认确有必要、范围没有过大。',
       };
-    }
-
-    const apiDelete = ghApiDelete(command);
-    if (apiDelete?.level === 'sensitive' && enabled('gh-api-delete-sensitive')) {
+    },
+  },
+  {
+    ruleId: 'gh-api-delete-sensitive',
+    match(_command, state) {
+      const apiDelete = state.apiDelete();
+      if (apiDelete?.level !== 'sensitive') return null;
       return {
         ruleId: 'gh-api-delete-sensitive', evaluation: 'matched',
         detail: `GitHub API 删除部署密钥、webhook、Actions secret 或 environment（${trunc(apiDelete.endpoint)}）`,
         why: '这些配置删除后需要重新生成或找回凭据，CI/部署会立即失效，请确认目标。',
       };
-    }
-    if (apiDelete?.level === 'other' && enabled('gh-api-delete')) {
+    },
+  },
+  {
+    ruleId: 'gh-api-delete',
+    match(command, state) {
+      const apiDelete = state.apiDelete();
+      if (apiDelete?.level !== 'other') return null;
       return {
         ruleId: 'gh-api-delete', evaluation: 'matched',
         detail: `GitHub API 删除操作：${trunc(displayCommand(command))}`,
         why: 'GitHub API DELETE 通常不可恢复，请确认 endpoint 与目标资源无误。',
       };
-    }
-
-    if (pushDeletesTrunk(command, ctx) === 'unknown' && enabled('push-delete-dynamic')) {
+    },
+  },
+  {
+    ruleId: 'push-delete-dynamic',
+    match(command, state) {
+      if (state.pushDeletesTrunk() !== 'unknown') return null;
       return {
         ruleId: 'push-delete-dynamic', evaluation: 'unknown',
         detail: `删除远端分支，但目标无法静态确定：${trunc(displayCommand(command))}`,
         why: '远端删除的目标 ref 是变量，可能是 main/master；请确认展开后的分支名。改法：把分支名写成字面量。',
       };
-    }
+    },
+  },
+  {
+    ruleId: 'reset-hard-main',
+    match(_command, state) {
+      const resetRef = state.hardResetRef();
+      if (typeof resetRef !== 'string' || !state.resetIsTrunk(resetRef)) return null;
+      return {
+        ruleId: 'reset-hard-main', evaluation: 'matched',
+        detail: `把当前分支硬重置到 ${resetRef}`,
+        why: '本地未推送的提交和工作区改动会被丢弃，请先确认没有需要保留的工作。',
+      };
+    },
+  },
+  {
+    ruleId: 'reset-hard-remote',
+    match(_command, state) {
+      const resetRef = state.hardResetRef();
+      if (typeof resetRef !== 'string' || !isRemoteResetRef(resetRef) || state.resetIsTrunk(resetRef)) return null;
+      return {
+        ruleId: 'reset-hard-remote', evaluation: 'matched',
+        detail: `把当前分支硬重置到 ${resetRef}`,
+        why: '本地未推送的提交和工作区改动会被丢弃，请先确认没有需要保留的工作。',
+      };
+    },
+  },
+  createGitFineRule('git-discard'),
+  createGitFineRule('git-trunk-ref'),
+  createGitFineRule('git-ref-change'),
+  createGitFineRule('git-config-global'),
+  createGitFineRule('git-lfs'),
+  createGitFineRule('git-exec'),
+  createGitFineRule('git-push-bulk'),
+  createGitFineRule('git-low-risk'),
+]);
 
-    const resetRef = hardResetRef(command);
-    if (typeof resetRef === 'string') {
-      const trunk = resetRefIsTrunk(resetRef, command, ctx);
-      if (trunk || /^(?:origin\/|refs\/remotes\/|remotes\/)/.test(resetRef) || UPSTREAM_REF.test(resetRef)) {
-        const ruleId = trunk ? 'reset-hard-main' : 'reset-hard-remote';
-        if (enabled(ruleId)) {
+/** @type {readonly PipelinePolicyRule[]} */
+export const CONFIRMATION_PIPELINE_RULES = Object.freeze([
+  {
+    ruleId: 'curl-pipe-sh',
+    match(graph) {
+      /** @type {Map<number, AnalyzedCommand[]>} */
+      const pipelineGroups = new Map();
+      for (const command of graph.commands) {
+        if (command.pipelineGroup === null) continue;
+        const group = pipelineGroups.get(command.pipelineGroup) ?? [];
+        group.push(command);
+        pipelineGroups.set(command.pipelineGroup, group);
+      }
+      for (const commands of pipelineGroups.values()) {
+        const download = commands.find((command) => isCommand(command, 'curl') || isCommand(command, 'wget'));
+        const shell = commands.find((command) => ['sh', 'bash', 'zsh', 'dash'].includes(commandName(command)));
+        if (download && shell) {
+          const url = download.argv.find((arg) => typeof arg === 'string' && /^https?:\/\//.test(arg));
           return {
-            ruleId, evaluation: 'matched',
-            detail: `把当前分支硬重置到 ${resetRef}`,
-            why: '本地未推送的提交和工作区改动会被丢弃，请先确认没有需要保留的工作。',
+            ruleId: 'curl-pipe-sh', evaluation: 'matched',
+            detail: `下载远程脚本${typeof url === 'string' ? `（${trunc(url)}）` : ''}并直接交给 shell 执行`,
+            why: '脚本内容未经审查就以当前用户权限运行，请确认来源可信。',
           };
         }
-        // An explicit remote-ref reset is otherwise left to the host approval
-        // layer, as in 0.4; full enables reset-hard-remote above.
-        if (!trunk) continue;
+      }
+      return null;
+    },
+  },
+]);
+
+/**
+ * @param {ShellGraph} graph @param {PolicyEnabled} enabled
+ * @param {(command: AnalyzedCommand) => CommandEvalState} stateFor
+ * @param {RuleContext} ctx @returns {PolicyMatch|null}
+ */
+function confirmationPolicy(graph, enabled, stateFor, ctx) {
+  const activeCommands = CONFIRMATION_COMMAND_RULES.filter((rule) => enabled(rule.ruleId));
+  if (activeCommands.length > 0) {
+    for (const command of graph.commands) {
+      const state = stateFor(command);
+      for (const rule of activeCommands) {
+        const matched = rule.match(command, state, ctx, graph);
+        if (matched) return matched;
       }
     }
-
-    const fine = gitRule(command);
-    if (fine && enabled(fine)) {
-      const text = GIT_RULE_TEXT[fine];
-      return {
-        ruleId: fine, evaluation: 'matched',
-        detail: `${text.detail}：${trunc(displayCommand(command))}`,
-        why: text.why,
-      };
-    }
   }
-
-  /** @type {Map<number, AnalyzedCommand[]>} */
-  const pipelineGroups = new Map();
-  for (const command of graph.commands) {
-    if (command.pipelineGroup === null) continue;
-    const group = pipelineGroups.get(command.pipelineGroup) ?? [];
-    group.push(command);
-    pipelineGroups.set(command.pipelineGroup, group);
-  }
-  for (const commands of pipelineGroups.values()) {
-    const download = commands.find((command) => isCommand(command, 'curl') || isCommand(command, 'wget'));
-    const shell = commands.find((command) => ['sh', 'bash', 'zsh', 'dash'].includes(commandName(command)));
-    if (download && shell && enabled('curl-pipe-sh')) {
-      const url = download.argv.find((arg) => typeof arg === 'string' && /^https?:\/\//.test(arg));
-      return {
-        ruleId: 'curl-pipe-sh', evaluation: 'matched',
-        detail: `下载远程脚本${typeof url === 'string' ? `（${trunc(url)}）` : ''}并直接交给 shell 执行`,
-        why: '脚本内容未经审查就以当前用户权限运行，请确认来源可信。',
-      };
-    }
+  const activePipelines = CONFIRMATION_PIPELINE_RULES.filter((rule) => enabled(rule.ruleId));
+  for (const rule of activePipelines) {
+    const matched = rule.match(graph);
+    if (matched) return matched;
   }
   return null;
 }
@@ -1677,13 +2005,15 @@ function evaluate(event, options) {
   const tier = permissionTier(event.permission_mode ?? event.permissionMode, options.host ?? 'claude');
   const enabled = (/** @type {string} */ ruleId) => isPolicyEnabled(ruleId, profile, tier);
   const cwd = eventCwd(event);
-  const cwds = cwdModel(analysis, cwd);
+  /** @type {ReturnType<typeof cwdModel>|undefined} */
+  let cwds;
+  const ensureCwds = () => (cwds ??= cwdModel(analysis, cwd));
   /** @type {RuleContext} */
   const ctx = {
     tier,
     cwd,
-    trustedCwd: cwds.trusted,
-    cwdsFor: cwds.forCommand,
+    get trustedCwd() { return ensureCwds().trusted; },
+    cwdsFor: (item) => ensureCwds().forCommand(item),
     projectDir: typeof options.projectDir === 'string' && options.projectDir.startsWith('/') ? normalizePath(options.projectDir) : null,
     unsandboxed: toolInput.dangerouslyDisableSandbox === true,
     protectedRoots: options.protectedRoots ?? ['/'],
@@ -1691,8 +2021,9 @@ function evaluate(event, options) {
     inspect: memoizeInspector(options.inspectDirectory ?? ((directory) => inspectDirectory(directory))),
     inspectProject: memoizeInspector(options.inspectProjectDir ?? ((directory) => inspectProjectDir(directory))),
   };
+  const stateFor = createCommandStateFactory(analysis, ctx);
 
-  const hard = hardPolicy(analysis, enabled, ctx);
+  const hard = hardPolicy(analysis, enabled, stateFor, ctx);
   if (hard) return { kind: 'deny', command, description, analysis, ...hard };
 
   const infrastructureFailure = analysis.unknowns.find((item) =>
@@ -1705,35 +2036,13 @@ function evaluate(event, options) {
     };
   }
 
-  if (tier === 'bypass' && enabled('bypass-no-project-sandbox')) {
-    const project = projectInfo(ctx);
-    if (!project?.sandboxConfigured && !isReadOnlyGraph(analysis)) {
-      const where = ctx.projectDir ?? project?.gitRoot ?? cwd ?? '(hook 未提供 cwd)';
-      return {
-        kind: 'deny', evaluation: 'matched', ruleId: 'bypass-no-project-sandbox', command, description, analysis,
-        detail: `bypass 会话所在项目（${where}）没有项目沙盒配置，拒绝写类命令：${trunc(command)}`,
-        why: 'bypass 只能在配好项目沙盒的项目里用；先配 .claude/settings.json 或切 auto。（判定：会话启动目录 CLAUDE_PROJECT_DIR——没有时用 cwd 所在 git 根——的 .claude/settings.json + settings.local.json 需未禁用沙盒且 sandbox.filesystem.allowWrite 非空，linked worktree 还会读主 worktree；只写 sandbox.enabled: true 不算；/tmp、scratchpad 不算项目。只读命令不受影响。）',
-      };
-    }
+  for (const stageRule of STAGE_RULES) {
+    if (!enabled(stageRule.ruleId)) continue;
+    const matched = stageRule.match(analysis, ctx, command);
+    if (matched) return { command, description, analysis, ...matched };
   }
 
-  if (analysis.status === 'unknown' && enabled('shell-analysis-unknown')) {
-    const reasons = analysis.unknowns.map((item) => item.reason).join(', ') || 'unknown';
-    const hardUnknownReasons = new Set(['dynamic-command', 'dynamic-evaluator', 'input-too-large', 'recursion-limit', 'command-limit']);
-    const kind = analysis.unknowns.some((item) => hardUnknownReasons.has(item.reason)) ? 'deny' : 'confirm';
-    return {
-      kind, evaluation: 'unknown', ruleId: 'shell-analysis-unknown', command, description, analysis,
-      detail: `shell 结构无法静态确认（${reasons}）：${trunc(command)}`,
-      why: kind === 'deny'
-        ? '无法证明动态执行内容没有隐藏硬禁区，guard 按 fail-closed 拒绝。'
-        : 'parser 无法确认执行结构，需要外部确认后再继续。',
-    };
-  }
-
-  const outside = enabled('unsandboxed-outside-project') ? unsandboxedOutsideProject(analysis, ctx) : null;
-  if (outside) return { kind: 'confirm', command, description, analysis, ...outside };
-
-  const confirmation = confirmationPolicy(analysis, enabled, ctx);
+  const confirmation = confirmationPolicy(analysis, enabled, stateFor, ctx);
   if (confirmation) {
     const kind = confirmation.ruleId === 'git-low-risk' ? 'review' : 'confirm';
     return { kind, command, description, analysis, ...confirmation };

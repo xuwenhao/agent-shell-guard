@@ -1,7 +1,7 @@
 // @ts-check
-// agent-shell-guard policy profiles. The analyzer always runs; profiles only decide
-// whether a matched rule may emit ask/deny or should defer to the host's own
-// approval layer.
+// agent-shell-guard policy profiles. The analyzer always runs; profiles filter
+// which policy rules execute after AST analysis (disabled rules are skipped
+// before their matchers run).
 
 /** @typedef {'full'|'dangerous-only'|'legacy-dangerous'|'off'} PolicyProfile */
 /**
